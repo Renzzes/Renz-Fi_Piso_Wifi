@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
-import { Upload, Wifi, X } from "lucide-react";
+import { Upload, X } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,10 +12,10 @@ export const Route = createFileRoute("/_layout/captive-portal")({
   component: PortalPage,
 });
 
-const MAX_BYTES = 200 * 1024; // hard limit 200KB
+const MAX_BYTES = 200 * 1024;
 const PREFERRED_BYTES = 100 * 1024;
 const ALLOWED = ["image/png", "image/jpeg", "image/webp"];
-const MAX_W = 440; // 2x display for retina, keeps file small
+const MAX_W = 440;
 
 async function optimizeImage(file: File): Promise<string> {
   const bitmap = await createImageBitmap(file);
@@ -27,7 +27,6 @@ async function optimizeImage(file: File): Promise<string> {
   canvas.height = h;
   const ctx = canvas.getContext("2d")!;
   ctx.drawImage(bitmap, 0, 0, w, h);
-  // Try webp first for smallest size; fall back to jpeg
   let quality = 0.85;
   let dataUrl = canvas.toDataURL("image/webp", quality);
   while (dataUrl.length * 0.75 > PREFERRED_BYTES && quality > 0.4) {
@@ -38,10 +37,8 @@ async function optimizeImage(file: File): Promise<string> {
 }
 
 function PortalPage() {
-  const [welcome, setWelcome] = useState("Welcome to Renz-Fi");
+  const [portalName, setPortalName] = useState("");
   const [announce, setAnnounce] = useState("Insert coin to get internet access.");
-  const [accent, setAccent] = useState("#3b82f6");
-  const [btnColor, setBtnColor] = useState("#10b981");
   const [banner, setBanner] = useState<string | null>(null);
   const [bannerSize, setBannerSize] = useState<number>(0);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -78,7 +75,7 @@ function PortalPage() {
     <div>
       <PageHeader
         title="Captive Portal"
-        description="Configure the landing page shown to users"
+        description="Configure the branding shown on your captive portal"
       />
       <div className="grid md:grid-cols-2 gap-3">
         {/* Settings */}
@@ -113,85 +110,50 @@ function PortalPage() {
           </div>
 
           <div className="space-y-1">
-            <Label className="text-xs">Welcome Message</Label>
-            <Input value={welcome} onChange={(e) => setWelcome(e.target.value)} />
+            <Label className="text-xs">Web Portal Name (Optional)</Label>
+            <Input
+              value={portalName}
+              onChange={(e) => setPortalName(e.target.value)}
+              placeholder="e.g. Renz-Fi Hotspot"
+            />
           </div>
           <div className="space-y-1">
             <Label className="text-xs">Announcement Message</Label>
             <Textarea value={announce} onChange={(e) => setAnnounce(e.target.value)} rows={2} />
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-1">
-              <Label className="text-xs">Accent Color</Label>
-              <Input type="color" value={accent} onChange={(e) => setAccent(e.target.value)} className="h-9 p-1" />
-            </div>
-            <div className="space-y-1">
-              <Label className="text-xs">Button Color</Label>
-              <Input type="color" value={btnColor} onChange={(e) => setBtnColor(e.target.value)} className="h-9 p-1" />
-            </div>
-          </div>
+
           <Button size="sm" onClick={() => toast.success("Settings saved")}>
             <Upload /> Save Settings
           </Button>
         </div>
 
-        {/* Live Preview */}
+        {/* Banner Preview */}
         <div className="rounded-md border bg-card p-3">
-          <div className="text-xs text-muted-foreground mb-2">Live Preview</div>
-          <div className="mx-auto max-w-[320px] rounded-md border bg-background p-4 space-y-3">
-            <div className="flex justify-center">
-              {banner ? (
-                <img
-                  src={banner}
-                  alt="Portal banner"
-                  className="rounded-md object-contain"
-                  style={{ maxWidth: 200, maxHeight: 100 }}
-                />
-              ) : (
-                <div
-                  className="rounded-md flex items-center justify-center text-[10px] text-muted-foreground border border-dashed"
-                  style={{ width: 200, height: 80 }}
-                >
-                  Banner / Logo
-                </div>
-              )}
-            </div>
-            <div className="text-center">
-              <h3 className="text-base font-semibold" style={{ color: accent }}>
-                {welcome}
-              </h3>
-              <p className="text-[11px] text-muted-foreground mt-1">{announce}</p>
-            </div>
-            <div className="flex items-center justify-center gap-1 text-[11px]">
-              <Wifi className="h-3 w-3 text-green-500" />
-              <span className="text-muted-foreground">Status: Online</span>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                className="px-2 py-1.5 rounded-md text-xs font-medium text-white"
-                style={{ background: btnColor }}
-              >
-                Insert Coin
-              </button>
-              <button
-                className="px-2 py-1.5 rounded-md text-xs font-medium border"
-                style={{ borderColor: accent, color: accent }}
-              >
-                Promo Rates
-              </button>
-            </div>
-            <div className="space-y-1.5">
-              <input
-                placeholder="Enter voucher code"
-                className="w-full h-8 px-2 rounded-md border bg-background text-xs"
+          <div className="text-xs text-muted-foreground mb-2">Banner Preview</div>
+          <div className="flex flex-col items-center justify-center rounded-md border bg-background p-4 min-h-[160px]">
+            {banner ? (
+              <img
+                src={banner}
+                alt="Portal banner"
+                className="rounded-md object-contain"
+                style={{ maxWidth: 220, maxHeight: 120 }}
               />
-              <button
-                className="w-full px-2 py-1.5 rounded-md text-xs font-medium text-white"
-                style={{ background: accent }}
+            ) : (
+              <div
+                className="rounded-md flex items-center justify-center text-[11px] text-muted-foreground border border-dashed"
+                style={{ width: 200, height: 90 }}
               >
-                Connect
-              </button>
-            </div>
+                No banner uploaded
+              </div>
+            )}
+            {portalName && (
+              <p className="mt-3 text-sm font-semibold text-center">{portalName}</p>
+            )}
+            {announce && (
+              <p className="mt-1 text-[11px] text-muted-foreground text-center max-w-[260px]">
+                {announce}
+              </p>
+            )}
           </div>
         </div>
       </div>
