@@ -5,7 +5,6 @@ import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/_layout/captive-portal")({
@@ -38,7 +37,6 @@ async function optimizeImage(file: File): Promise<string> {
 
 function PortalPage() {
   const [portalName, setPortalName] = useState("");
-  const [announce, setAnnounce] = useState("Insert coin to get internet access.");
   const [banner, setBanner] = useState<string | null>(null);
   const [bannerSize, setBannerSize] = useState<number>(0);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -77,85 +75,55 @@ function PortalPage() {
         title="Captive Portal"
         description="Configure the branding shown on your captive portal"
       />
-      <div className="grid md:grid-cols-2 gap-3">
-        {/* Settings */}
-        <div className="rounded-md border bg-card p-3 space-y-4">
-          <div>
-            <h3 className="text-sm font-semibold mb-2">Portal Branding</h3>
-            <div className="space-y-1">
-              <Label className="text-xs">Portal Banner / Logo</Label>
-              <div className="flex items-center gap-2">
-                <Input
-                  ref={fileRef}
-                  type="file"
-                  accept="image/png,image/jpeg,image/webp"
-                  onChange={handleFile}
-                  className="h-9 text-xs"
-                />
-                {banner && (
-                  <Button size="icon" variant="outline" onClick={clearBanner} aria-label="Remove banner">
-                    <X />
-                  </Button>
-                )}
-              </div>
-              <p className="text-[11px] text-muted-foreground">
-                Recommended: WEBP format, max 100KB. Hard limit 200KB.
-              </p>
-              {banner && (
-                <p className="text-[11px] text-muted-foreground">
-                  Optimized size: {(bannerSize / 1024).toFixed(1)}KB
-                </p>
-              )}
-            </div>
-          </div>
+      <div className="max-w-xl space-y-4 rounded-md border bg-card p-3">
+        <div className="space-y-1">
+          <Label className="text-xs">Portal Banner / Logo</Label>
+          <Input
+            ref={fileRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            onChange={handleFile}
+            className="h-9 text-xs"
+          />
+          <p className="text-[11px] text-muted-foreground">
+            Recommended: WEBP format, max 100KB. Hard limit 200KB.
+          </p>
 
-          <div className="space-y-1">
-            <Label className="text-xs">Web Portal Name (Optional)</Label>
-            <Input
-              value={portalName}
-              onChange={(e) => setPortalName(e.target.value)}
-              placeholder="e.g. Renz-Fi Hotspot"
-            />
-          </div>
-          <div className="space-y-1">
-            <Label className="text-xs">Announcement Message</Label>
-            <Textarea value={announce} onChange={(e) => setAnnounce(e.target.value)} rows={2} />
-          </div>
-
-          <Button size="sm" onClick={() => toast.success("Settings saved")}>
-            <Upload /> Save Settings
-          </Button>
-        </div>
-
-        {/* Banner Preview */}
-        <div className="rounded-md border bg-card p-3">
-          <div className="text-xs text-muted-foreground mb-2">Banner Preview</div>
-          <div className="flex flex-col items-center justify-center rounded-md border bg-background p-4 min-h-[160px]">
-            {banner ? (
+          {banner && (
+            <div className="relative inline-block mt-2">
               <img
                 src={banner}
                 alt="Portal banner"
                 className="rounded-md object-contain"
                 style={{ maxWidth: 220, maxHeight: 120 }}
               />
-            ) : (
-              <div
-                className="rounded-md flex items-center justify-center text-[11px] text-muted-foreground border border-dashed"
-                style={{ width: 200, height: 90 }}
+              <button
+                type="button"
+                onClick={clearBanner}
+                aria-label="Remove banner"
+                className="absolute -top-2 -right-2 h-6 w-6 rounded-full bg-destructive text-destructive-foreground flex items-center justify-center shadow"
               >
-                No banner uploaded
-              </div>
-            )}
-            {portalName && (
-              <p className="mt-3 text-sm font-semibold text-center">{portalName}</p>
-            )}
-            {announce && (
-              <p className="mt-1 text-[11px] text-muted-foreground text-center max-w-[260px]">
-                {announce}
+                <X className="h-3.5 w-3.5" />
+              </button>
+              <p className="text-[11px] text-muted-foreground mt-1">
+                Optimized: {(bannerSize / 1024).toFixed(1)}KB
               </p>
-            )}
-          </div>
+            </div>
+          )}
         </div>
+
+        <div className="space-y-1">
+          <Label className="text-xs">Web Portal Name (Optional)</Label>
+          <Input
+            value={portalName}
+            onChange={(e) => setPortalName(e.target.value)}
+            placeholder="e.g. Renz-Fi Hotspot"
+          />
+        </div>
+
+        <Button size="sm" onClick={() => toast.success("Settings saved")}>
+          <Upload /> Save Settings
+        </Button>
       </div>
     </div>
   );
