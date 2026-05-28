@@ -1,0 +1,17 @@
+{
+  "name": "Renz-Fi Admin",
+  "short_name": "Renz-Fi",
+  "description": "Piso WiFi local admin dashboard",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#0f172a",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
