@@ -15,7 +15,7 @@
 #include "StorageManager.h"
 #include "VoucherManager.h"
 #include "WiFiBootstrap.h"
-#include "config.h"
+#include "Config.h"
 
 class FirmwareApp {
  public:

@@ -2,7 +2,7 @@
 
 #include <mbedtls/sha256.h>
 
-#include "config.h"
+#include "Config.h"
 
 void AuthManager::begin(StorageManager *storage, Logger *logger) {
   _storage = storage;
@@ -59,7 +59,7 @@ bool AuthManager::isAuthenticated(AsyncWebServerRequest *request) {
   if (!_storage || !_storage->readJson(RenzFiConfig::ADMIN_SESSIONS_FILE, doc)) return false;
   uint32_t now = millis() / 1000;
   for (JsonObject session : doc.as<JsonArray>()) {
-    if ((session["token"] | "") == token && (session["expiresAt"] | 0UL) > now) return true;
+    if (token.equals(session["token"] | "") && (session["expiresAt"] | 0UL) > now) return true;
   }
   return false;
 }
@@ -158,7 +158,7 @@ void AuthManager::deleteSession(const String &token) {
   DynamicJsonDocument next(RenzFiConfig::JSON_DOC_MEDIUM);
   JsonArray out = next.to<JsonArray>();
   for (JsonObject session : doc.as<JsonArray>()) {
-    if ((session["token"] | "") != token) {
+    if (!token.equals(session["token"] | "")) {
       JsonObject copy = out.createNestedObject();
       copy.set(session);
     }

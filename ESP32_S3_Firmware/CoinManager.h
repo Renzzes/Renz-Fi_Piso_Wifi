@@ -31,6 +31,7 @@ class CoinManager {
   volatile uint32_t _lastPulseMs = 0;
   uint32_t _lastProcessedPulseMs = 0;
   uint32_t _pulsesToday = 0;
+  uint32_t _lastAcceptedCoinMs = 0;
   CoinSettings _settings;
   LedMode _ledMode = LedMode::Waiting;
 
@@ -38,4 +39,5 @@ class CoinManager {
   void loadSettings();
   void processCoin(uint32_t pulses);
   void updateLed();
+  void setRgbLed(bool red, bool green, bool blue);
 };

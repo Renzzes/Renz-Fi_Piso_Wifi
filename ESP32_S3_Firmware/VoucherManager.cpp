@@ -1,6 +1,6 @@
 #include "VoucherManager.h"
 
-#include "config.h"
+#include "Config.h"
 
 void VoucherManager::begin(StorageManager *storage, Logger *logger, EventBus *events) {
   _storage = storage;
@@ -16,7 +16,7 @@ bool VoucherManager::find(const String &code, JsonDocument &doc) {
   DynamicJsonDocument all(RenzFiConfig::JSON_DOC_LARGE);
   if (!list(all)) return false;
   for (JsonObject item : all.as<JsonArray>()) {
-    if ((item["code"] | "") == code) {
+    if (code.equals(item["code"] | "")) {
       doc.set(item);
       return true;
     }
@@ -54,7 +54,7 @@ bool VoucherManager::remove(const String &code) {
   JsonArray out = next.to<JsonArray>();
   bool removed = false;
   for (JsonObject item : doc.as<JsonArray>()) {
-    if ((item["code"] | "") == code) {
+    if (code.equals(item["code"] | "")) {
       removed = true;
       continue;
     }
@@ -71,7 +71,7 @@ bool VoucherManager::markActive(const String &code) {
   DynamicJsonDocument doc(RenzFiConfig::JSON_DOC_LARGE);
   if (!list(doc)) return false;
   for (JsonObject item : doc.as<JsonArray>()) {
-    if ((item["code"] | "") == code) {
+    if (code.equals(item["code"] | "")) {
       item["status"] = "active";
       bool ok = _storage->writeJson(RenzFiConfig::VOUCHERS_FILE, doc);
       if (ok && _events) _events->emit("vouchers.changed");

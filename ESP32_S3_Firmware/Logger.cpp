@@ -1,6 +1,6 @@
 #include "Logger.h"
 
-#include "config.h"
+#include "Config.h"
 
 static String logTimestamp() {
   return String("uptime-ms:") + millis();

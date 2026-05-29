@@ -1,6 +1,6 @@
 #include "PromoManager.h"
 
-#include "config.h"
+#include "Config.h"
 
 void PromoManager::begin(StorageManager *storage, Logger *logger, EventBus *events) {
   _storage = storage;

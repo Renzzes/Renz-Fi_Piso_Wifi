@@ -1,6 +1,6 @@
 #include "CoinManager.h"
 
-#include "config.h"
+#include "Config.h"
 
 static CoinManager *coinInstance = nullptr;
 
@@ -13,7 +13,10 @@ void CoinManager::begin(StorageManager *storage, Logger *logger, EventBus *event
   loadSettings();
 
   pinMode(RenzFiConfig::PIN_COIN, INPUT_PULLUP);
-  pinMode(RenzFiConfig::PIN_INSERT_COIN_LED, OUTPUT);
+  pinMode(RenzFiConfig::PIN_RGB_LED_RED, OUTPUT);
+  pinMode(RenzFiConfig::PIN_RGB_LED_GREEN, OUTPUT);
+  pinMode(RenzFiConfig::PIN_RGB_LED_BLUE, OUTPUT);
+  setRgbLed(false, false, false);
   coinInstance = this;
   attachInterrupt(digitalPinToInterrupt(RenzFiConfig::PIN_COIN), CoinManager::isrThunk, FALLING);
 }
@@ -41,7 +44,7 @@ void CoinManager::loop() {
     processCoin(pulses);
   }
 
-  _ledMode = _sessions && _sessions->hasActiveUsers() ? LedMode::Active : LedMode::Waiting;
+  _ledMode = _lastAcceptedCoinMs > 0 && millis() - _lastAcceptedCoinMs < RenzFiConfig::RGB_LED_ACCEPTED_MS ? LedMode::Active : LedMode::Waiting;
   updateLed();
 }
 
@@ -125,6 +128,7 @@ void CoinManager::processCoin(uint32_t pulses) {
   int amount = pulses * max(1, _settings.pesoPerPulse);
   int minutes = _promos ? _promos->minutesForAmount(amount) : amount * _settings.defaultMinutesPerPeso;
   if (_sessions) _sessions->grantCoinSession(amount, minutes);
+  _lastAcceptedCoinMs = millis();
   if (_logger) _logger->info("coin", String("Accepted ") + pulses + " pulse(s), amount PHP " + amount);
   if (_events) _events->emit("coin.diagnostics");
 }
@@ -137,19 +141,24 @@ void CoinManager::updateLed() {
 
   switch (_ledMode) {
     case LedMode::Off:
-      digitalWrite(RenzFiConfig::PIN_INSERT_COIN_LED, LOW);
+      setRgbLed(false, false, false);
       break;
     case LedMode::Active:
-      digitalWrite(RenzFiConfig::PIN_INSERT_COIN_LED, HIGH);
+      setRgbLed(false, true, false);
       break;
     case LedMode::Error:
       ledState = !ledState;
-      digitalWrite(RenzFiConfig::PIN_INSERT_COIN_LED, ledState ? HIGH : LOW);
+      setRgbLed(ledState, false, false);
       break;
     case LedMode::Waiting:
     default:
-      if ((millis() / 500) % 2 == 0) digitalWrite(RenzFiConfig::PIN_INSERT_COIN_LED, HIGH);
-      else digitalWrite(RenzFiConfig::PIN_INSERT_COIN_LED, LOW);
+      setRgbLed(false, false, (millis() / 500) % 2 == 0);
       break;
   }
+}
+
+void CoinManager::setRgbLed(bool red, bool green, bool blue) {
+  digitalWrite(RenzFiConfig::PIN_RGB_LED_RED, red ? HIGH : LOW);
+  digitalWrite(RenzFiConfig::PIN_RGB_LED_GREEN, green ? HIGH : LOW);
+  digitalWrite(RenzFiConfig::PIN_RGB_LED_BLUE, blue ? HIGH : LOW);
 }

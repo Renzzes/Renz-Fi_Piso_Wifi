@@ -2,16 +2,20 @@
 
 #include <SPI.h>
 
-#include "config.h"
+#include "Config.h"
 
 bool StorageManager::begin() {
+  Serial.println("[boot] SD card initialization starting");
   SPI.begin(RenzFiConfig::PIN_SD_SCK, RenzFiConfig::PIN_SD_MISO, RenzFiConfig::PIN_SD_MOSI, RenzFiConfig::PIN_SD_CS);
   _healthy = SD.begin(RenzFiConfig::PIN_SD_CS);
   if (!_healthy) {
-    setError("SD card initialization failed");
+    setError("[ERROR] SD card mount failed");
     return false;
   }
-  return ensureLayout();
+  Serial.printf("[boot] SD card mounted: total=%llu bytes used=%llu bytes\n", SD.totalBytes(), SD.usedBytes());
+  bool ok = ensureLayout();
+  Serial.println(ok ? "[boot] SD card layout ready" : "[ERROR] SD card layout initialization failed");
+  return ok;
 }
 
 bool StorageManager::healthy() const {
@@ -154,7 +158,7 @@ uint64_t StorageManager::usedBytes() const {
 
 void StorageManager::setError(const String &message) {
   _lastError = message;
-  Serial.println("[storage] " + message);
+  Serial.println(message);
 }
 
 bool StorageManager::ensureDir(const char *path) {

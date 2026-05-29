@@ -1,6 +1,6 @@
 #include "MikroTikManager.h"
 
-#include "config.h"
+#include "Config.h"
 
 void MikroTikManager::begin(StorageManager *storage, Logger *logger) {
   _storage = storage;

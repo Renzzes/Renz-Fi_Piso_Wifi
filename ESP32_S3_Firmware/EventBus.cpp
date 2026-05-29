@@ -1,6 +1,6 @@
 #include "EventBus.h"
 
-#include "config.h"
+#include "Config.h"
 
 EventBus::EventBus(const char *url) : _events(url) {}
 

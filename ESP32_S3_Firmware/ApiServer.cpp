@@ -4,12 +4,36 @@
 
 #include <ESPAsyncWebServer.h>
 #include <SD.h>
+#include <SPIFFS.h>
 
-#include "config.h"
+#include "Config.h"
 
 namespace {
 
 using JsonRoute = std::function<void(AsyncWebServerRequest *, JsonVariantConst)>;
+
+const char SPIFFS_FALLBACK_PAGE[] PROGMEM = R"rawliteral(<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Renz-Fi Admin Dashboard</title>
+  <style>
+    body{font-family:Arial,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;display:grid;min-height:100vh;place-items:center}
+    main{max-width:640px;padding:32px}
+    a{color:#38bdf8}
+    code{background:#1e293b;padding:2px 6px;border-radius:4px}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Renz-Fi Admin Dashboard</h1>
+    <p>The ESP32-S3 hotspot and backend are running in degraded mode, but the SPIFFS frontend image is not available.</p>
+    <p>Build the React app, copy <code>dist/*</code> into <code>ESP32_S3_Firmware/data/</code>, upload the SPIFFS image, then reopen <a href="http://192.168.4.1">http://192.168.4.1</a>.</p>
+    <p>Backend health: <a href="/api/health">/api/health</a></p>
+  </main>
+</body>
+</html>)rawliteral";
 
 void addJsonRoute(AsyncWebServer *server, const char *path, WebRequestMethodComposite method, JsonRoute route) {
   server->on(
@@ -121,19 +145,21 @@ void ApiServer::sendStaticOrIndex(AsyncWebServerRequest *request) {
   }
 
   String path = request->url();
-  String gzPath = String(RenzFiConfig::WWW_ROOT) + path + ".gz";
-  String fullPath = String(RenzFiConfig::WWW_ROOT) + path;
+  String fullPath = path;
   if (fullPath.endsWith("/")) fullPath += "index.html";
-  if (!_storage->exists(fullPath.c_str()) && !path.startsWith("/api/")) fullPath = String(RenzFiConfig::WWW_ROOT) + "/index.html";
-  bool gzip = _storage->exists(gzPath.c_str());
+  if (!SPIFFS.exists(fullPath.c_str()) && !path.startsWith("/api/")) fullPath = "/index.html";
+  String gzPath = fullPath + ".gz";
+  bool gzip = SPIFFS.exists(gzPath.c_str());
   if (gzip) fullPath = gzPath;
-  if (!_storage->exists(fullPath.c_str())) {
-    request->send(404, "text/plain", "Static frontend not found. Copy build output to /www on SD card.");
+  if (!SPIFFS.exists(fullPath.c_str())) {
+    AsyncWebServerResponse *response = request->beginResponse(200, "text/html; charset=utf-8", FPSTR(SPIFFS_FALLBACK_PAGE));
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
     return;
   }
 
   String typePath = (path == "/" || fullPath.endsWith("index.html") || fullPath.endsWith("index.html.gz")) ? "/index.html" : path;
-  AsyncWebServerResponse *response = request->beginResponse(SD, fullPath, _storage->contentType(typePath));
+  AsyncWebServerResponse *response = request->beginResponse(SPIFFS, fullPath, _storage->contentType(typePath));
   if (gzip) response->addHeader("Content-Encoding", "gzip");
   if (path.indexOf("/assets/") == 0) response->addHeader("Cache-Control", "public, max-age=31536000, immutable");
   else response->addHeader("Cache-Control", "no-cache");
@@ -141,6 +167,22 @@ void ApiServer::sendStaticOrIndex(AsyncWebServerRequest *request) {
 }
 
 void ApiServer::registerRoutes() {
+  _server->on("/", HTTP_GET, [this](AsyncWebServerRequest *request) {
+    sendStaticOrIndex(request);
+  });
+
+  _server->on("^\\/assets\\/.*$", HTTP_GET, [this](AsyncWebServerRequest *request) {
+    sendStaticOrIndex(request);
+  });
+
+  _server->on("/manifest.webmanifest", HTTP_GET, [this](AsyncWebServerRequest *request) {
+    sendStaticOrIndex(request);
+  });
+
+  _server->on("/sw.js", HTTP_GET, [this](AsyncWebServerRequest *request) {
+    sendStaticOrIndex(request);
+  });
+
   _server->on("/api/health", HTTP_GET, [this](AsyncWebServerRequest *request) {
     DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
     data["ok"] = true;

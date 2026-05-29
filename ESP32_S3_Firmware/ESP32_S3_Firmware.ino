@@ -1,4 +1,4 @@
-#include "src/FirmwareApp.h"
+#include "FirmwareApp.h"
 
 FirmwareApp app;
 

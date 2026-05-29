@@ -2,10 +2,12 @@
 
 #include <WiFi.h>
 
-#include "config.h"
+#include "Config.h"
 
 void CaptivePortal::begin() {
+  Serial.println("[boot] Captive portal DNS startup starting");
   _dns.start(RenzFiConfig::DNS_PORT, "*", RenzFiConfig::AP_IP);
+  Serial.printf("[boot] Captive portal DNS started on port %u\n", RenzFiConfig::DNS_PORT);
 }
 
 void CaptivePortal::loop() {

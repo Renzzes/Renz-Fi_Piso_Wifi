@@ -4,12 +4,13 @@
 
 namespace RenzFiConfig {
 
+static constexpr const char *FIRMWARE_VERSION = "0.2.0-arduino";
 static constexpr const char *AP_SSID = "Renz-Fi";
 static constexpr const char *AP_PASSWORD = "";
 static constexpr const char *MDNS_NAME = "renz-fi";
 
-static const IPAddress AP_IP(10, 10, 10, 1);
-static const IPAddress AP_GATEWAY(10, 10, 10, 1);
+static const IPAddress AP_IP(192, 168, 4, 1);
+static const IPAddress AP_GATEWAY(192, 168, 4, 1);
 static const IPAddress AP_SUBNET(255, 255, 255, 0);
 
 static constexpr uint16_t HTTP_PORT = 80;
@@ -21,7 +22,9 @@ static constexpr int PIN_SD_MISO = 13;
 static constexpr int PIN_SD_MOSI = 11;
 
 static constexpr int PIN_COIN = 4;
-static constexpr int PIN_INSERT_COIN_LED = 5;
+static constexpr int PIN_RGB_LED_RED = 5;
+static constexpr int PIN_RGB_LED_GREEN = 6;
+static constexpr int PIN_RGB_LED_BLUE = 7;
 
 static constexpr uint32_t COIN_DEBOUNCE_MS = 35;
 static constexpr uint32_t COIN_SETTLE_MS = 450;
@@ -29,6 +32,7 @@ static constexpr uint32_t SESSION_TTL_SECONDS = 8UL * 60UL * 60UL;
 static constexpr uint32_t SSE_HEARTBEAT_MS = 15000;
 static constexpr uint32_t CLEANUP_INTERVAL_MS = 30000;
 static constexpr uint32_t LED_TICK_MS = 150;
+static constexpr uint32_t RGB_LED_ACCEPTED_MS = 1200;
 
 static constexpr size_t JSON_DOC_SMALL = 2048;
 static constexpr size_t JSON_DOC_MEDIUM = 8192;

@@ -1,6 +1,6 @@
 #include "SessionManager.h"
 
-#include "config.h"
+#include "Config.h"
 
 static String durationText(uint32_t seconds) {
   uint32_t minutes = seconds / 60;
@@ -31,7 +31,7 @@ bool SessionManager::disconnect(const String &mac) {
   JsonArray out = next.to<JsonArray>();
   bool removed = false;
   for (JsonObject user : doc.as<JsonArray>()) {
-    if ((user["mac"] | "") == mac) {
+    if (mac.equals(user["mac"] | "")) {
       removed = true;
       continue;
     }
