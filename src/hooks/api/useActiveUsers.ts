@@ -14,13 +14,31 @@ export function useActiveUsers() {
   });
 }
 
+function invalidateUserQueries(qc: ReturnType<typeof useQueryClient>) {
+  qc.invalidateQueries({ queryKey: ["users", "active"] });
+  qc.invalidateQueries({ queryKey: ["system", "status"] });
+}
+
 export function useDisconnectUser() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (mac: string) => usersApi.disconnect(mac),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["users", "active"] });
-      qc.invalidateQueries({ queryKey: ["system", "status"] });
-    },
+    onSuccess: () => invalidateUserQueries(qc),
+  });
+}
+
+export function usePauseUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (mac: string) => usersApi.pause(mac),
+    onSuccess: () => invalidateUserQueries(qc),
+  });
+}
+
+export function useResumeUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (mac: string) => usersApi.resume(mac),
+    onSuccess: () => invalidateUserQueries(qc),
   });
 }

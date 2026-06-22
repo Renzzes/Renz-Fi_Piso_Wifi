@@ -1,41 +1,58 @@
 import { Router, type Request, type Response } from "express";
-import { z } from "zod";
+import express from "express";
+import crypto from "node:crypto";
 import { sendError, sendSuccess } from "../utils/response.js";
-import { handleFirmwareUpload } from "../services/firmware.js";
+import { publishAdminEvent } from "../services/eventBus.js";
+import { pushRamLog } from "../services/ramLogs.js";
 
 export const firmwareRouter = Router();
 
 firmwareRouter.get("/", (_req, res) => {
   return sendSuccess(res, {
-    version: "v1.0.0",
-    build: "2026-05-20",
+    version: "0.5.0-dev-simulator",
+    build: new Date().toISOString().slice(0, 10),
     sizeMb: 1.2,
-    note: "Firmware metadata only — ESP32 OTA is handled externally",
+    partition: "simulator",
+    note: "Development simulator — flash real .bin on ESP32 hardware",
   });
 });
 
-const firmwareUploadSchema = z
-  .object({
-    // Current UI uploads are not wired to real OTA yet.
-    filename: z.string().min(1).optional(),
-    sizeBytes: z.number().int().nonnegative().optional(),
-    mimeType: z.string().optional(),
-  })
-  .partial();
+firmwareRouter.post(
+  "/",
+  express.raw({ type: ["application/octet-stream", "application/x-msdownload"], limit: "3mb" }),
+  (req: Request, res: Response) => {
+    const body = req.body as Buffer;
+    if (!body?.length) {
+      return sendError(res, {
+        status: 400,
+        code: "BAD_REQUEST",
+        error: "Missing firmware binary body",
+      });
+    }
 
-function uploadFirmware(req: Request, res: Response) {
-  const parsed = firmwareUploadSchema.safeParse(req.body ?? {});
-  if (!parsed.success) {
-    return sendError(res, {
-      status: 400,
-      code: "BAD_REQUEST",
-      error: "Invalid firmware upload payload",
-      details: parsed.error.flatten(),
+    const md5 = crypto.createHash("md5").update(body).digest("hex");
+    publishAdminEvent("firmware.progress", { phase: "verify", md5 });
+    publishAdminEvent("firmware.progress", { phase: "complete", md5 });
+    pushRamLog({
+      lvl: "INFO",
+      type: "firmware",
+      msg: `Simulator accepted firmware (${body.length} bytes, md5=${md5})`,
     });
-  }
 
-  return sendSuccess(res, handleFirmwareUpload(parsed.data));
-}
+    return sendSuccess(res, {
+      ok: true,
+      bytes: body.length,
+      md5,
+      rebooting: false,
+      message: "Simulator recorded firmware upload (no OTA in dev mode)",
+    });
+  },
+);
 
-firmwareRouter.post("/", uploadFirmware);
-firmwareRouter.post("/upload", uploadFirmware);
+firmwareRouter.post("/upload", (req, res) => {
+  return sendError(res, {
+    status: 400,
+    code: "BAD_REQUEST",
+    error: "Use POST /api/system/firmware with raw .bin body",
+  });
+});

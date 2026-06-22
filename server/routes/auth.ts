@@ -21,7 +21,7 @@ const loginSchema = z.object({
 
 const changePasswordSchema = z.object({
   oldPassword: z.string().min(1).max(256),
-  newPassword: z.string().min(4).max(256),
+  newPassword: z.string().min(8).max(256),
 });
 
 authRouter.post("/login", loginRateLimitMiddleware, async (req, res) => {

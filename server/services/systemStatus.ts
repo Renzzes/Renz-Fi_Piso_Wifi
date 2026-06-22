@@ -33,6 +33,12 @@ export function getSystemStatus(): SystemStatus {
     db.prepare("SELECT COUNT(*) as c FROM active_sessions").get() as { c: number }
   ).c;
 
+  const pausedCount = (
+    db.prepare("SELECT COUNT(*) as c FROM active_sessions WHERE paused = 1").get() as {
+      c: number;
+    }
+  ).c;
+
   const pendingSync = (
     db.prepare("SELECT COUNT(*) as c FROM sync_queue WHERE status = 'pending'").get() as {
       c: number;
@@ -45,9 +51,9 @@ export function getSystemStatus(): SystemStatus {
     )
     .get() as { created_at: string } | undefined;
 
-  const mikrotikConnected = getSetting("router_settings", "connected", "1") === "1";
-  const host = getSetting("router_settings", "host", "10.0.0.1");
-  const ssid = getSetting("router_settings", "ssid", "Renz-Fi");
+  const host = getSetting("router_settings", "host", "");
+  const ssid = getSetting("router_settings", "ssid", "");
+  const routerConfigured = host.trim().length > 0;
 
   let storageOk = true;
   try {
@@ -60,27 +66,42 @@ export function getSystemStatus(): SystemStatus {
     server: { ok: true, uptimeSeconds: Math.floor((Date.now() - startTime) / 1000) },
     database: { ok: storageOk },
     sales: {
-      today: { amount: todaySales.amount || 248, sessions: todaySales.sessions || 32 },
-      weekly: { amount: weeklySales.amount || 1820, sessions: weeklySales.sessions || 208 },
-      monthly: { amount: monthlySales.amount || 7415, sessions: monthlySales.sessions || 842 },
+      today: { amount: todaySales.amount, sessions: todaySales.sessions },
+      weekly: { amount: weeklySales.amount, sessions: weeklySales.sessions },
+      monthly: { amount: monthlySales.amount, sessions: monthlySales.sessions },
     },
-    activeUsers: { count: activeCount || 12, idle: 2 },
-    mikrotik: { ok: mikrotikConnected, host, latencyMs: 32 },
-    internet: { ok: true, latencyMs: 32 },
+    activeUsers: { count: activeCount, paused: pausedCount, idle: 0 },
+    mikrotik: { ok: routerConfigured, host, latencyMs: 0 },
+    internet: { ok: false, latencyMs: 0, known: false },
     coinSlot: {
-      ok: true,
-      state: getSetting("coin_settings", "state", "Ready"),
-      pulsesToday: Number(getSetting("coin_settings", "total_today", "248")),
+      ok: getSetting("coin_settings", "enabled", "1") === "1",
+      state: getSetting("coin_settings", "state", ""),
+      pulsesToday: Number(getSetting("coin_settings", "total_today", "0") || 0),
     },
-    hotspot: { ok: true, ssid },
-    esp32: { uptime: "3d 4h 12m", lastSeen: new Date().toISOString() },
+    hotspot: { ok: routerConfigured && ssid.trim().length > 0, ssid },
+    esp32: {
+      uptime: `${Math.floor((Date.now() - startTime) / 1000)}s`,
+      lastSeen: new Date().toISOString(),
+    },
     storage: {
-      flashUsedMb: 1.2,
-      flashTotalMb: 3.0,
+      flashUsedMb: 0,
+      flashTotalMb: 0,
       ramUsedKb: 128,
       ramTotalKb: 320,
-      logsUsedKb: 82,
+      logsUsedKb: 0,
       logsTotalKb: 256,
+      sd: {
+        present: true,
+        mounted: true,
+        usedMb: 0,
+        totalMb: 512,
+        freeMb: 512,
+        status: "Ready",
+        fallback: false,
+        pollingDisabled: false,
+        recoveryAttempts: 0,
+        mode: "SD",
+      },
     },
     sync: { pending: pendingSync, lastSyncAt: lastSync?.created_at ?? null },
   };

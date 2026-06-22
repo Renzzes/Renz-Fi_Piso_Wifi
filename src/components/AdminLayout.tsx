@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import logo2Src from "../../public/logo2.png";
 import { Link, Outlet, useLocation } from "react-router-dom";
 import {
   LayoutDashboard,
@@ -8,7 +9,7 @@ import {
   BarChart3,
   MonitorSmartphone,
   Coins,
-  Router as RouterIcon,
+  SlidersHorizontal,
   ScrollText,
   Download,
   Settings,
@@ -18,6 +19,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { useRealtime } from "@/contexts/RealtimeContext";
 
 const nav = [
   { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -27,7 +29,7 @@ const nav = [
   { to: "/sales-reports", label: "Sales Reports", icon: BarChart3 },
   { to: "/captive-portal", label: "Captive Portal", icon: MonitorSmartphone },
   { to: "/coin-settings", label: "Coin Settings", icon: Coins },
-  { to: "/router-settings", label: "Router Settings", icon: RouterIcon },
+  { to: "/system-configuration", label: "System Configuration", icon: SlidersHorizontal },
   { to: "/logs", label: "Logs", icon: ScrollText },
   { to: "/firmware", label: "Firmware Update", icon: Download },
   { to: "/system-settings", label: "System Settings", icon: Settings },
@@ -36,16 +38,52 @@ const nav = [
 type AdminLayoutProps = {
   adminIp: string;
   onDisconnect: () => void;
+  connectionLost?: boolean;
 };
 
-export function AdminLayout({ adminIp, onDisconnect }: AdminLayoutProps) {
+function LiveUpdatesBadge() {
+  const { sseConnected, sseReconnecting } = useRealtime();
+  const label = sseConnected
+    ? "Live Updates: Connected"
+    : sseReconnecting
+      ? "Live Updates: Reconnecting"
+      : "Live Updates: Reconnecting";
+
+  return (
+    <div
+      className={cn(
+        "text-[10px] px-2 py-1 rounded-md hidden sm:flex items-center gap-1.5",
+        sseConnected
+          ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+          : "bg-amber-500/10 text-amber-700 dark:text-amber-400",
+      )}
+      title={label}
+    >
+      <span
+        className={cn(
+          "h-1.5 w-1.5 rounded-full",
+          sseConnected ? "bg-emerald-500" : "bg-amber-500 animate-pulse",
+        )}
+      />
+      {label}
+    </div>
+  );
+}
+
+export function AdminLayout({ adminIp, onDisconnect, connectionLost = false }: AdminLayoutProps) {
   const [open, setOpen] = useState(false);
   const { pathname } = useLocation();
 
   useEffect(() => setOpen(false), [pathname]);
 
   return (
-    <div className="min-h-screen flex bg-background text-foreground">
+    <div
+      className={cn(
+        "min-h-screen flex bg-background text-foreground",
+        connectionLost && "pointer-events-none select-none opacity-60",
+      )}
+      aria-hidden={connectionLost || undefined}
+    >
       <aside
         className={cn(
           "fixed inset-y-0 left-0 z-40 w-56 border-r bg-sidebar text-sidebar-foreground flex flex-col transition-transform md:translate-x-0 md:static md:shrink-0",
@@ -55,7 +93,7 @@ export function AdminLayout({ adminIp, onDisconnect }: AdminLayoutProps) {
         <div className="h-14 flex items-center px-4 border-b bg-white">
           <div className="relative h-10 w-40 overflow-hidden">
             <img
-              src="/logo2.png"
+              src={logo2Src}
               alt="Renz-Fi logo"
               className="absolute left-1/2 top-1/2 w-[270px] max-w-none -translate-x-1/2 -translate-y-1/2"
             />
@@ -106,6 +144,7 @@ export function AdminLayout({ adminIp, onDisconnect }: AdminLayoutProps) {
             </h1>
           </div>
           <div className="flex items-center gap-1">
+            <LiveUpdatesBadge />
             <div className="text-xs px-2 py-1 rounded-md bg-muted hidden sm:block">{adminIp}</div>
             <Button variant="ghost" size="icon" className="h-8 w-8" onClick={onDisconnect}>
               <LogOut className="h-4 w-4" />

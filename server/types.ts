@@ -38,9 +38,9 @@ export type SystemStatus = {
     weekly: { amount: number; sessions: number };
     monthly: { amount: number; sessions: number };
   };
-  activeUsers: { count: number; idle: number };
+  activeUsers: { count: number; paused: number; idle: number };
   mikrotik: { ok: boolean; host: string; latencyMs: number };
-  internet: { ok: boolean; latencyMs: number };
+  internet: { ok: boolean; latencyMs: number; known?: boolean };
   coinSlot: { ok: boolean; state: string; pulsesToday: number };
   hotspot: { ok: boolean; ssid: string };
   esp32: { uptime: string; lastSeen: string | null };
@@ -51,6 +51,18 @@ export type SystemStatus = {
     ramTotalKb: number;
     logsUsedKb: number;
     logsTotalKb: number;
+    sd: {
+      present: boolean;
+      mounted: boolean;
+      usedMb: number;
+      totalMb: number;
+      freeMb: number;
+      status: "Ready" | "Missing" | "Mount Failed" | "Read Only" | "Error";
+      fallback?: boolean;
+      pollingDisabled?: boolean;
+      recoveryAttempts?: number;
+      mode?: "SD" | "SPIFFS Fallback";
+    };
   };
   sync: { pending: number; lastSyncAt: string | null };
 };

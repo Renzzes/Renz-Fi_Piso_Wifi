@@ -1,0 +1,37 @@
+R_DEF: Internal format may change without notice
+local
+color ic_launcher_background
+color renzfi_navy
+color renzfi_sky
+color renzfi_slate
+drawable ic_launcher_foreground
+drawable ic_launcher_foreground_img
+drawable ic_notification
+drawable renzfi_logo
+mipmap ic_launcher
+mipmap ic_launcher_round
+string about_app_name
+string about_description
+string about_link_label
+string about_title
+string about_vpn_note
+string add_device
+string app_name
+string app_version
+string checking_appliance
+string connection_help_title
+string delete_device
+string delete_device_message
+string device_management
+string device_overview
+string edit_device
+string logo_content_description
+string notification_channel_name
+string offline
+string online
+string open_dashboard
+string settings_title
+string unknown_status
+string version_label
+style Theme.RenzFiManager
+xml network_security_config

@@ -1,0 +1,1 @@
+ALTER TABLE active_sessions ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;

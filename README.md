@@ -20,8 +20,8 @@ npm install
 npm run dev
 ```
 
-- UI: http://localhost:5173 (proxies `/api` → backend)
-- Simulator API: http://localhost:3001
+- UI: http://127.0.0.1:5173 (proxies `/api` -> backend)
+- Simulator API: http://127.0.0.1:3001
 
 For static PWA output:
 

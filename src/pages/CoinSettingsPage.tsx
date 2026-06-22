@@ -1,6 +1,17 @@
 import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { PageHeader } from "@/components/PageHeader";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -55,22 +66,31 @@ export default function CoinSettingsPage() {
     onSuccess: () => toast.success("Test pulse acknowledged"),
   });
 
-  const stats = diagnostics?.stats ?? settings ?? {};
+  const resetMutation = useMutation({
+    mutationFn: () => coinApi.reset(),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["coin", "diagnostics"] });
+      toast.success("Coin diagnostics reset");
+    },
+    onError: () => toast.error("Failed to reset coin diagnostics"),
+  });
+
+  const stats = diagnostics?.stats;
 
   return (
     <div>
       <PageHeader title="Coin Settings" description="Configure the coin slot acceptor" />
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
-        <StatCard label="Last Pulse" value={stats.last_pulse ?? "0"} icon={Coins} />
+        <StatCard label="Last Pulse" value={stats?.last_pulse ?? "0"} icon={Coins} />
         <StatCard
           label="Total Today"
-          value={stats.total_today ?? "248"}
+          value={stats?.total_today ?? "0"}
           icon={Coins}
           tone="success"
         />
-        <StatCard label="Errors" value={stats.errors ?? "0"} tone="success" />
-        <StatCard label="State" value={stats.state ?? "Ready"} tone="success" />
+        <StatCard label="Errors" value={stats?.errors ?? "0"} tone="success" />
+        <StatCard label="State" value={stats?.state ?? "—"} tone="success" />
       </div>
 
       <div className="grid md:grid-cols-2 gap-3">
@@ -110,9 +130,28 @@ export default function CoinSettingsPage() {
             <Button size="sm" variant="outline" onClick={() => testMutation.mutate()}>
               Test Pulse
             </Button>
-            <Button size="sm" variant="outline">
-              Reset
-            </Button>
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button size="sm" variant="outline" disabled={resetMutation.isPending}>
+                  Reset
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Reset coin diagnostics?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    This clears today&apos;s pulse counters, error count, and the diagnostics log.
+                    Portal credits and active sessions are not affected.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction onClick={() => resetMutation.mutate()}>
+                    Reset counters
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           </div>
         </div>
       </div>

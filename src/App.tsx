@@ -1,17 +1,18 @@
-import { type FormEvent, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import { AdminLayout } from "@/components/AdminLayout";
-import { Button } from "@/components/ui/button";
+import { AuthCheckingScreen } from "@/components/AuthCheckingScreen";
+import { ConnectionLostOverlay } from "@/components/ConnectionLostOverlay";
 import {
   Dialog,
   DialogContent,
   DialogDescription,
-  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { ChangeAdminPasswordForm } from "@/components/ChangeAdminPasswordForm";
+import { SessionExpiryWarningDialog } from "@/components/SessionExpiryWarningDialog";
 import AuthPage from "@/pages/AuthPage";
 import DashboardPage from "@/pages/DashboardPage";
 import PromoRatesPage from "@/pages/PromoRatesPage";
@@ -21,61 +22,140 @@ import SalesReportsPage from "@/pages/SalesReportsPage";
 import CaptivePortalPage from "@/pages/CaptivePortalPage";
 import CoinSettingsPage from "@/pages/CoinSettingsPage";
 import RouterSettingsPage from "@/pages/RouterSettingsPage";
+import SystemConfigurationPage from "@/pages/SystemConfigurationPage";
 import LogsPage from "@/pages/LogsPage";
 import FirmwarePage from "@/pages/FirmwarePage";
 import SystemSettingsPage from "@/pages/SystemSettingsPage";
 import { toast } from "sonner";
 import { authApi, setRememberedIp } from "@/services/auth";
 import { ApiError } from "@/services/api";
+import { setUnauthorizedHandler } from "@/services/authSession";
+import {
+  clearReloginRequired,
+  isReloginRequired,
+  logoutBestEffort,
+  markReloginRequired,
+  resolveBootstrapAuth,
+  startLogoutRetryUntilSuccess,
+  stopLogoutRetry,
+} from "@/services/sessionGate";
 import { getEmbeddedHost } from "@/services/embeddedApi";
-import { useAdminEventStream } from "@/hooks/useAdminEventStream";
+import { useDashboardEvents } from "@/hooks/useDashboardEvents";
+import { useAdminApiMonitor } from "@/hooks/useAdminApiMonitor";
+import { useSessionIdleTimeout } from "@/hooks/useSessionIdleTimeout";
 import { RealtimeProvider, type RealtimeContextValue } from "@/contexts/RealtimeContext";
 
 export default function App() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [adminIp] = useState(() => getEmbeddedHost());
-  const [connected, setConnected] = useState<boolean | null>(null);
+  const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [showPasswordChange, setShowPasswordChange] = useState(false);
+  const [connectionRetrying, setConnectionRetrying] = useState(false);
 
-  const realtime: RealtimeContextValue = useAdminEventStream(connected === true);
+  const sessionChecked = authenticated !== null;
+  const isLoggedIn = authenticated === true;
+
+  const handleDisconnect = useCallback(async () => {
+    try {
+      const cleared = await logoutBestEffort();
+      if (cleared) {
+        clearReloginRequired();
+      } else {
+        markReloginRequired("disconnect");
+        startLogoutRetryUntilSuccess();
+      }
+    } catch {
+      markReloginRequired("disconnect");
+      startLogoutRetryUntilSuccess();
+    } finally {
+      setAuthenticated(false);
+      setShowPasswordChange(false);
+      navigate("/login", { replace: true });
+    }
+  }, [navigate]);
+
+  const handleReconnectRequireLogin = useCallback(async () => {
+    markReloginRequired("reconnect");
+    queryClient.clear();
+    setAuthenticated(false);
+    setShowPasswordChange(false);
+    navigate("/login", { replace: true });
+    toast.message("Connection restored. Please sign in again.");
+
+    const cleared = await logoutBestEffort();
+    if (!cleared) {
+      startLogoutRetryUntilSuccess();
+    }
+  }, [navigate, queryClient]);
+
+  const { connectionLost, adminApiReachable, retryConnection } = useAdminApiMonitor({
+    enabled: isLoggedIn,
+    onReconnectRequireLogin: handleReconnectRequireLogin,
+  });
+
+  const handleConnectionRetry = useCallback(async () => {
+    setConnectionRetrying(true);
+    try {
+      await retryConnection();
+    } finally {
+      setConnectionRetrying(false);
+    }
+  }, [retryConnection]);
+
+  const dashboardEvents = useDashboardEvents(isLoggedIn);
+  const realtime: RealtimeContextValue = {
+    ...dashboardEvents,
+    connectionLost,
+    adminApiReachable,
+  };
+
+  const { showWarning, stayLoggedIn } = useSessionIdleTimeout({
+    enabled: isLoggedIn && !connectionLost,
+    onExpire: () => {
+      toast.message("Session expired due to inactivity.");
+      void handleDisconnect();
+    },
+  });
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         const json = await authApi.health();
-        if (!cancelled) setConnected(Boolean(json?.session?.authenticated));
+        const serverAuthenticated = Boolean(json?.session?.authenticated);
+        if (isReloginRequired() && serverAuthenticated) {
+          void logoutBestEffort().then((cleared) => {
+            if (!cleared) startLogoutRetryUntilSuccess();
+          });
+        }
+        if (!cancelled) {
+          setAuthenticated(resolveBootstrapAuth(serverAuthenticated));
+        }
       } catch {
-        if (!cancelled) setConnected(false);
+        if (!cancelled) setAuthenticated(false);
       }
     })();
 
     return () => {
       cancelled = true;
+      stopLogoutRetry();
     };
   }, []);
 
   useEffect(() => {
-    let wasOnline = navigator.onLine;
+    setUnauthorizedHandler(() => {
+      toast.message("Your session has ended. Please sign in again.");
+      void handleDisconnect();
+    });
 
-    const handleChange = () => {
-      const nowOnline = navigator.onLine;
-      if (!nowOnline && wasOnline) {
-        toast.error("You appear to be offline. Reconnect to refresh data.");
-      }
-      wasOnline = nowOnline;
-    };
-
-    window.addEventListener("offline", handleChange);
-    window.addEventListener("online", handleChange);
     return () => {
-      window.removeEventListener("offline", handleChange);
-      window.removeEventListener("online", handleChange);
+      setUnauthorizedHandler(null);
     };
-  }, []);
+  }, [handleDisconnect]);
 
-  const handleConnect = async (ipAddress: string, password: string, rememberIp: boolean) => {
+  const handleConnect = async (ipAddress: string, password: string, rememberIpAddress: boolean) => {
     setConnecting(true);
     try {
       const health = await authApi.health();
@@ -84,10 +164,12 @@ export default function App() {
         return;
       }
 
-      const login = await authApi.login(password, rememberIp);
-      if (rememberIp) setRememberedIp(ipAddress);
+      const login = await authApi.login(password);
+      if (rememberIpAddress) setRememberedIp(ipAddress);
 
-      setConnected(true);
+      clearReloginRequired();
+      stopLogoutRetry();
+      setAuthenticated(true);
       setShowPasswordChange(Boolean(login.mustChangePassword));
       navigate("/dashboard", { replace: true });
     } catch (err) {
@@ -102,33 +184,30 @@ export default function App() {
     }
   };
 
-  const handleDisconnect = async () => {
-    try {
-      await authApi.logout();
-    } catch {
-      // Logout is best-effort; UI should still disconnect.
-    } finally {
-      setConnected(false);
-      setShowPasswordChange(false);
-      navigate("/login", { replace: true });
-    }
-  };
-
-  if (connected === null) {
-    return (
-      <div className="min-h-screen flex items-center justify-center text-sm text-muted-foreground">
-        Checking connection…
-      </div>
-    );
+  if (!sessionChecked) {
+    return <AuthCheckingScreen />;
   }
+
+  const adminEntry = isLoggedIn ? (
+    <Navigate to="/dashboard" replace />
+  ) : (
+    <Navigate to="/login" replace />
+  );
 
   return (
     <RealtimeProvider value={realtime}>
+      <ConnectionLostOverlay
+        open={isLoggedIn && connectionLost}
+        onRetry={() => void handleConnectionRetry()}
+        retrying={connectionRetrying}
+      />
       <Routes>
+        <Route path="/admin" element={adminEntry} />
+        <Route path="/admin/*" element={adminEntry} />
         <Route
           path="/login"
           element={
-            connected ? (
+            isLoggedIn ? (
               <Navigate to="/dashboard" replace />
             ) : (
               <AuthPage onConnect={handleConnect} connecting={connecting} />
@@ -139,8 +218,12 @@ export default function App() {
         <Route
           path="/"
           element={
-            connected ? (
-              <AdminLayout adminIp={adminIp} onDisconnect={handleDisconnect} />
+            isLoggedIn ? (
+              <AdminLayout
+                adminIp={adminIp}
+                onDisconnect={handleDisconnect}
+                connectionLost={connectionLost}
+              />
             ) : (
               <Navigate to="/login" replace />
             )
@@ -154,52 +237,34 @@ export default function App() {
           <Route path="sales-reports" element={<SalesReportsPage />} />
           <Route path="captive-portal" element={<CaptivePortalPage />} />
           <Route path="coin-settings" element={<CoinSettingsPage />} />
+          <Route path="system-configuration" element={<SystemConfigurationPage />} />
           <Route path="router-settings" element={<RouterSettingsPage />} />
           <Route path="logs" element={<LogsPage />} />
           <Route path="firmware" element={<FirmwarePage />} />
-          <Route path="system-settings" element={<SystemSettingsPage />} />
+          <Route
+            path="system-settings"
+            element={<SystemSettingsPage onPasswordChanged={handleDisconnect} />}
+          />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Route>
       </Routes>
-      <ChangePasswordDialog
-        open={connected === true && showPasswordChange}
-        onChanged={() => setShowPasswordChange(false)}
+      <ChangePasswordDialog open={isLoggedIn && showPasswordChange} onChanged={handleDisconnect} />
+      <SessionExpiryWarningDialog
+        open={isLoggedIn && showWarning}
+        onStayLoggedIn={stayLoggedIn}
+        onLogout={() => void handleDisconnect()}
       />
     </RealtimeProvider>
   );
 }
 
-function ChangePasswordDialog({ open, onChanged }: { open: boolean; onChanged: () => void }) {
-  const [oldPassword, setOldPassword] = useState("admin");
-  const [newPassword, setNewPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
-  const [saving, setSaving] = useState(false);
-
-  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (newPassword.length < 4) {
-      toast.error("New password must be at least 4 characters.");
-      return;
-    }
-    if (newPassword !== confirmPassword) {
-      toast.error("New passwords do not match.");
-      return;
-    }
-
-    setSaving(true);
-    try {
-      await authApi.changePassword({ oldPassword, newPassword });
-      toast.success("Admin password changed.");
-      setNewPassword("");
-      setConfirmPassword("");
-      onChanged();
-    } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : "Failed to change password.");
-    } finally {
-      setSaving(false);
-    }
-  };
-
+function ChangePasswordDialog({
+  open,
+  onChanged,
+}: {
+  open: boolean;
+  onChanged: () => void | Promise<void>;
+}) {
   return (
     <Dialog open={open} onOpenChange={() => undefined}>
       <DialogContent
@@ -213,46 +278,7 @@ function ChangePasswordDialog({ open, onChanged }: { open: boolean; onChanged: (
             Change the default admin password before continuing.
           </DialogDescription>
         </DialogHeader>
-        <form className="space-y-4" onSubmit={handleSubmit}>
-          <div className="space-y-2">
-            <Label htmlFor="oldPassword">Old Password</Label>
-            <Input
-              id="oldPassword"
-              type="password"
-              value={oldPassword}
-              onChange={(event) => setOldPassword(event.target.value)}
-              autoComplete="current-password"
-              required
-            />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="newPassword">New Password:</Label>
-            <Input
-              id="newPassword"
-              type="password"
-              value={newPassword}
-              onChange={(event) => setNewPassword(event.target.value)}
-              autoComplete="new-password"
-              required
-            />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="confirmPassword">Confirm New Password:</Label>
-            <Input
-              id="confirmPassword"
-              type="password"
-              value={confirmPassword}
-              onChange={(event) => setConfirmPassword(event.target.value)}
-              autoComplete="new-password"
-              required
-            />
-          </div>
-          <DialogFooter>
-            <Button type="submit" disabled={saving}>
-              {saving ? "Saving..." : "Change Password"}
-            </Button>
-          </DialogFooter>
-        </form>
+        <ChangeAdminPasswordForm defaultOldPassword="admin" onSuccess={onChanged} />
       </DialogContent>
     </Dialog>
   );

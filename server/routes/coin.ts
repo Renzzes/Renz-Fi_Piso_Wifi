@@ -61,3 +61,21 @@ coinRouter.post("/test", (_req, res) => {
   publishAdminEvent("logs.changed");
   return sendSuccess(res, { ok: true }, "Test pulse acknowledged (simulator only)");
 });
+
+coinRouter.post("/reset", (_req, res) => {
+  const upsert = db.prepare(
+    `INSERT INTO coin_settings (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+  );
+  upsert.run("last_pulse", "0");
+  upsert.run("total_today", "0");
+  upsert.run("errors", "0");
+  upsert.run("state", "Ready");
+  logStructured({
+    level: "INFO",
+    category: "diagnostics",
+    message: "Coin diagnostics counters reset",
+  });
+  publishAdminEvent("coin.diagnostics");
+  return sendSuccess(res, { ok: true });
+});

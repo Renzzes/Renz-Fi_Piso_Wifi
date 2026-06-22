@@ -6,8 +6,8 @@ function normalizeIp(ip: string) {
   return ip.replace(/^::ffff:/, "");
 }
 
-function isLocalhost(ip: string) {
-  return ip === "127.0.0.1" || ip === "::1" || ip === "localhost";
+function isLoopback(ip: string) {
+  return ip === "127.0.0.1" || ip === "::1";
 }
 
 function ipInCidr(ip: string, cidr: string) {
@@ -28,7 +28,7 @@ function ipInCidr(ip: string, cidr: string) {
 export function lanSecurityMiddleware(req: Request, res: Response, next: NextFunction) {
   const ip = normalizeIp(String(req.ip ?? req.socket.remoteAddress ?? ""));
 
-  if (isLocalhost(ip) || config.isDev) {
+  if (isLoopback(ip) || config.isDev) {
     return next();
   }
 

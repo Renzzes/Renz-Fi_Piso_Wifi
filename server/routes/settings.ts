@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { settingsRepository } from "../db/repositories/settingsRepository.js";
 import { z } from "zod";
+import { logStructured } from "../services/logger.js";
 import { sendError, sendSuccess } from "../utils/response.js";
 
 export const settingsRouter = Router();
@@ -34,15 +35,25 @@ settingsRouter.put("/admin", async (req, res) => {
 });
 
 settingsRouter.get("/backup", (_req, res) => {
+  logStructured({ level: "INFO", category: "backup", message: "export started" });
   const backup = settingsRepository.backup();
   res.setHeader("Content-Type", "application/json");
-  res.setHeader("Content-Disposition", 'attachment; filename="renz-fi-backup.json"');
-  res.json(backup);
+  res.setHeader("Content-Disposition", 'attachment; filename="renzfi-backup.json"');
+  logStructured({ level: "INFO", category: "backup", message: "export completed" });
+  res.json({
+    backupVersion: 1,
+    firmwareVersion: "simulator",
+    exportedAt: backup.exportedAt,
+    ...backup,
+  });
 });
 
 settingsRouter.post("/restore", (req, res) => {
+  logStructured({ level: "INFO", category: "restore", message: "restore started" });
   const backupSchema = z
     .object({
+      backupVersion: z.number().optional(),
+      firmwareVersion: z.string().optional(),
       exportedAt: z.string(),
       promo_rates: z.array(z.record(z.any())).optional(),
       vouchers: z.array(z.record(z.any())).optional(),
@@ -69,5 +80,6 @@ settingsRouter.post("/restore", (req, res) => {
   }
 
   const result = settingsRepository.restore(parsed.data);
-  return sendSuccess(res, result);
+  logStructured({ level: "INFO", category: "restore", message: "restore completed" });
+  return sendSuccess(res, { ...result, rebooting: false });
 });

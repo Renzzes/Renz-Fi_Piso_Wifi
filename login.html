@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b84ff" />
+    <meta name="format-detection" content="telephone=no" />
+    <meta http-equiv="pragma" content="no-cache" />
+    <meta http-equiv="expires" content="-1" />
+    <title>Renz-Fi Piso WiFi</title>
+    <link rel="stylesheet" href="renzfi-style.css" />
+  </head>
+
+  <body>
+    $(if chap-id)
+
+    <form name="sendin" action="$(link-login-only)" method="post" style="display: none">
+      <input type="hidden" name="username" />
+      <input type="hidden" name="password" />
+      <input type="hidden" name="dst" value="$(link-orig)" />
+      <input type="hidden" name="popup" value="true" />
+    </form>
+
+    <script src="md5.js"></script>
+
+    <script>
+      function doLogin() {
+        document.sendin.username.value = document.login.username.value;
+        document.sendin.password.value = hexMD5(
+          "$(chap-id)" + document.login.password.value + "$(chap-challenge)",
+        );
+        document.sendin.submit();
+        return false;
+      }
+    </script>
+
+    $(endif)
+
+    <main class="portal-shell">
+      <header class="hero">
+        <img
+          class="portal-logo"
+          id="portalBanner"
+          src="Default-Banner.png"
+          data-upload-src="portal-banner.png"
+          data-default-src="Default-Banner.png"
+          alt="Renz-Fi Piso WiFi"
+        />
+      </header>
+
+      <section class="status-line">
+        <div>
+          <p>
+            <span>Status :</span>
+            <strong id="connectionStatus" class="disconnected">Disconnected</strong>
+          </p>
+          <small id="currentDate"></small>
+        </div>
+      </section>
+
+      <section class="device-card">
+        <article class="info-item">
+          <p>IP ADDRESS</p>
+          <strong id="ipAddress">$(ip)</strong>
+        </article>
+        <article class="info-item">
+          <p>MAC ADDRESS</p>
+          <strong id="macAddress">$(mac)</strong>
+        </article>
+        <article class="info-item credits-item">
+          <p>ACCOUNT CREDITS</p>
+          <strong id="credits">&#8369;0.00</strong>
+        </article>
+      </section>
+
+      <section class="card timer-card">
+        <p class="eyebrow">REMAINING TIME</p>
+        <div class="timer" id="mainTimer">00:00:00</div>
+        <div class="timer-labels">
+          <span>HRS</span>
+          <span>MINS</span>
+          <span>SECS</span>
+        </div>
+      </section>
+
+      <section class="actions">
+        <button type="button" class="action-btn green" id="insertCoinBtn">
+          <span>&#x1FA99;</span>
+          <span class="action-label">INSERT COIN</span>
+          <span class="chevron">&#x203A;</span>
+        </button>
+
+        <button type="button" class="action-btn red" id="pauseButton" aria-pressed="false">
+          <span>&#x23F8;</span>
+          <b id="pauseButtonText">PAUSE</b>
+          <span class="chevron">&#x203A;</span>
+        </button>
+
+        <button type="button" class="action-btn blue" id="viewRatesBtn">
+          <span>&#x1F3F7;</span>
+          VIEW RATES
+          <span class="chevron">&#x203A;</span>
+        </button>
+      </section>
+
+      <section class="card voucher-card">
+        <h2>HAVE A VOUCHER?</h2>
+        <form name="login" id="voucherForm" action="$(link-login-only)" method="post" $(if chap-id) onSubmit="return doLogin()" $(endif)>
+          <input type="hidden" name="dst" value="$(link-orig)" />
+          <input type="hidden" name="popup" value="true" />
+          <input type="hidden" name="password" value="renzfi" />
+          <div class="voucher-row">
+            <div class="input-wrap">
+              <input
+                id="voucherCode"
+                name="username"
+                type="text"
+                placeholder="ENTER VOUCHER CODE HERE..."
+              />
+            </div>
+            <button type="submit" class="connect-btn">CONNECT</button>
+          </div>
+          <p id="voucherHelp">Voucher is case-insensitive</p>
+        </form>
+      </section>
+
+      <footer class="footer">
+        <div class="color-strip"></div>
+        <p>Powered by <strong>Renz-Fi Piso WiFi</strong></p>
+        <small>Thank you for using our service!</small>
+      </footer>
+    </main>
+
+    <!-- INSERT COIN MODAL -->
+    <div class="modal" id="coinModal" hidden>
+      <div class="modal-box">
+        <button type="button" class="close-modal" data-close-modal>&#x00D7;</button>
+        <h2>Please Insert Money</h2>
+        <p>Waiting for <strong id="coinCountdown">60</strong> seconds</p>
+        <div class="progress-wrap">
+          <div class="progress-bar" id="coinProgressBar"></div>
+        </div>
+        <div class="rates-summary">
+          <div class="rate-line">
+            <span>&#x1F552; Time:</span>
+            <strong id="coinTime">0m</strong>
+          </div>
+          <div class="rate-line">
+            <span>&#x1F3F7; Voucher:</span>
+            <strong id="coinVoucherTime">0m</strong>
+          </div>
+          <div class="rate-line">
+            <span>&#x1F4B5; Total Amount:</span>
+            <strong>&#8369;<span id="insertedAmount">0.00</span></strong>
+          </div>
+        </div>
+        <small id="coinNote">Waiting for coin pulses from the machine.</small>
+        <button type="button" class="cancel-btn" id="donePayingBtn">Done Paying</button>
+      </div>
+    </div>
+
+    <!-- BACKGROUND MUSIC (plays during coin insert countdown) -->
+    <audio id="bgMusic" loop preload="auto">
+      <source src="bg_music.mp3" type="audio/mpeg" />
+    </audio>
+
+    <!-- RATES MODAL -->
+    <div class="modal" id="ratesModal" hidden>
+      <div class="modal-box">
+        <button type="button" class="close-modal" data-close-modal>&#x00D7;</button>
+        <h2>WiFi Rates</h2>
+        <p>Affordable time packages for browsing and gaming.</p>
+        <div class="rates-list">
+          <div class="rate-card"><span>&#8369;1</span><strong>5 mins</strong></div>
+          <div class="rate-card"><span>&#8369;5</span><strong>30 mins</strong></div>
+          <div class="rate-card"><span>&#8369;10</span><strong>70 mins</strong></div>
+          <div class="rate-card"><span>&#8369;20</span><strong>150 mins</strong></div>
+        </div>
+        <button type="button" class="done-btn" data-close-modal>Done</button>
+      </div>
+    </div>
+
+    <script src="renzfi-app.js"></script>
+  </body>
+</html>

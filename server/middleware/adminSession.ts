@@ -8,7 +8,7 @@ const PUBLIC_PATHS = new Set(["/health", "/auth/login", "/auth/logout"]);
 
 export function adminSessionRequiredMiddleware(req: Request, res: Response, next: NextFunction) {
   const p = req.path;
-  if (PUBLIC_PATHS.has(p)) {
+  if (PUBLIC_PATHS.has(p) || p.startsWith("/portal/")) {
     return next();
   }
 

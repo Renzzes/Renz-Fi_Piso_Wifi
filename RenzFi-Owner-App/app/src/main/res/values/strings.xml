@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Renz-Fi Manager</string>
+    <string name="app_version">1.0.0</string>
+    <string name="version_label">Version %1$s</string>
+    <string name="checking_appliance">Checking appliance…</string>
+    <string name="device_management">Device Management</string>
+    <string name="add_device">Add Device</string>
+    <string name="edit_device">Edit Device</string>
+    <string name="delete_device">Delete Device</string>
+    <string name="open_dashboard">Open Dashboard</string>
+    <string name="device_overview">Device Overview</string>
+    <string name="about_title">About</string>
+    <string name="about_app_name">Renz-Fi Manager</string>
+    <string name="about_description">Manage multiple Renz-Fi vendo installations from one app. Connect locally on your LAN — no cloud, no VPS, no third-party relay.</string>
+    <string name="about_vpn_note">Future remote access will use MikroTik WireGuard VPN.</string>
+    <string name="about_link_label">About Renz-Fi Manager</string>
+    <string name="settings_title">Settings</string>
+    <string name="logo_content_description">Renz-Fi logo</string>
+    <string name="delete_device_message">This will permanently remove \"%1$s\" from Renz-Fi Manager.</string>
+    <string name="online">Online</string>
+    <string name="offline">Offline</string>
+    <string name="unknown_status">Unknown</string>
+    <string name="connection_help_title">Renz-Fi Appliance Not Found</string>
+    <string name="notification_channel_name">Renz-Fi Manager</string>
+</resources>

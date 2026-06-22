@@ -1,12 +1,23 @@
 import { Router } from "express";
-import { getRouterConfig, saveRouterConfig, testRouterConnection } from "../services/mikrotik.js";
+import {
+  getPublicRouterConfig,
+  listHotspotProfiles,
+  resolveRouterCredentials,
+  saveRouterConfig,
+  testRouterConnection,
+} from "../services/mikrotik.js";
 import { z } from "zod";
 import { sendError, sendSuccess } from "../utils/response.js";
 
 export const routerRouter = Router();
 
 routerRouter.get("/settings", (_req, res) => {
-  return sendSuccess(res, getRouterConfig());
+  return sendSuccess(res, getPublicRouterConfig());
+});
+
+routerRouter.get("/profiles", (_req, res) => {
+  const result = listHotspotProfiles();
+  return sendSuccess(res, result, result.error ? "Profiles unavailable" : "Profiles loaded");
 });
 
 routerRouter.put("/settings", (req, res) => {
@@ -14,9 +25,10 @@ routerRouter.put("/settings", (req, res) => {
     .object({
       host: z.string().trim().min(1).max(256),
       username: z.string().trim().min(1).max(128),
-      password: z.string().trim().max(256),
+      password: z.string().max(256).optional(),
       profile: z.string().trim().min(1).max(128),
       ssid: z.string().trim().min(1).max(128).optional(),
+      wifiPassword: z.string().max(256).optional(),
     })
     .safeParse(req.body);
 
@@ -38,9 +50,10 @@ routerRouter.post("/test", async (req, res) => {
     .object({
       host: z.string().trim().min(1).max(256).optional(),
       username: z.string().trim().min(1).max(128).optional(),
-      password: z.string().trim().max(256).optional(),
+      password: z.string().max(256).optional(),
       profile: z.string().trim().min(1).max(128).optional(),
       ssid: z.string().trim().min(1).max(128).optional(),
+      wifiPassword: z.string().max(256).optional(),
     })
     .safeParse(req.body);
 
@@ -53,7 +66,7 @@ routerRouter.post("/test", async (req, res) => {
     });
   }
 
-  const config = { ...getRouterConfig(), ...parsed.data };
-  const ok = await testRouterConnection(config);
-  return sendSuccess(res, { ok });
+  const config = resolveRouterCredentials(parsed.data);
+  const result = await testRouterConnection(config);
+  return sendSuccess(res, result);
 });

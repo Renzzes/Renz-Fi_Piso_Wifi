@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Download } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
@@ -13,7 +13,39 @@ import {
 } from "@/components/ui/table";
 import { StatCard } from "@/components/StatCard";
 import { salesApi } from "@/services/sales";
-function MiniBars({ data, labels }: { data: number[]; labels: string[] }) {
+import { formatPeso } from "@/lib/currency";
+import { toast } from "sonner";
+import type { ChartData } from "@/types/api";
+
+function hasChartData(chart: ChartData | undefined): chart is ChartData {
+  return Boolean(chart?.data?.length);
+}
+
+function MiniBars({
+  data,
+  labels,
+  loading,
+}: {
+  data: number[];
+  labels: string[];
+  loading: boolean;
+}) {
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-32 text-sm text-muted-foreground">
+        Loading...
+      </div>
+    );
+  }
+
+  if (!data.length) {
+    return (
+      <div className="flex items-center justify-center h-32 text-sm text-muted-foreground">
+        No sales data
+      </div>
+    );
+  }
+
   const max = Math.max(...data, 1);
   return (
     <div className="flex items-end gap-1 h-32 px-1">
@@ -22,7 +54,7 @@ function MiniBars({ data, labels }: { data: number[]; labels: string[] }) {
           <div
             className="w-full bg-primary rounded-sm transition-all"
             style={{ height: `${(v / max) * 100}%`, minHeight: 2 }}
-            title={`${labels[i]}: ₱${v}`}
+            title={`${labels[i]}: ${formatPeso(v)}`}
           />
           <span className="text-[10px] text-muted-foreground">{labels[i]}</span>
         </div>
@@ -31,35 +63,46 @@ function MiniBars({ data, labels }: { data: number[]; labels: string[] }) {
   );
 }
 
+function formatSalesAmount(amount: number | undefined, loading: boolean) {
+  return formatPeso(amount, loading);
+}
+
 export default function SalesReportsPage() {
-  const { data: today } = useQuery({
+  const { data: today, isLoading: todayLoading } = useQuery({
     queryKey: ["sales", "today"],
     queryFn: () => salesApi.today(),
   });
-  const { data: weekly } = useQuery({
+  const { data: weekly, isLoading: weeklyLoading } = useQuery({
     queryKey: ["sales", "weekly"],
     queryFn: () => salesApi.weekly(),
   });
-  const { data: dailyChart } = useQuery({
+  const { data: dailyChart, isLoading: dailyChartLoading } = useQuery({
     queryKey: ["sales", "chart", "daily"],
     queryFn: () => salesApi.chartDaily(),
   });
-  const { data: weeklyChart } = useQuery({
+  const { data: weeklyChart, isLoading: weeklyChartLoading } = useQuery({
     queryKey: ["sales", "chart", "weekly"],
     queryFn: () => salesApi.chartWeekly(),
   });
-  const { data: monthlyChart } = useQuery({
+  const { data: monthlyChart, isLoading: monthlyChartLoading } = useQuery({
     queryKey: ["sales", "chart", "monthly"],
     queryFn: () => salesApi.chartMonthly(),
   });
-  const { data: history = [] } = useQuery({
+  const { data: history = [], isLoading: historyLoading } = useQuery({
     queryKey: ["sales", "history"],
     queryFn: () => salesApi.history(),
   });
 
-  const daily = dailyChart?.data ?? [12, 28, 18, 42, 35, 56, 48];
-  const dailyLabels = dailyChart?.labels ?? ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-  const total = daily.reduce((a, b) => a + b, 0);
+  const exportMutation = useMutation({
+    mutationFn: () => salesApi.exportCsv(),
+    onSuccess: () => toast.success("Sales report downloaded"),
+    onError: (error: Error) => toast.error(error.message || "Export failed"),
+  });
+
+  const daily = hasChartData(dailyChart) ? dailyChart.data : [];
+  const dailyLabels = hasChartData(dailyChart) ? dailyChart.labels : [];
+  const dailyTotal = daily.reduce((a, b) => a + b, 0);
+  const avgPerDay = daily.length > 0 ? Math.round(dailyTotal / daily.length) : undefined;
 
   return (
     <div>
@@ -70,7 +113,8 @@ export default function SalesReportsPage() {
           <Button
             size="sm"
             variant="outline"
-            onClick={() => window.open(salesApi.exportUrl(), "_blank")}
+            disabled={exportMutation.isPending}
+            onClick={() => exportMutation.mutate()}
           >
             <Download className="h-4 w-4" /> Export CSV
           </Button>
@@ -78,9 +122,9 @@ export default function SalesReportsPage() {
       />
 
       <div className="grid grid-cols-3 gap-2 mb-3">
-        <StatCard label="Today" value={`₱${today?.amount ?? daily[daily.length - 1]}`} />
-        <StatCard label="This Week" value={`₱${weekly?.amount ?? total}`} />
-        <StatCard label="Avg / Day" value={`₱${Math.round(total / 7)}`} />
+        <StatCard label="Today" value={formatSalesAmount(today?.amount, todayLoading)} />
+        <StatCard label="This Week" value={formatSalesAmount(weekly?.amount, weeklyLoading)} />
+        <StatCard label="Avg / Day" value={formatPeso(avgPerDay, dailyChartLoading)} />
       </div>
 
       <Tabs defaultValue="daily" className="rounded-md border bg-card p-3">
@@ -90,18 +134,20 @@ export default function SalesReportsPage() {
           <TabsTrigger value="monthly">Monthly</TabsTrigger>
         </TabsList>
         <TabsContent value="daily">
-          <MiniBars data={daily} labels={dailyLabels} />
+          <MiniBars data={daily} labels={dailyLabels} loading={dailyChartLoading} />
         </TabsContent>
         <TabsContent value="weekly">
           <MiniBars
-            data={weeklyChart?.data ?? [180, 220, 195, 260]}
-            labels={weeklyChart?.labels ?? ["W1", "W2", "W3", "W4"]}
+            data={hasChartData(weeklyChart) ? weeklyChart.data : []}
+            labels={hasChartData(weeklyChart) ? weeklyChart.labels : []}
+            loading={weeklyChartLoading}
           />
         </TabsContent>
         <TabsContent value="monthly">
           <MiniBars
-            data={monthlyChart?.data ?? [1820, 2100, 1980, 2400, 2680, 2950]}
-            labels={monthlyChart?.labels ?? ["Jan", "Feb", "Mar", "Apr", "May", "Jun"]}
+            data={hasChartData(monthlyChart) ? monthlyChart.data : []}
+            labels={hasChartData(monthlyChart) ? monthlyChart.labels : []}
+            loading={monthlyChartLoading}
           />
         </TabsContent>
       </Tabs>
@@ -117,15 +163,23 @@ export default function SalesReportsPage() {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {history.map((r) => (
-              <TableRow key={r.date}>
-                <TableCell className="text-xs">{r.date}</TableCell>
-                <TableCell>{r.sessions}</TableCell>
-                <TableCell>{r.revenue}</TableCell>
-                <TableCell className="text-right tabular-nums">₱{r.revenue}</TableCell>
+            {historyLoading ? (
+              <TableRow>
+                <TableCell colSpan={4} className="text-center text-muted-foreground py-6 text-sm">
+                  Loading...
+                </TableCell>
               </TableRow>
-            ))}
-            {history.length === 0 && (
+            ) : (
+              history.map((r) => (
+                <TableRow key={r.date}>
+                  <TableCell className="text-xs">{r.date}</TableCell>
+                  <TableCell>{r.sessions}</TableCell>
+                  <TableCell>{r.revenue}</TableCell>
+                  <TableCell className="text-right tabular-nums">{formatPeso(r.revenue)}</TableCell>
+                </TableRow>
+              ))
+            )}
+            {!historyLoading && history.length === 0 && (
               <TableRow>
                 <TableCell colSpan={4} className="text-center text-muted-foreground py-6 text-sm">
                   No sales history

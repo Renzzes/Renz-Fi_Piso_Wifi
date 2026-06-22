@@ -1,5 +1,6 @@
 import { db } from "../db/connection.js";
 import { writeQueue } from "./writeQueue.js";
+import { pushRamLog } from "./ramLogs.js";
 
 export type LogLevel = "DEBUG" | "INFO" | "OK" | "WARN" | "ERR";
 export type LogCategory =
@@ -10,7 +11,10 @@ export type LogCategory =
   | "diagnostics"
   | "captive_portal"
   | "firmware"
-  | "system";
+  | "system"
+  | "backup"
+  | "restore"
+  | "sales";
 
 export type StructuredLogInput = {
   level: LogLevel;
@@ -40,6 +44,12 @@ export function logStructured(input: StructuredLogInput) {
       `INSERT INTO logs (level, message, type, metadata, created_at)
        VALUES (?, ?, ?, ?, datetime('now'))`,
     ).run(levelToDb(input.level), input.message, input.category, metadataJson);
+  });
+
+  pushRamLog({
+    lvl: levelToDb(input.level),
+    type: input.category,
+    msg: input.message,
   });
 
   if (process.env.NODE_ENV !== "production" && input.level === "ERR") {

@@ -9,4 +9,5 @@ export const coinApi = {
   diagnostics: () =>
     api.get<{ stats: Record<string, string>; logs: LogEntry[] }>(`${embeddedApi.coin}/diagnostics`),
   test: () => api.post<{ ok: boolean }>(`${embeddedApi.coin}/test`),
+  reset: () => api.post<{ ok: boolean }>(`${embeddedApi.coin}/reset`),
 };

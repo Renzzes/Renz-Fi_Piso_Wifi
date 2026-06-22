@@ -34,12 +34,31 @@ export function StatCard({
   );
 }
 
-export function StatusRow({ label, status, ok }: { label: string; status: string; ok: boolean }) {
+export function StatusRow({
+  label,
+  status,
+  ok,
+  variant = ok ? "ok" : "bad",
+}: {
+  label: string;
+  status: string;
+  ok: boolean;
+  variant?: "ok" | "bad" | "unknown" | "unconfigured";
+}) {
+  const dotClass =
+    variant === "unconfigured"
+      ? "bg-muted-foreground/50"
+      : variant === "unknown"
+        ? "bg-amber-500"
+        : variant === "ok" || ok
+          ? "bg-emerald-500"
+          : "bg-red-500";
+
   return (
     <div className="flex items-center justify-between py-2 border-b last:border-0 text-sm">
       <span className="text-muted-foreground">{label}</span>
       <span className="flex items-center gap-2">
-        <span className={cn("h-2 w-2 rounded-full", ok ? "bg-emerald-500" : "bg-red-500")} />
+        <span className={cn("h-2 w-2 rounded-full", dotClass)} />
         <span className="font-medium">{status}</span>
       </span>
     </div>

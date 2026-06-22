@@ -28,20 +28,6 @@ if (voucherCount.c === 0) {
   for (const v of vouchers) insertVoucher.run(...v);
 }
 
-const sessionCount = db.prepare("SELECT COUNT(*) as c FROM active_sessions").get() as { c: number };
-if (sessionCount.c === 0) {
-  const insertSession = db.prepare(
-    `INSERT INTO active_sessions (mac, ip, remaining, device) VALUES (?, ?, ?, ?)`,
-  );
-  const sessions = [
-    ["A4:C3:F0:12:8B:9D", "10.10.10.21", "1h 22m", "iPhone"],
-    ["B8:27:EB:55:AA:01", "10.10.10.34", "0h 14m", "Android"],
-    ["DC:A6:32:9F:11:42", "10.10.10.45", "3h 05m", "Laptop"],
-    ["E4:5F:01:7C:88:33", "10.10.10.58", "0h 02m", "Android"],
-  ] as const;
-  for (const s of sessions) insertSession.run(...s);
-}
-
 const logCount = db.prepare("SELECT COUNT(*) as c FROM logs").get() as { c: number };
 if (logCount.c === 0) {
   const insertLog = db.prepare(
@@ -95,9 +81,9 @@ setDefault("coin_settings", "last_pulse", "0");
 setDefault("coin_settings", "total_today", "248");
 setDefault("coin_settings", "errors", "0");
 setDefault("coin_settings", "state", "Ready");
-setDefault("router_settings", "host", "10.0.0.1");
+setDefault("router_settings", "host", "10.40.0.1");
 setDefault("router_settings", "username", "admin");
 setDefault("router_settings", "password", "");
 setDefault("router_settings", "profile", "default");
-setDefault("router_settings", "ssid", "Renz-Fi");
+setDefault("router_settings", "ssid", "RenzFi_PesoWifi");
 setDefault("router_settings", "connected", "1");

@@ -1,4 +1,5 @@
 import { apiUrl } from "./embeddedApi";
+import { handleUnauthorizedResponse } from "./authSession";
 
 export class ApiError extends Error {
   constructor(
@@ -11,11 +12,18 @@ export class ApiError extends Error {
 }
 
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const isFormData = typeof FormData !== "undefined" && init?.body instanceof FormData;
+  const isBinaryBody =
+    init?.body instanceof Blob ||
+    init?.body instanceof ArrayBuffer ||
+    (typeof ArrayBuffer !== "undefined" &&
+      init?.body != null &&
+      ArrayBuffer.isView(init.body as ArrayBufferView));
   const res = await fetch(apiUrl(path), {
     credentials: "include",
     ...init,
     headers: {
-      "Content-Type": "application/json",
+      ...(isFormData || isBinaryBody ? {} : { "Content-Type": "application/json" }),
       ...init?.headers,
     },
   });
@@ -30,8 +38,12 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
       const text = await res.text().catch(() => "");
       if (text) message = text;
     }
+    if (res.status === 401) {
+      handleUnauthorizedResponse(path);
+    }
     throw new ApiError(message || `Request failed (${res.status})`, res.status, code);
   }
+
   if (res.status === 204) return undefined as T;
   const contentType = res.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
@@ -64,4 +76,6 @@ export const api = {
       body: body !== undefined ? JSON.stringify(body) : undefined,
     }),
   delete: <T>(path: string) => apiFetch<T>(path, { method: "DELETE" }),
+  upload: <T>(path: string, form: FormData) =>
+    apiFetch<T>(path, { method: "POST", body: form }),
 };

@@ -7,7 +7,6 @@ export function setAdminSessionCookie(res: Response, token: string) {
     "HttpOnly",
     "Path=/",
     "SameSite=Strict",
-    `Max-Age=${config.adminSessionCookie.ttlSeconds}`,
   ];
   if (config.isProd) parts.push("Secure");
   res.setHeader("Set-Cookie", parts.join("; "));

@@ -4,7 +4,7 @@ import { apiUrl, embeddedApi } from "./embeddedApi";
 const REMEMBER_IP_KEY = "renz_admin_ip";
 
 export const authApi = {
-  login: (password: string, rememberIp?: boolean) =>
+  login: (password: string) =>
     api.post<{
       authenticated: boolean;
       username: string;
@@ -12,7 +12,6 @@ export const authApi = {
       mustChangePassword?: boolean;
     }>(`${embeddedApi.auth}/login`, {
       password,
-      rememberIp,
     }),
 
   logout: () => api.post<{ success: boolean; message: string }>(`${embeddedApi.auth}/logout`),

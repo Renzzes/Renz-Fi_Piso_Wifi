@@ -1,4 +1,4 @@
-const DEFAULT_EMBEDDED_HOST = "10.10.10.1";
+const DEFAULT_EMBEDDED_HOST = "192.168.30.252";
 
 export const apiBaseUrl = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 
@@ -19,7 +19,14 @@ export const embeddedApi = {
 };
 
 export function apiUrl(path: string) {
+  if (/^https?:\/\//i.test(path)) return path;
   return `${apiBaseUrl}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+/** Resolve portal branding asset URLs from settings (relative or absolute). */
+export function resolvePortalAssetUrl(url?: string | null): string {
+  if (!url) return "";
+  return apiUrl(url);
 }
 
 export function getEmbeddedHost() {
@@ -28,5 +35,5 @@ export function getEmbeddedHost() {
 
 export function getDefaultAdminAddress() {
   const host = getEmbeddedHost();
-  return host === "localhost" || host === "127.0.0.1" ? DEFAULT_EMBEDDED_HOST : host;
+  return host === "127.0.0.1" || host === "::1" ? DEFAULT_EMBEDDED_HOST : host;
 }

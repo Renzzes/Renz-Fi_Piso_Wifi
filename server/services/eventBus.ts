@@ -3,13 +3,17 @@ import type { Response } from "express";
 
 export type AdminEventType =
   | "system.status"
+  | "sessions.changed"
   | "users.active"
   | "logs.changed"
   | "sync.queue"
   | "coin.diagnostics"
   | "vouchers.changed"
   | "sales.changed"
-  | "promos.changed";
+  | "promos.changed"
+  | "log.entry"
+  | "portal.changed"
+  | "firmware.progress";
 
 export type AdminEvent = {
   type: AdminEventType;
