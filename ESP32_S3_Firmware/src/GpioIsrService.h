@@ -2,10 +2,9 @@
 
 #include <esp_err.h>
 
-// Central GPIO ISR dispatcher — installed exactly once before any
-// gpio_isr_handler_add() use. ETH.begin() also installs the service;
-// noteExternalInstall() after ETH.begin() records that so ensureInstalled()
-// never invokes gpio_install_isr_service() again.
+// Singleton GPIO ISR dispatcher — gpio_install_isr_service() runs at most once.
+// ETH.begin() installs the service on arduino-esp32 3.x; call noteExternalInstall()
+// immediately after a successful ETH.begin() so ensureInstalled() stays a no-op.
 class GpioIsrService {
  public:
   static esp_err_t ensureInstalled(const char *requester = nullptr);

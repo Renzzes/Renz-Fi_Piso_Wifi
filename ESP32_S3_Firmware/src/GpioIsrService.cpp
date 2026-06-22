@@ -10,14 +10,19 @@ bool GpioIsrService::isInstalled() {
 }
 
 void GpioIsrService::noteExternalInstall(const char *source) {
+  if (g_gpioIsrInstalled) {
+    Serial.println("[GPIO_ISR] Service already installed");
+    return;
+  }
   g_gpioIsrInstalled = true;
   if (source && source[0] != '\0') {
-    Serial.printf("[GPIO_ISR] registered (via %s)\n", source);
+    Serial.printf("[GPIO_ISR] Service registered (installed by %s)\n", source);
   }
 }
 
 esp_err_t GpioIsrService::ensureInstalled(const char *requester) {
   if (g_gpioIsrInstalled) {
+    Serial.println("[GPIO_ISR] Service already installed");
     return ESP_OK;
   }
 
@@ -35,6 +40,7 @@ esp_err_t GpioIsrService::ensureInstalled(const char *requester) {
 
   if (err == ESP_ERR_INVALID_STATE) {
     g_gpioIsrInstalled = true;
+    Serial.println("[GPIO_ISR] Service already installed");
     return ESP_OK;
   }
 

@@ -35,6 +35,9 @@ void FirmwareApp::begin() {
   Serial.printf("[boot] IP   : %s\n", _eth.ip().c_str());
   Serial.println("----------------------------------------");
 
+  // ETH.begin() installs the GPIO ISR service on arduino-esp32 3.x — record it
+  // so ensureInstalled() never calls gpio_install_isr_service() a second time.
+  GpioIsrService::noteExternalInstall("ETH.begin");
   GpioIsrService::ensureInstalled("boot");
 
   // ── Phase 2: SPIFFS ────────────────────────────────────────────────────────
@@ -63,7 +66,11 @@ void FirmwareApp::begin() {
   _mikrotik.begin(&_storage, &_logger);
   _portalSessions.begin(&_storage, &_logger, &_events, &_promos, &_mikrotik);
   _portalConfig.begin(&_storage, &_logger, &_events);
-  _coin.begin(&_storage, &_logger, &_events, &_promos, &_portalSessions);
+  if (RenzFiConfig::ENABLE_COIN_MANAGER) {
+    _coin.begin(&_storage, &_logger, &_events, &_promos, &_portalSessions);
+  } else {
+    Serial.println("[coin] CoinManager disabled");
+  }
 
   if (_eth.isServiceReady()) {
     startNetworkServices();
@@ -88,7 +95,9 @@ void FirmwareApp::loop() {
     startNetworkServices();
   }
 
-  _coin.loop();
+  if (RenzFiConfig::ENABLE_COIN_MANAGER) {
+    _coin.loop();
+  }
   _portalSessions.loop();
   _storage.pollStorageHealth();
   _events.heartbeat();
@@ -111,8 +120,9 @@ void FirmwareApp::startNetworkServices() {
   }
 
   _events.begin(*_server);
+  CoinManager *coin = RenzFiConfig::ENABLE_COIN_MANAGER ? &_coin : nullptr;
   _api.begin(_server, &_storage, &_auth, &_sessions, &_promos, &_vouchers,
-             &_coin, &_mikrotik, &_logger, &_events, &_eth,
+             coin, &_mikrotik, &_logger, &_events, &_eth,
              &_portalSessions, &_portalConfig);
 
   _server->begin();

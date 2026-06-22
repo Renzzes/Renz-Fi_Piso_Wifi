@@ -6,6 +6,10 @@ namespace RenzFiConfig {
 
 static constexpr const char *FIRMWARE_VERSION = "0.5.0-w5500";
 
+// ── Optional hardware ───────────────────────────────────────────────────────
+// Set true when Universal Coin Slot is wired (GPIO4 pulse input + RGB LEDs).
+static constexpr bool ENABLE_COIN_MANAGER = false;
+
 // ── Network backend ───────────────────────────────────────────────────────────
 // Backend networking is now handled by W5500 wired Ethernet (VLAN40).
 // See W5500Config.h for pin map and static IP configuration.
