@@ -122,6 +122,46 @@ void mergedActiveUserStats(SessionManager       *sessions,
   }
 }
 
+// Safe JSON when ENABLE_COIN_MANAGER=false (_coin == nullptr in ApiServer).
+void fillCoinDisabledStatus(JsonObject coinSlot) {
+  coinSlot["ok"]          = false;
+  coinSlot["state"]       = "disabled";
+  coinSlot["pulsesToday"] = 0;
+}
+
+void fillCoinDisabledSettings(JsonDocument &doc) {
+  doc["pulse_width_ms"]        = String(RenzFiConfig::COIN_DEBOUNCE_MS);
+  doc["calibration"]           = "1";
+  doc["timeout_seconds"]       = String(RenzFiConfig::COIN_INSERT_TIMEOUT_SEC);
+  doc["pesoPerPulse"]          = "1";
+  doc["defaultMinutesPerPeso"] = "5";
+  doc["debounceMs"]            = String(RenzFiConfig::COIN_DEBOUNCE_MS);
+  doc["settleMs"]              = String(RenzFiConfig::COIN_SETTLE_MS);
+  doc["timeoutSeconds"]        = String(RenzFiConfig::COIN_INSERT_TIMEOUT_SEC);
+  doc["enabled"]               = "false";
+}
+
+void fillCoinDisabledDiagnostics(JsonDocument &doc) {
+  JsonObject stats = doc["stats"].to<JsonObject>();
+  stats["last_pulse"]      = "0";
+  stats["total_today"]     = "0";
+  stats["errors"]          = "0";
+  stats["state"]           = "disabled";
+  stats["enabled"]         = "false";
+  stats["pendingPulses"]   = "0";
+  stats["pulsesToday"]     = "0";
+  stats["debounceMs"]      = String(RenzFiConfig::COIN_DEBOUNCE_MS);
+  stats["settleMs"]        = String(RenzFiConfig::COIN_SETTLE_MS);
+  stats["pin"]             = String(RenzFiConfig::PIN_COIN);
+  doc["logs"].to<JsonArray>();
+}
+
+IPAddress requestRemoteIp(AsyncWebServerRequest *req) {
+  if (!req) return IPAddress();
+  AsyncClient *client = req->client();
+  return client ? client->remoteIP() : IPAddress();
+}
+
 struct PortalAssetUpload {
   enum class Kind { None, Banner, Music } kind = Kind::None;
   enum class Source { None, Multipart, RawBody, Upload } source = Source::None;
@@ -275,7 +315,7 @@ String ApiServer::getBody(AsyncWebServerRequest *req) {
 }
 
 void ApiServer::logRequest(AsyncWebServerRequest *req, const char *handler) {
-  IPAddress remoteIp = req->client()->remoteIP();
+  IPAddress remoteIp = requestRemoteIp(req);
   Serial.printf("[tcp] %s %s from=%s via=ETH local=%s host=%s handler=%s\n",
                 methodStr(req->method()),
                 req->url().c_str(),
@@ -513,9 +553,7 @@ void ApiServer::registerRoutes() {
     if (_coin) {
       _coin->fillStatus(data["coinSlot"].to<JsonObject>());
     } else {
-      data["coinSlot"]["ok"]             = false;
-      data["coinSlot"]["state"]          = "Unavailable";
-      data["coinSlot"]["pulsesToday"]    = 0;
+      fillCoinDisabledStatus(data["coinSlot"].to<JsonObject>());
     }
 
     data["hotspot"]["ok"]                = routerConfigured && routerSsid.length() > 0;
@@ -1513,12 +1551,20 @@ void ApiServer::registerRoutes() {
               [this](AsyncWebServerRequest *req) {
                 if (!requireAuth(req)) return;
                 DynamicJsonDocument data(512);
-                _coin->settings(data);
+                if (_coin) {
+                  _coin->settings(data);
+                } else {
+                  fillCoinDisabledSettings(data);
+                }
                 sendOk(req, data);
               });
 
   auto coinSave = [this](AsyncWebServerRequest *req) {
     if (!requireAuth(req)) return;
+    if (!_coin) {
+      sendError(req, 503, "Coin slot hardware is disabled", "COIN_DISABLED");
+      return;
+    }
     DynamicJsonDocument body(512);
     String raw = getBody(req);
     if (raw.length() > 0) deserializeJson(body, raw);
@@ -1532,18 +1578,30 @@ void ApiServer::registerRoutes() {
               [this](AsyncWebServerRequest *req) {
                 if (!requireAuth(req)) return;
                 DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
-                _coin->diagnostics(data);
+                if (_coin) {
+                  _coin->diagnostics(data);
+                } else {
+                  fillCoinDisabledDiagnostics(data);
+                }
                 sendOk(req, data);
               });
 
   _server->on("/api/coin/test", HTTP_POST, [this](AsyncWebServerRequest *req) {
     if (!requireAuth(req)) return;
+    if (!_coin) {
+      sendError(req, 503, "Coin slot hardware is disabled", "COIN_DISABLED");
+      return;
+    }
     _sessions->grantCoinSession(1, _promos->minutesForAmount(1));
     sendOk(req);
   });
 
   _server->on("/api/coin/reset", HTTP_POST, [this](AsyncWebServerRequest *req) {
     if (!requireAuth(req)) return;
+    if (!_coin) {
+      sendError(req, 503, "Coin slot hardware is disabled", "COIN_DISABLED");
+      return;
+    }
     _coin->resetCounters();
     sendOk(req);
   });
@@ -1711,6 +1769,10 @@ void ApiServer::registerRoutes() {
         String ip  = body["ip"]  | "";
         if (mac.isEmpty()) {
           sendError(req, 400, "mac field required", "MISSING_MAC");
+          return;
+        }
+        if (!_coin) {
+          sendError(req, 503, "Coin slot hardware is disabled", "COIN_DISABLED");
           return;
         }
         if (_portalSessions && _portalSessions->startCoinWindow(mac, ip)) {
@@ -2009,7 +2071,7 @@ void ApiServer::registerRoutes() {
 
     // /api/* — 404 JSON
     if (path.startsWith("/api/")) {
-      IPAddress remoteIp = req->client()->remoteIP();
+      IPAddress remoteIp = requestRemoteIp(req);
       Serial.printf("[tcp] 404 %s %s from=%s local=%s\n",
                     methodStr(req->method()), path.c_str(),
                     remoteIp.toString().c_str(),
@@ -2020,7 +2082,7 @@ void ApiServer::registerRoutes() {
 
     // /assets/* missing from SPIFFS (serveStatic already matched found files)
     if (path.startsWith("/assets/")) {
-      IPAddress remoteIp = req->client()->remoteIP();
+      IPAddress remoteIp = requestRemoteIp(req);
       Serial.printf("[tcp] 404 %s %s from=%s local=%s (missing asset)\n",
                     methodStr(req->method()), path.c_str(),
                     remoteIp.toString().c_str(),
@@ -2034,7 +2096,7 @@ void ApiServer::registerRoutes() {
     }
 
     // Catch-all → SPA or static SPIFFS file
-    IPAddress remoteIp = req->client()->remoteIP();
+    IPAddress remoteIp = requestRemoteIp(req);
     Serial.printf("[tcp] %s %s from=%s local=%s -> SPA\n",
                   methodStr(req->method()), path.c_str(),
                   remoteIp.toString().c_str(),
