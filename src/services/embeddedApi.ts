@@ -1,6 +1,37 @@
 const DEFAULT_EMBEDDED_HOST = "192.168.30.252";
 
-export const apiBaseUrl = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
+/** Build-time override (dev proxy target). */
+const envBaseUrl = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
+
+/** Runtime fleet target — empty string means same-origin (Direct Mode). */
+let runtimeApiBaseUrl: string | null = null;
+
+export function getRuntimeApiBaseUrl(): string {
+  if (runtimeApiBaseUrl != null) return runtimeApiBaseUrl;
+  return envBaseUrl;
+}
+
+export function setRuntimeApiBaseUrl(base: string | null): void {
+  runtimeApiBaseUrl = base == null ? null : base.replace(/\/$/, "");
+}
+
+/** @deprecated Use getRuntimeApiBaseUrl — kept for existing imports. */
+export const apiBaseUrl = envBaseUrl;
+
+export function isDirectMode(): boolean {
+  return getRuntimeApiBaseUrl() === "";
+}
+
+export function isFleetTargetActive(): boolean {
+  return getRuntimeApiBaseUrl() !== "";
+}
+
+export function buildDeviceBaseUrl(ip: string): string {
+  const trimmed = ip.trim();
+  if (!trimmed) return "";
+  if (/^https?:\/\//i.test(trimmed)) return trimmed.replace(/\/$/, "");
+  return `http://${trimmed}`;
+}
 
 export const embeddedApi = {
   health: "/api/health",
@@ -20,7 +51,8 @@ export const embeddedApi = {
 
 export function apiUrl(path: string) {
   if (/^https?:\/\//i.test(path)) return path;
-  return `${apiBaseUrl}${path.startsWith("/") ? path : `/${path}`}`;
+  const base = getRuntimeApiBaseUrl();
+  return `${base}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
 /** Resolve portal branding asset URLs from settings (relative or absolute). */
@@ -30,6 +62,13 @@ export function resolvePortalAssetUrl(url?: string | null): string {
 }
 
 export function getEmbeddedHost() {
+  if (isFleetTargetActive()) {
+    try {
+      return new URL(getRuntimeApiBaseUrl()).hostname;
+    } catch {
+      return window.location.hostname || DEFAULT_EMBEDDED_HOST;
+    }
+  }
   return window.location.hostname || DEFAULT_EMBEDDED_HOST;
 }
 

@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -27,23 +28,24 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
-import com.renzfi.owner.R
 import com.renzfi.owner.model.VendoDevice
 import com.renzfi.owner.ui.components.DeleteConfirmDialog
 import com.renzfi.owner.ui.components.DeviceCard
 import com.renzfi.owner.ui.components.RenzFiTopBar
 import com.renzfi.owner.viewmodel.DeviceListUiState
 
+/**
+ * "My Vendo" — main home screen shown whenever at least one appliance is registered.
+ * Lists all saved appliances with name, IP, online status, and a "Login to Admin" button.
+ */
 @Composable
 fun DeviceListScreen(
     uiState: DeviceListUiState,
     onRefresh: () -> Unit,
-    onOpenDashboard: (VendoDevice) -> Unit,
+    onLoginToAdmin: (VendoDevice) -> Unit,
     onEditDevice: (VendoDevice) -> Unit,
     onDeleteDevice: (VendoDevice) -> Unit,
-    onDeviceOverview: (VendoDevice) -> Unit,
     onAddDevice: () -> Unit,
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
@@ -65,7 +67,7 @@ fun DeviceListScreen(
         modifier = modifier,
         topBar = {
             RenzFiTopBar(
-                title = stringResource(R.string.app_name),
+                title = "My Vendo",
                 actions = {
                     IconButton(onClick = onRefresh, enabled = !uiState.isRefreshing) {
                         Icon(
@@ -89,11 +91,11 @@ fun DeviceListScreen(
                 ExtendedFloatingActionButton(
                     onClick = onAddDevice,
                     icon = { Icon(Icons.Default.Add, contentDescription = null) },
-                    text = { Text("Add Device") },
+                    text = { Text("Add Appliance") },
                 )
             } else {
                 FloatingActionButton(onClick = onAddDevice) {
-                    Icon(Icons.Default.Add, contentDescription = "Add device")
+                    Icon(Icons.Default.Add, contentDescription = "Add appliance")
                 }
             }
         },
@@ -105,12 +107,14 @@ fun DeviceListScreen(
         ) {
             if (uiState.devices.isEmpty()) {
                 Text(
-                    text = "No devices configured.\nTap Add Device to get started.",
+                    text = "No appliances registered.\nTap + to add your Renz-Fi appliance.",
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
                     modifier = Modifier
                         .align(Alignment.Center)
-                        .padding(32.dp),
+                        .padding(32.dp)
+                        .fillMaxWidth(),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                 )
             } else {
                 LazyColumn(
@@ -120,16 +124,15 @@ fun DeviceListScreen(
                     items(uiState.devices, key = { it.id }) { device ->
                         DeviceCard(
                             device = device,
-                            onOpenDashboard = { onOpenDashboard(device) },
+                            onLoginToAdmin = { onLoginToAdmin(device) },
                             onEdit = { onEditDevice(device) },
                             onDelete = { deviceToDelete = device },
-                            onOverview = { onDeviceOverview(device) },
                         )
                     }
                 }
             }
 
-            if (uiState.isRefreshing || uiState.isCheckingDevice) {
+            if (uiState.isRefreshing) {
                 CircularProgressIndicator(
                     modifier = Modifier
                         .align(Alignment.TopCenter)

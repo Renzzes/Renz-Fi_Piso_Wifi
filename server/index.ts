@@ -17,8 +17,10 @@ import { firmwareRouter } from "./routes/firmware.js";
 import { settingsRouter } from "./routes/settings.js";
 import { syncRouter } from "./routes/sync.js";
 import { storageRouter } from "./routes/storage.js";
+import { rgbRouter } from "./routes/rgb.js";
 import { authRouter } from "./routes/auth.js";
 import { eventsRouter } from "./routes/events.js";
+import { provisioningRouter } from "./routes/provisioning.js";
 import { apiRateLimitMiddleware } from "./middleware/apiRateLimit.js";
 import { errorHandler } from "./middleware/errorHandler.js";
 import { notFoundApiHandler } from "./middleware/notFound.js";
@@ -85,6 +87,59 @@ app.get("/api/health", (req, res) => {
     database: { ok: dbOk },
     sync: { pending: pendingSync },
     session,
+    storage: {
+      ok: dbOk,
+      storageMode: "SD",
+      sdPresent: true,
+      sdMounted: true,
+      fallbackActive: false,
+      spiffsReady: true,
+    },
+    installation: {
+      state: "ready",
+      ready: true,
+      needsSetup: false,
+      progressPercent: 100,
+    },
+    router: { configured: true, driverId: "mikrotik" },
+    portal: { revision: 1, hasBanner: true, hasMusic: false },
+    coin: { enabled: true, ok: true },
+    uptimeSeconds: Math.floor(process.uptime()),
+    serverTimeMs: Date.now(),
+    deviceId: "RF-DEV001",
+    deviceName: "Dev Simulator",
+    version: "0.5.0-w5500",
+    device: {
+      deviceId: "RF-DEV001",
+      serialNumber: "DE:AD:BE:EF:00:01",
+      friendlyName: "Dev Simulator",
+      deviceName: "Dev Simulator",
+      firmwareVersion: "0.5.0-w5500",
+      version: "0.5.0-w5500",
+      hardwareRevision: "ESP32-S3-W5500-N8R8",
+      macAddress: "DE:AD:BE:EF:00:01",
+      ipAddress: "127.0.0.1",
+      routerDriver: "mikrotik",
+      online: true,
+      capabilities: {
+        coin: true,
+        voucher: true,
+        assetUpload: true,
+        router: "mikrotik",
+        fleet: true,
+      },
+    },
+    build: {
+      firmwareVersion: "0.5.0-w5500",
+      adminBuild: new Date().toISOString(),
+      portalRevision: "dev000",
+      gitCommit: "simulator",
+      buildNumber: 0,
+      stagedAt: new Date().toISOString(),
+      deviceProfileVersion: 1,
+      storageContractVersion: 1,
+      httpContractVersion: 1,
+    },
   });
 });
 
@@ -98,6 +153,7 @@ app.get("/api/status", (_req, res) => {
 });
 app.use("/api/system", systemRouter);
 app.use("/api/storage", storageRouter);
+app.use("/api/rgb", rgbRouter);
 app.use("/api/sales", salesRouter);
 app.use("/api/promos", promosRouter);
 app.use("/api/vouchers", vouchersRouter);
@@ -113,6 +169,7 @@ app.use("/api/system/firmware", firmwareRouter);
 app.use("/api/settings", settingsRouter);
 app.use("/api/sync", syncRouter);
 app.use("/api/system/sync", syncRouter);
+app.use("/api/provisioning", provisioningRouter);
 
 if (isProd) {
   const serverDir = resolveFromImportMeta(import.meta.url);

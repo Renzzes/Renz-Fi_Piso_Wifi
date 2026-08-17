@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { RealtimeContextValue } from "@/contexts/RealtimeContext";
+import type { SystemStatus } from "@/types/api";
 import { apiUrl, embeddedApi } from "@/services/embeddedApi";
 
 const THROTTLE_MS = 500;
@@ -12,6 +13,8 @@ const EVENT_QUERY_MAP: Record<string, Array<{ queryKey: readonly unknown[] }>> =
     { queryKey: ["system", "status"] },
     { queryKey: ["sales"] },
   ],
+  // sale.created uses a targeted setQueryData patch for dashboard cards;
+  // sales history list still invalidates lightly below.
   "sessions.changed": [
     { queryKey: ["system", "status"] },
     { queryKey: ["users", "active"] },
@@ -21,12 +24,41 @@ const EVENT_QUERY_MAP: Record<string, Array<{ queryKey: readonly unknown[] }>> =
     { queryKey: ["system", "status"] },
   ],
   "system.status": [{ queryKey: ["system", "status"] }],
+  "storage.changed": [
+    { queryKey: ["storage", "status"] },
+    { queryKey: ["system", "status"] },
+    { queryKey: ["system", "health"] },
+  ],
+  "rgb.changed": [
+    { queryKey: ["rgb", "status"] },
+    { queryKey: ["system", "rgb"] },
+    { queryKey: ["system", "health"] },
+    { queryKey: ["system", "status"] },
+  ],
   "logs.changed": [{ queryKey: ["logs"] }],
   "log.entry": [{ queryKey: ["logs"] }],
   "portal.changed": [{ queryKey: ["portal"] }],
   "firmware.progress": [{ queryKey: ["firmware"] }],
   "sync.queue": [{ queryKey: ["system", "status"] }],
   "coin.diagnostics": [{ queryKey: ["coin", "diagnostics"] }],
+  "coin.state.changed": [
+    { queryKey: ["system", "coin"] },
+    { queryKey: ["system", "health"] },
+    { queryKey: ["system", "status"] },
+  ],
+  "coin.pulse": [
+    { queryKey: ["system", "coin"] },
+    { queryKey: ["coin", "diagnostics"] },
+  ],
+  "coin.accepted": [
+    { queryKey: ["system", "coin"] },
+    { queryKey: ["system", "health"] },
+    { queryKey: ["coin", "diagnostics"] },
+  ],
+  "coin.fault": [
+    { queryKey: ["system", "coin"] },
+    { queryKey: ["system", "health"] },
+  ],
   "vouchers.changed": [{ queryKey: ["vouchers"] }],
   "promos.changed": [{ queryKey: ["promos"] }],
 };
@@ -34,6 +66,53 @@ const EVENT_QUERY_MAP: Record<string, Array<{ queryKey: readonly unknown[] }>> =
 function fallbackPollMs(sseConnected: boolean): RealtimeContextValue["fallbackPollMs"] {
   if (sseConnected) return false;
   return FALLBACK_POLL_MS;
+}
+
+function bumpBucket(
+  bucket: { amount: number; sessions: number } | undefined,
+  amount: number,
+) {
+  return {
+    amount: (bucket?.amount ?? 0) + amount,
+    sessions: (bucket?.sessions ?? 0) + 1,
+  };
+}
+
+/** Apply persisted sale.created to dashboard cards without a full reload. */
+function applySaleCreatedPatch(
+  queryClient: ReturnType<typeof useQueryClient>,
+  raw: string,
+): boolean {
+  let amount = 0;
+  try {
+    const parsed = JSON.parse(raw) as { amount?: unknown };
+    amount = Number(parsed.amount);
+    if (!Number.isFinite(amount) || amount <= 0) return false;
+  } catch {
+    return false;
+  }
+
+  queryClient.setQueryData<SystemStatus>(["system", "status"], (old) => {
+    if (!old?.sales) return old;
+    return {
+      ...old,
+      sales: {
+        today: bumpBucket(old.sales.today, amount),
+        weekly: bumpBucket(old.sales.weekly, amount),
+        monthly: bumpBucket(old.sales.monthly, amount),
+      },
+      coinSlot: old.coinSlot
+        ? {
+            ...old.coinSlot,
+            totalCoinCount:
+              old.coinSlot.totalCoinCount !== undefined
+                ? old.coinSlot.totalCoinCount + 1
+                : old.coinSlot.totalCoinCount,
+          }
+        : old.coinSlot,
+    };
+  });
+  return true;
 }
 
 export function useDashboardEvents(
@@ -99,6 +178,20 @@ export function useDashboardEvents(
       for (const type of Object.keys(EVENT_QUERY_MAP)) {
         es.addEventListener(type, () => scheduleInvalidate(type));
       }
+
+      es.addEventListener("sale.created", (event: Event) => {
+        const message = event as MessageEvent<string>;
+        const patched = applySaleCreatedPatch(queryClient, message.data ?? "");
+        if (!patched) {
+          scheduleInvalidate("sales.changed");
+          return;
+        }
+        // History/list pages only — dashboard cards already patched in RAM.
+        pendingKeysRef.current.add(JSON.stringify(["sales"]));
+        if (!flushTimerRef.current) {
+          flushTimerRef.current = setTimeout(flushInvalidations, THROTTLE_MS);
+        }
+      });
     };
 
     connect();

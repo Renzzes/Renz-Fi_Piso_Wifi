@@ -20,7 +20,10 @@ data class DeviceFormUiState(
     val mikrotikPublicIp: String = "",
     val mikrotikNotes: String = "",
     val esp32LocalIp: String = Constants.DEFAULT_ESP32_IP,
+    val discoverySubnet: String = Constants.DEFAULT_DISCOVERY_SUBNET,
     val isSaving: Boolean = false,
+    val isDiscovering: Boolean = false,
+    val discoveryMessage: String? = null,
     val saveSuccess: Boolean = false,
     val errorMessage: String? = null,
 )
@@ -74,6 +77,78 @@ class DeviceFormViewModel(application: Application) : AndroidViewModel(applicati
 
     fun updateEsp32LocalIp(value: String) {
         _uiState.value = _uiState.value.copy(esp32LocalIp = value, errorMessage = null)
+    }
+
+    fun updateDiscoverySubnet(value: String) {
+        _uiState.value = _uiState.value.copy(discoverySubnet = value, errorMessage = null)
+    }
+
+    fun discoverAtCurrentIp() {
+        val ip = _uiState.value.esp32LocalIp.trim()
+        if (!NetworkUtils.isValidHost(ip)) {
+            _uiState.value = _uiState.value.copy(errorMessage = "Enter a valid IP to probe.")
+            return
+        }
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(isDiscovering = true, discoveryMessage = null)
+            try {
+                val device = repository.probeAndRegisterIp(ip)
+                if (device != null) {
+                    _uiState.value = _uiState.value.copy(
+                        deviceId = device.id,
+                        name = device.name,
+                        esp32LocalIp = device.esp32LocalIp,
+                        discoveryMessage = "Found ${device.name} (${device.applianceDeviceId ?: device.id})",
+                        saveSuccess = true,
+                    )
+                } else {
+                    _uiState.value = _uiState.value.copy(
+                        errorMessage = "No Renz-Fi appliance at $ip.",
+                    )
+                }
+            } catch (_: Exception) {
+                _uiState.value = _uiState.value.copy(errorMessage = "Discovery failed.")
+            } finally {
+                _uiState.value = _uiState.value.copy(isDiscovering = false)
+            }
+        }
+    }
+
+    fun discoverSubnet() {
+        val subnet = _uiState.value.discoverySubnet.trim()
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                isDiscovering = true,
+                discoveryMessage = "Scanning subnet…",
+                errorMessage = null,
+            )
+            try {
+                val found = repository.discoverDevicesOnSubnet(subnet) { progress ->
+                    _uiState.value = _uiState.value.copy(
+                        discoveryMessage = "Scanning ${progress.scanned}/${progress.total}…",
+                    )
+                }
+                if (found.isEmpty()) {
+                    _uiState.value = _uiState.value.copy(
+                        errorMessage = "No appliances found on $subnet.",
+                        discoveryMessage = null,
+                    )
+                } else {
+                    val first = found.first()
+                    _uiState.value = _uiState.value.copy(
+                        deviceId = first.id,
+                        name = first.name,
+                        esp32LocalIp = first.esp32LocalIp,
+                        discoveryMessage = "Discovered ${found.size} appliance(s).",
+                        saveSuccess = true,
+                    )
+                }
+            } catch (_: Exception) {
+                _uiState.value = _uiState.value.copy(errorMessage = "Subnet discovery failed.")
+            } finally {
+                _uiState.value = _uiState.value.copy(isDiscovering = false)
+            }
+        }
     }
 
     fun save() {

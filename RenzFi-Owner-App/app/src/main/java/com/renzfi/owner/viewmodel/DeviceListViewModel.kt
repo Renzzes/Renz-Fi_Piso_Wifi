@@ -17,8 +17,6 @@ import kotlinx.coroutines.launch
 data class DeviceListUiState(
     val devices: List<VendoDevice> = emptyList(),
     val isRefreshing: Boolean = false,
-    val isCheckingDevice: Boolean = false,
-    val checkingDeviceId: String? = null,
     val errorMessage: String? = null,
 )
 
@@ -36,6 +34,11 @@ class DeviceListViewModel(application: Application) : AndroidViewModel(applicati
                 _uiState.value = _uiState.value.copy(devices = devices)
             }
         }
+    }
+
+    /** Starts background online-status polling after My Vendo is visible. */
+    fun startBackgroundRefresh() {
+        if (refreshJob?.isActive == true) return
         startAutoRefresh()
     }
 
@@ -47,7 +50,7 @@ class DeviceListViewModel(application: Application) : AndroidViewModel(applicati
                 repository.refreshAllDeviceStatus(getApplication())
             } catch (_: Exception) {
                 _uiState.value = _uiState.value.copy(
-                    errorMessage = "Failed to refresh device status.",
+                    errorMessage = "Could not refresh status. Check your network.",
                 )
             } finally {
                 _uiState.value = _uiState.value.copy(isRefreshing = false)
@@ -59,20 +62,6 @@ class DeviceListViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch {
             repository.deleteDevice(id)
         }
-    }
-
-    fun setCheckingDevice(deviceId: String?) {
-        _uiState.value = _uiState.value.copy(
-            isCheckingDevice = deviceId != null,
-            checkingDeviceId = deviceId,
-        )
-    }
-
-    fun clearCheckingDevice() {
-        _uiState.value = _uiState.value.copy(
-            isCheckingDevice = false,
-            checkingDeviceId = null,
-        )
     }
 
     private fun startAutoRefresh() {

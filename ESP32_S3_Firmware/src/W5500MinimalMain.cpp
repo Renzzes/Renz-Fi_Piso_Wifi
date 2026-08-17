@@ -41,6 +41,7 @@ void setup() {
 
   g_server.begin();
   g_serverStarted = true;
+  EthernetManager::noteWebServerState(true);
   Serial.println("[boot] Web server listening on http://" + g_eth.ip());
   Serial.println("========================================");
 }

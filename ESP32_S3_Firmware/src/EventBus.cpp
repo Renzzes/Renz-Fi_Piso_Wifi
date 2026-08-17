@@ -29,15 +29,30 @@ void EventBus::begin(AsyncWebServer &server) {
 }
 
 void EventBus::emit(const char *event, const String &json) {
-  if (!_source || !event) return;
+  if (!event) return;
+  if (_internalListener) {
+    _internalListener(event, json, _internalListenerCtx);
+  }
+  if (!_source) return;
+  if (_source->count() == 0) return;
   const char *payload = json.length() > 0 ? json.c_str() : "{}";
   _source->send(payload, event, millis());
 }
 
+void EventBus::setInternalListener(InternalListener listener, void *ctx) {
+  _internalListener = listener;
+  _internalListenerCtx = ctx;
+}
+
 void EventBus::heartbeat() {
   if (!_source) return;
+  if (_source->count() == 0) return;
   if (millis() - _lastHeartbeat >= 30000) {
     _lastHeartbeat = millis();
     _source->send("{}", "ping", millis());
   }
+}
+
+size_t EventBus::clientCount() const {
+  return _source ? _source->count() : 0;
 }

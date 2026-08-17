@@ -17,10 +17,56 @@ function downloadBlob(blob: Blob, filename: string) {
   URL.revokeObjectURL(url);
 }
 
+export type SetupUnlockStatus = {
+  configured: boolean;
+  recoverable?: boolean;
+  password?: string;
+};
+
+export type OperatorAccountStatus = {
+  configured: boolean;
+  username?: string;
+  permissions?: string[];
+};
+
 export const settingsApi = {
-  admin: () => api.get<{ username: string }>(`${embeddedApi.settings}/admin`),
-  updateAdmin: (payload: { username?: string; password?: string }) =>
+  admin: () => api.get<{ adminIp?: string }>(`${embeddedApi.settings}/admin`),
+  updateAdmin: (payload: { password?: string }) =>
     api.put<{ ok: boolean }>(`${embeddedApi.settings}/admin`, payload),
+
+  setupUnlock: () =>
+    api.get<SetupUnlockStatus>(`${embeddedApi.settings}/setup-unlock`),
+  changeSetupUnlock: (payload: {
+    currentPassword: string;
+    newPassword: string;
+    confirmPassword: string;
+  }) =>
+    api.post<{ ok: boolean; configured?: boolean }>(
+      `${embeddedApi.settings}/setup-unlock`,
+      payload,
+    ),
+
+  operator: () =>
+    api.get<OperatorAccountStatus>(`${embeddedApi.settings}/operator`),
+  createOperator: (payload: {
+    username: string;
+    password: string;
+    confirmPassword: string;
+    permissions?: string[];
+  }) =>
+    api.post<{
+      ok: boolean;
+      configured?: boolean;
+      username?: string;
+      permissions?: string[];
+    }>(`${embeddedApi.settings}/operator`, payload),
+  updateOperatorPermissions: (permissions: string[]) =>
+    api.post<{
+      ok: boolean;
+      configured?: boolean;
+      username?: string;
+      permissions?: string[];
+    }>(`${embeddedApi.settings}/operator`, { permissions }),
 
   backup: async () => {
     const res = await fetch(apiUrl(`${embeddedApi.settings}/backup`), {

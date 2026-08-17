@@ -1,4 +1,5 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
@@ -63,11 +64,27 @@ function MiniBars({
   );
 }
 
-function formatSalesAmount(amount: number | undefined, loading: boolean) {
-  return formatPeso(amount, loading);
+function displaySalesAmount(
+  summary:
+    | {
+        amount?: number;
+        undatedAmount?: number;
+        clockReady?: boolean;
+      }
+    | undefined,
+  loading: boolean,
+) {
+  if (loading) return formatPeso(undefined, true);
+  const dated = Number(summary?.amount || 0);
+  const undated = Number(summary?.undatedAmount || 0);
+  // amount already includes attributed undated when clockReady; when not ready,
+  // surface undated so the UI never shows ₱0.00 while COIN records exist.
+  const shown = summary?.clockReady === false ? dated + undated : dated;
+  return formatPeso(shown);
 }
 
 export default function SalesReportsPage() {
+  const queryClient = useQueryClient();
   const { data: today, isLoading: todayLoading } = useQuery({
     queryKey: ["sales", "today"],
     queryFn: () => salesApi.today(),
@@ -92,11 +109,24 @@ export default function SalesReportsPage() {
     queryKey: ["sales", "history"],
     queryFn: () => salesApi.history(),
   });
+  const { data: records = [], isLoading: recordsLoading } = useQuery({
+    queryKey: ["sales", "records"],
+    queryFn: () => salesApi.records(),
+  });
 
   const exportMutation = useMutation({
     mutationFn: () => salesApi.exportCsv(),
     onSuccess: () => toast.success("Sales report downloaded"),
     onError: (error: Error) => toast.error(error.message || "Export failed"),
+  });
+
+  const resetMutation = useMutation({
+    mutationFn: () => salesApi.reset(),
+    onSuccess: async () => {
+      toast.success("Sales reset. A new audit cycle has started.");
+      await queryClient.invalidateQueries({ queryKey: ["sales"] });
+    },
+    onError: (error: Error) => toast.error(error.message || "Reset failed"),
   });
 
   const daily = hasChartData(dailyChart) ? dailyChart.data : [];
@@ -110,22 +140,56 @@ export default function SalesReportsPage() {
         title="Sales Reports"
         description="Revenue overview"
         actions={
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={exportMutation.isPending}
-            onClick={() => exportMutation.mutate()}
-          >
-            <Download className="h-4 w-4" /> Export CSV
-          </Button>
+          <div className="flex gap-2 flex-wrap">
+            <Button
+              size="sm"
+              variant="destructive"
+              disabled={resetMutation.isPending}
+              onClick={() => {
+                if (
+                  !window.confirm(
+                    "Reset all sales records? Use this after you have audited physical coins and want to start a new cycle. This cannot be undone.",
+                  )
+                ) {
+                  return;
+                }
+                if (
+                  !window.confirm(
+                    "Confirm sales reset. Charts and history will clear on this appliance.",
+                  )
+                ) {
+                  return;
+                }
+                resetMutation.mutate();
+              }}
+            >
+              {resetMutation.isPending ? "Resetting…" : "Reset Sales"}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={exportMutation.isPending}
+              onClick={() => exportMutation.mutate()}
+            >
+              <Download className="h-4 w-4" /> Export CSV
+            </Button>
+          </div>
         }
       />
 
       <div className="grid grid-cols-3 gap-2 mb-3">
-        <StatCard label="Today" value={formatSalesAmount(today?.amount, todayLoading)} />
-        <StatCard label="This Week" value={formatSalesAmount(weekly?.amount, weeklyLoading)} />
+        <StatCard label="Today" value={displaySalesAmount(today, todayLoading)} />
+        <StatCard label="This Week" value={displaySalesAmount(weekly, weeklyLoading)} />
         <StatCard label="Avg / Day" value={formatPeso(avgPerDay, dailyChartLoading)} />
       </div>
+      {((today?.undatedAmount || 0) > 0 || (weekly?.undatedAmount || 0) > 0) && (
+        <p className="mb-3 text-xs text-muted-foreground">
+          Includes offline/undated COIN sales
+          {today?.clockReady === false
+            ? " (device clock not ready — totals use unclocked transactions)."
+            : " attributed to the current local business day once the clock is ready."}
+        </p>
+      )}
 
       <Tabs defaultValue="daily" className="rounded-md border bg-card p-3">
         <TabsList>
@@ -158,7 +222,7 @@ export default function SalesReportsPage() {
             <TableRow>
               <TableHead>Date</TableHead>
               <TableHead>Sessions</TableHead>
-              <TableHead>Coins</TableHead>
+              <TableHead>Transactions</TableHead>
               <TableHead className="text-right">Revenue</TableHead>
             </TableRow>
           </TableHeader>
@@ -174,7 +238,7 @@ export default function SalesReportsPage() {
                 <TableRow key={r.date}>
                   <TableCell className="text-xs">{r.date}</TableCell>
                   <TableCell>{r.sessions}</TableCell>
-                  <TableCell>{r.revenue}</TableCell>
+                  <TableCell>{r.sessions}</TableCell>
                   <TableCell className="text-right tabular-nums">{formatPeso(r.revenue)}</TableCell>
                 </TableRow>
               ))
@@ -183,6 +247,61 @@ export default function SalesReportsPage() {
               <TableRow>
                 <TableCell colSpan={4} className="text-center text-muted-foreground py-6 text-sm">
                   No sales history
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </div>
+
+      <div className="rounded-md border bg-card mt-3 overflow-x-auto">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Date / Time</TableHead>
+              <TableHead>Transaction</TableHead>
+              <TableHead>Minutes</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>Payment</TableHead>
+              <TableHead className="text-right">Amount</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {recordsLoading ? (
+              <TableRow>
+                <TableCell colSpan={6} className="text-center text-muted-foreground py-6 text-sm">
+                  Loading transactions...
+                </TableCell>
+              </TableRow>
+            ) : (
+              records.map((record) => (
+                <TableRow key={record.id}>
+                  <TableCell className="text-xs">
+                    {record.recordedAt || record.recorded_at || "—"}
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    {record.id || record.sessionId || "—"}
+                  </TableCell>
+                  <TableCell>{record.durationMinutes ?? 0}</TableCell>
+                  <TableCell className="text-xs">
+                    {record.status || "completed"}
+                    {record.terminationReason ? (
+                      <div className="text-muted-foreground">{record.terminationReason}</div>
+                    ) : null}
+                  </TableCell>
+                  <TableCell className="uppercase text-xs">
+                    {record.paymentType || "—"}
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {formatPeso(record.amount)}
+                  </TableCell>
+                </TableRow>
+              ))
+            )}
+            {!recordsLoading && records.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={6} className="text-center text-muted-foreground py-6 text-sm">
+                  No transactions
                 </TableCell>
               </TableRow>
             )}

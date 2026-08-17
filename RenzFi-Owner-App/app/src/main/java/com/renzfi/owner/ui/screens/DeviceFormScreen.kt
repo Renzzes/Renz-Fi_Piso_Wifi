@@ -35,6 +35,9 @@ fun DeviceFormScreen(
     onMikrotikPublicIpChange: (String) -> Unit,
     onMikrotikNotesChange: (String) -> Unit,
     onEsp32LocalIpChange: (String) -> Unit,
+    onDiscoverySubnetChange: (String) -> Unit,
+    onDiscoverSubnet: () -> Unit,
+    onDiscoverAtIp: () -> Unit,
     onSave: () -> Unit,
     onBack: () -> Unit,
     onSaveSuccessShown: () -> Unit,
@@ -135,6 +138,50 @@ fun DeviceFormScreen(
             )
             Spacer(modifier = Modifier.height(24.dp))
             Text(
+                text = "Device Registry",
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "Discover appliances on your LAN — no manual IP required.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            OutlinedTextField(
+                value = uiState.discoverySubnet,
+                onValueChange = onDiscoverySubnetChange,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Discovery subnet") },
+                placeholder = { Text(Constants.DEFAULT_DISCOVERY_SUBNET) },
+                singleLine = true,
+                enabled = !uiState.isSaving && !uiState.isDiscovering,
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Button(
+                onClick = onDiscoverSubnet,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !uiState.isSaving && !uiState.isDiscovering,
+            ) {
+                if (uiState.isDiscovering) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.height(20.dp),
+                        strokeWidth = 2.dp,
+                    )
+                } else {
+                    Text("Discover on subnet")
+                }
+            }
+            uiState.discoveryMessage?.let { message ->
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+            Spacer(modifier = Modifier.height(24.dp))
+            Text(
                 text = "ESP32 Appliance",
                 style = MaterialTheme.typography.titleMedium,
             )
@@ -143,11 +190,19 @@ fun DeviceFormScreen(
                 value = uiState.esp32LocalIp,
                 onValueChange = onEsp32LocalIpChange,
                 modifier = Modifier.fillMaxWidth(),
-                label = { Text("ESP32 Local IP") },
+                label = { Text("ESP32 Local IP (optional override)") },
                 placeholder = { Text(Constants.DEFAULT_ESP32_IP) },
                 singleLine = true,
-                enabled = !uiState.isSaving,
+                enabled = !uiState.isSaving && !uiState.isDiscovering,
             )
+            Spacer(modifier = Modifier.height(12.dp))
+            Button(
+                onClick = onDiscoverAtIp,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !uiState.isSaving && !uiState.isDiscovering,
+            ) {
+                Text("Probe IP")
+            }
             Spacer(modifier = Modifier.height(24.dp))
             Button(
                 onClick = onSave,

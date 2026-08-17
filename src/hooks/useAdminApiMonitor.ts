@@ -6,11 +6,14 @@ const HEALTH_POLL_MS = 5000;
 
 type UseAdminApiMonitorOptions = {
   enabled: boolean;
+  /** When EventBus SSE is open, skip /api/health polling — ping is liveness. */
+  sseConnected?: boolean;
   onReconnectRequireLogin: () => void | Promise<void>;
 };
 
 export function useAdminApiMonitor({
   enabled,
+  sseConnected = false,
   onReconnectRequireLogin,
 }: UseAdminApiMonitorOptions) {
   const [connectionLost, setConnectionLost] = useState(false);
@@ -56,18 +59,24 @@ export function useAdminApiMonitor({
     }
 
     void checkHealth();
-    const intervalId = window.setInterval(() => void checkHealth(), HEALTH_POLL_MS);
 
     const onOffline = () => {
       if (enabled) markLost();
     };
-
     window.addEventListener("offline", onOffline);
+
+    if (sseConnected) {
+      return () => {
+        window.removeEventListener("offline", onOffline);
+      };
+    }
+
+    const intervalId = window.setInterval(() => void checkHealth(), HEALTH_POLL_MS);
     return () => {
       window.clearInterval(intervalId);
       window.removeEventListener("offline", onOffline);
     };
-  }, [checkHealth, enabled, markLost]);
+  }, [checkHealth, enabled, markLost, sseConnected]);
 
   return {
     connectionLost,

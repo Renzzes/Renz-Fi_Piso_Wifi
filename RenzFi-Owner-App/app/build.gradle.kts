@@ -21,6 +21,8 @@ android {
         applicationId = "com.renzfi.owner"
         minSdk = 26
         targetSdk = 35
+        // IMPORTANT: versionCode must be incremented for every public release.
+        // Android will reject an in-place update if versionCode is not higher than installed.
         versionCode = 1
         versionName = "1.0.0"
 

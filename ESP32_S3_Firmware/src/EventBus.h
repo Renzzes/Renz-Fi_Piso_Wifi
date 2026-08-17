@@ -19,11 +19,20 @@ class EventBus {
   // Broadcast an SSE event to all connected clients.
   void emit(const char *event, const String &json = "{}");
 
+  // Optional in-firmware subscriber (e.g. RgbController).
+  using InternalListener = void (*)(const char *event, const String &json,
+                                    void *ctx);
+  void setInternalListener(InternalListener listener, void *ctx);
+
   // Send a periodic keepalive ping; call from loop().
   void heartbeat();
+
+  size_t clientCount() const;
 
  private:
   const char       *_url;
   AsyncEventSource *_source        = nullptr;
   uint32_t          _lastHeartbeat = 0;
+  InternalListener  _internalListener = nullptr;
+  void             *_internalListenerCtx = nullptr;
 };

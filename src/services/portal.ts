@@ -19,18 +19,31 @@ export type PortalSettings = {
 
 export const portalApi = {
   settings: () => apiFetch<PortalSettings>(portalSettingsPath),
-  uploadBanner: (file: Blob) =>
-    apiFetch<PortalSettings>(`${portalSettingsPath}/banner`, {
+  uploadBanner: (file: Blob | File) => {
+    const form = new FormData();
+    const name =
+      file instanceof File && file.name
+        ? file.name
+        : file.type.includes("png")
+          ? "banner.png"
+          : file.type.includes("jpeg") || file.type.includes("jpg")
+            ? "banner.jpg"
+            : "banner.png";
+    form.append("file", file, name);
+    return apiFetch<PortalSettings>(`${portalSettingsPath}/banner`, {
       method: "POST",
-      body: file,
-      headers: { "Content-Type": file.type || "image/webp" },
-    }),
-  uploadMusic: (file: File | Blob) =>
-    apiFetch<PortalSettings>(`${portalSettingsPath}/music`, {
+      body: form,
+    });
+  },
+  uploadMusic: (file: File | Blob) => {
+    const form = new FormData();
+    const name = file instanceof File && file.name ? file.name : "bg_music.mp3";
+    form.append("file", file, name);
+    return apiFetch<PortalSettings>(`${portalSettingsPath}/music`, {
       method: "POST",
-      body: file,
-      headers: { "Content-Type": file.type || "audio/mpeg" },
-    }),
+      body: form,
+    });
+  },
   deleteBanner: () => apiFetch<{ ok: boolean }>(`${portalSettingsPath}/banner`, { method: "DELETE" }),
   deleteMusic: () => apiFetch<{ ok: boolean }>(`${portalSettingsPath}/music`, { method: "DELETE" }),
 };

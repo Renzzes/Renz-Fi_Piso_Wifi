@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 
+#include "Config.h"
 #include "EventBus.h"
 #include "Logger.h"
 #include "Models.h"
@@ -20,28 +21,44 @@ class CoinManager {
   bool diagnostics(JsonDocument &doc);
   void resetCounters();
   void fillStatus(JsonObject coinSlot) const;
+  void fillCoinStatus(JsonObject out) const;
+  CoinStatus statusSnapshot() const;
   uint32_t insertTimeoutSeconds() const;
-  LedMode ledMode() const;
+  CoinState state() const;
+  bool isFault() const;
   static void IRAM_ATTR isrThunk();
+  static const char *stateLabel(CoinState state);
 
  private:
   StorageManager *_storage = nullptr;
   Logger *_logger = nullptr;
   EventBus *_events = nullptr;
-  PromoManager          *_promos         = nullptr;
-  PortalSessionManager  *_portalSessions = nullptr;
+  PromoManager *_promos = nullptr;
+  PortalSessionManager *_portalSessions = nullptr;
 
   volatile uint32_t _pulses = 0;
   volatile uint32_t _lastPulseMs = 0;
+  volatile uint32_t _isrPulseTotal = 0;
+  /** Monotonic millis of first pulse in the current group (ISR-set). */
+  volatile uint32_t _groupFirstPulseMs = 0;
+  volatile uint32_t _debounceMsCached = RenzFiConfig::COIN_DEBOUNCE_MS;
+  // TEMP calibration: ISR ignores edges while millis() is before this value.
+  // Set from loop() right after a pulse group is finalized (never written
+  // from within the ISR) to suppress post-group electrical ringing.
+  volatile uint32_t _postGroupGuardUntilMs = 0;
   uint32_t _lastProcessedPulseMs = 0;
   uint32_t _pulsesToday = 0;
   uint32_t _lastAcceptedPulses = 0;
-  uint32_t _lastAcceptedCoinMs = 0;
   uint32_t _errors = 0;
   CoinSettings _settings;
-  LedMode _ledMode = LedMode::Waiting;
+  CoinStats _stats;
+  CoinState _state = CoinState::WaitingForActivity;
+  CoinFaultReason _faultReason = CoinFaultReason::None;
   bool _coinIsrAttached = false;
   bool _beginComplete = false;
+  bool _statsDirty = false;
+  uint32_t _lastStatsSaveMs = 0;
+  bool _pulseEventPending = false;
 
   static constexpr size_t kDiagLogMax = 12;
   String _diagLogMsg[kDiagLogMax];
@@ -50,10 +67,17 @@ class CoinManager {
 
   void IRAM_ATTR handlePulse();
   void loadSettings();
+  void loadStats();
+  void saveStatsIfNeeded(bool force = false);
+  void updateState();
+  void transitionState(CoinState next, CoinFaultReason fault = CoinFaultReason::None);
+  void enterFault(CoinFaultReason reason, const char *logMsg);
   void processCoin(uint32_t pulses);
-  void updateLed();
-  void setRgbLed(bool red, bool green, bool blue);
   void appendDiagLog(const String &msg);
-  const char *stateLabel() const;
+  const char *uiStateLabel() const;
+  String formatTimestamp(uint32_t eventMs) const;
+  bool attachCoinIsr();
   void detachCoinIsr();
+  void applyEnableState(bool enabled);
+  void emitStateChanged(CoinState from) const;
 };

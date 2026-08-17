@@ -1,4 +1,4 @@
-import type { ChartData, SalesHistoryRow } from "@/types/api";
+import type { ChartData, SaleSessionRecord, SalesHistoryRow } from "@/types/api";
 import { ApiError, api } from "./api";
 import { apiUrl, embeddedApi } from "./embeddedApi";
 
@@ -18,13 +18,38 @@ function downloadBlob(blob: Blob, filename: string) {
 }
 
 export const salesApi = {
-  today: () => api.get<{ amount: number; sessions: number }>(`${embeddedApi.sales}/today`),
-  weekly: () => api.get<{ amount: number; sessions: number }>(`${embeddedApi.sales}/weekly`),
-  monthly: () => api.get<{ amount: number; sessions: number }>(`${embeddedApi.sales}/monthly`),
+  today: () =>
+    api.get<{
+      amount: number;
+      sessions: number;
+      undatedAmount?: number;
+      undatedSessions?: number;
+      clockReady?: boolean;
+    }>(`${embeddedApi.sales}/today`),
+  weekly: () =>
+    api.get<{
+      amount: number;
+      sessions: number;
+      undatedAmount?: number;
+      undatedSessions?: number;
+      clockReady?: boolean;
+    }>(`${embeddedApi.sales}/weekly`),
+  monthly: () =>
+    api.get<{
+      amount: number;
+      sessions: number;
+      undatedAmount?: number;
+      undatedSessions?: number;
+      clockReady?: boolean;
+    }>(`${embeddedApi.sales}/monthly`),
   history: () => api.get<SalesHistoryRow[]>(`${embeddedApi.sales}/history`),
+  records: (limit = 200) =>
+    api.get<SaleSessionRecord[]>(`${embeddedApi.sales}/records?limit=${limit}`),
   chartDaily: () => api.get<ChartData>(`${embeddedApi.sales}/chart/daily`),
   chartWeekly: () => api.get<ChartData>(`${embeddedApi.sales}/chart/weekly`),
   chartMonthly: () => api.get<ChartData>(`${embeddedApi.sales}/chart/monthly`),
+
+  reset: () => api.post<{ ok: boolean }>(`${embeddedApi.sales}/reset`, {}),
 
   exportCsv: async () => {
     const res = await fetch(apiUrl(`${embeddedApi.sales}/export`), {

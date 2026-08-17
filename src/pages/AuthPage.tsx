@@ -24,7 +24,7 @@ export default function AuthPage({ onConnect, connecting }: AuthPageProps) {
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    void onConnect(ipAddress.trim() || "10.10.10.1", password, rememberIpAddress);
+    void onConnect(ipAddress.trim() || "10.40.0.2", password, rememberIpAddress);
   };
 
   return (
@@ -32,31 +32,31 @@ export default function AuthPage({ onConnect, connecting }: AuthPageProps) {
       <Card className="w-full max-w-md">
         <CardHeader className="items-center text-center">
           <img src={logoSrc} alt="Renz-Fi logo" className="mb-2 h-32 w-auto object-contain" />
-          <CardTitle className="text-2xl">Welcome</CardTitle>
-          <CardDescription>Enter the admin IP address to open the dashboard.</CardDescription>
+          <CardTitle className="text-2xl">Connect to Your Renz-Fi Appliance</CardTitle>
+          <CardDescription>Enter your appliance&rsquo;s IP address and password to continue.</CardDescription>
         </CardHeader>
         <CardContent>
           <form className="space-y-4" onSubmit={handleSubmit}>
             <div className="space-y-2">
-              <Label htmlFor="ipAddress">Admin IP address</Label>
+              <Label htmlFor="ipAddress">Admin IP Address</Label>
               <Input
                 id="ipAddress"
                 value={ipAddress}
                 onChange={(event) => setIpAddress(event.target.value)}
-                placeholder="10.10.10.1"
+                placeholder="10.40.0.2"
                 required
                 autoComplete="off"
               />
-              <p className="text-xs text-muted-foreground">Use 10.10.10.1 for testing.</p>
+              <p className="text-xs text-muted-foreground">Default appliance IP: 10.40.0.2</p>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="password">Admin password</Label>
+              <Label htmlFor="password">Password</Label>
               <Input
                 id="password"
                 type="password"
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
-                placeholder="Enter admin password"
+                placeholder="Enter your password"
                 required
                 autoComplete="current-password"
               />
@@ -68,15 +68,15 @@ export default function AuthPage({ onConnect, connecting }: AuthPageProps) {
                 onCheckedChange={(v) => setRememberIpAddress(v === true)}
               />
               <Label htmlFor="rememberIpAddress" className="text-sm font-normal cursor-pointer">
-                Remember IP address on this device
+                Remember this appliance
               </Label>
             </div>
             <p className="text-xs text-muted-foreground">
-              Admin login uses a browser session cookie only. Closing the browser requires signing
-              in again.
+              Your session stays signed in on this browser until you sign out or close the
+              browser.
             </p>
             <Button type="submit" className="w-full" disabled={connecting}>
-              {connecting ? "Connecting…" : "Connect to Admin"}
+              {connecting ? "Connecting…" : "Connect"}
             </Button>
           </form>
         </CardContent>

@@ -41,7 +41,17 @@ export type SystemStatus = {
   activeUsers: { count: number; paused: number; idle: number };
   mikrotik: { ok: boolean; host: string; latencyMs: number };
   internet: { ok: boolean; latencyMs: number; known?: boolean };
-  coinSlot: { ok: boolean; state: string; pulsesToday: number };
+  coinSlot: {
+    enabled?: boolean;
+    hardwareState?: string;
+    lastPulseTimestamp?: string | null;
+    lastCoinTimestamp?: string | null;
+    totalPulseCount?: number;
+    totalCoinCount?: number;
+    ok: boolean;
+    state: string;
+    pulsesToday: number;
+  };
   hotspot: { ok: boolean; ssid: string };
   esp32: { uptime: string; lastSeen: string | null };
   storage: {
@@ -65,4 +75,12 @@ export type SystemStatus = {
     };
   };
   sync: { pending: number; lastSyncAt: string | null };
+  storageStatus?: {
+    storageMode: "SD" | "SPIFFS";
+    sdPresent: boolean;
+    sdMounted: boolean;
+    capacity: number;
+    used: number;
+    fallbackActive: boolean;
+  };
 };

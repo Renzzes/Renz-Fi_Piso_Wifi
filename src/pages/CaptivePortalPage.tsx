@@ -1,6 +1,6 @@
 import { useRef, useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Music, Trash2, Upload, X } from "lucide-react";
+import { Trash2, Upload, X } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -9,35 +9,9 @@ import { toast } from "sonner";
 import { portalApi } from "@/services/portal";
 import { resolvePortalAssetUrl } from "@/services/embeddedApi";
 
-const BANNER_MAX_BYTES = 200 * 1024;
-const BANNER_PREFERRED_BYTES = 100 * 1024;
-const MUSIC_MAX_BYTES = 1000 * 1024;
-const MUSIC_PREFERRED_BYTES = 950 * 1024;
-const BANNER_ALLOWED = ["image/png", "image/jpeg", "image/webp"];
-const MAX_W = 440;
-
-async function optimizeBanner(file: File): Promise<Blob> {
-  const bitmap = await createImageBitmap(file);
-  const ratio = bitmap.width > MAX_W ? MAX_W / bitmap.width : 1;
-  const w = Math.round(bitmap.width * ratio);
-  const h = Math.round(bitmap.height * ratio);
-  const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d")!;
-  ctx.drawImage(bitmap, 0, 0, w, h);
-  let quality = 0.85;
-  let blob = await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("encode failed"))), "image/webp", quality);
-  });
-  while (blob.size > BANNER_PREFERRED_BYTES && quality > 0.4) {
-    quality -= 0.1;
-    blob = await new Promise<Blob>((resolve, reject) => {
-      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("encode failed"))), "image/webp", quality);
-    });
-  }
-  return blob;
-}
+const BANNER_MAX_BYTES = 2 * 1024 * 1024;
+const MUSIC_MAX_BYTES = 2 * 1024 * 1024;
+const BANNER_ALLOWED = ["image/png", "image/jpeg", "image/jpg"];
 
 export default function CaptivePortalPage() {
   const qc = useQueryClient();
@@ -48,6 +22,7 @@ export default function CaptivePortalPage() {
   const [bannerPreview, setBannerPreview] = useState<string | null>(null);
   const [bannerBlob, setBannerBlob] = useState<Blob | null>(null);
   const [bannerSize, setBannerSize] = useState(0);
+  const [bannerName, setBannerName] = useState("banner.png");
   const [musicFile, setMusicFile] = useState<File | null>(null);
   const bannerRef = useRef<HTMLInputElement>(null);
   const musicRef = useRef<HTMLInputElement>(null);
@@ -60,16 +35,9 @@ export default function CaptivePortalPage() {
   );
 
   useEffect(() => {
-    if (!settings?.musicUrl || !musicConfigured) return;
-    console.log("Music URL", settings.musicUrl, "→", resolvePortalAssetUrl(settings.musicUrl));
-  }, [settings?.musicUrl, musicConfigured]);
-
-  useEffect(() => {
     if (!settings?.bannerUrl || bannerBlob) return;
     if (bannerConfigured) {
-      const resolved = resolvePortalAssetUrl(settings.bannerUrl);
-      console.log("Banner URL", settings.bannerUrl, "→", resolved);
-      setBannerPreview(resolved);
+      setBannerPreview(resolvePortalAssetUrl(settings.bannerUrl));
     } else {
       setBannerPreview(null);
     }
@@ -94,109 +62,40 @@ export default function CaptivePortalPage() {
     mutationFn: async () => {
       const hadBanner = Boolean(bannerBlob);
       const hadMusic = Boolean(musicFile);
-      if (bannerBlob) await portalApi.uploadBanner(bannerBlob);
+      if (bannerBlob) {
+        const file = new File([bannerBlob], bannerName, {
+          type: bannerBlob.type || "image/png",
+        });
+        await portalApi.uploadBanner(file);
+      }
       if (musicFile) await portalApi.uploadMusic(musicFile);
       const latest = await portalApi.settings();
       return { latest, hadBanner, hadMusic };
     },
     onSuccess: ({ latest, hadBanner, hadMusic }) => {
       qc.setQueryData(["portal", "settings"], latest);
-
       const bannerOk =
         !hadBanner ||
         Boolean(latest.bannerConfigured ?? latest.has_banner ?? latest.hasCustomBanner);
       const musicOk =
         !hadMusic ||
         Boolean(latest.musicConfigured ?? latest.has_music ?? latest.hasCustomMusic);
-
       if (!bannerOk || !musicOk) {
-        toast.error(
-          !bannerOk && !musicOk
-            ? "Upload did not persist — check firmware logs for [portal-upload]"
-            : !bannerOk
-              ? "Banner upload did not persist on device"
-              : "Music upload did not persist on device",
-        );
+        toast.error("Upload did not persist — check device storage");
         return;
       }
-
-      toast.success("Portal branding saved — captive portal will refresh automatically");
+      toast.success("Portal branding saved");
       setBannerBlob(null);
+      setBannerSize(0);
       setMusicFile(null);
       if (bannerRef.current) bannerRef.current.value = "";
       if (musicRef.current) musicRef.current.value = "";
       if (latest.bannerUrl && (latest.bannerConfigured ?? latest.has_banner)) {
-        const resolved = resolvePortalAssetUrl(latest.bannerUrl);
-        console.log("Banner URL", latest.bannerUrl, "→", resolved);
-        setBannerPreview(resolved);
+        setBannerPreview(resolvePortalAssetUrl(latest.bannerUrl));
       }
     },
-    onError: () => toast.error("Failed to save portal branding"),
+    onError: () => toast.error("Failed to save portal assets"),
   });
-
-  const deleteBannerMutation = useMutation({
-    mutationFn: () => portalApi.deleteBanner(),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["portal"] });
-      clearBanner();
-      toast.success("Custom banner removed — default banner will be used");
-    },
-    onError: () => toast.error("Failed to remove banner"),
-  });
-
-  const deleteMusicMutation = useMutation({
-    mutationFn: () => portalApi.deleteMusic(),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["portal"] });
-      clearMusic();
-      toast.success("Custom music removed — default bg_music.mp3 will be used");
-    },
-    onError: () => toast.error("Failed to remove music"),
-  });
-
-  const handleBanner = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!BANNER_ALLOWED.includes(file.type)) {
-      toast.error("Only PNG, JPG, or WEBP allowed");
-      return;
-    }
-    if (file.size > BANNER_MAX_BYTES) {
-      toast.error("Banner exceeds 200 KiB hard limit");
-      return;
-    }
-    try {
-      const blob = await optimizeBanner(file);
-      if (blob.size > BANNER_MAX_BYTES) {
-        toast.error("Optimized banner still exceeds 200 KiB");
-        return;
-      }
-      if (bannerPreview?.startsWith("blob:")) URL.revokeObjectURL(bannerPreview);
-      setBannerBlob(blob);
-      setBannerSize(blob.size);
-      setBannerPreview(URL.createObjectURL(blob));
-      toast.success(`Banner ready (${(blob.size / 1024).toFixed(1)} KiB)`);
-    } catch {
-      toast.error("Failed to process banner");
-    }
-  };
-
-  const handleMusic = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!file.name.toLowerCase().endsWith(".mp3") && file.type !== "audio/mpeg") {
-      toast.error("Only MP3 files are allowed");
-      return;
-    }
-    if (file.size > MUSIC_MAX_BYTES) {
-      toast.error("Music exceeds 1000 KiB hard limit");
-      return;
-    }
-    if (file.size > MUSIC_PREFERRED_BYTES) {
-      toast.warning(`Music is ${(file.size / 1024).toFixed(0)} KiB — recommended max is 950 KiB`);
-    }
-    setMusicFile(file);
-  };
 
   const clearBanner = () => {
     if (bannerPreview?.startsWith("blob:")) URL.revokeObjectURL(bannerPreview);
@@ -211,6 +110,61 @@ export default function CaptivePortalPage() {
     if (musicRef.current) musicRef.current.value = "";
   };
 
+  const removeBannerMutation = useMutation({
+    mutationFn: () => portalApi.deleteBanner(),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["portal", "settings"] });
+      clearBanner();
+      toast.success("Custom banner removed — default banner will be used");
+    },
+    onError: () => toast.error("Failed to remove banner"),
+  });
+
+  const removeMusicMutation = useMutation({
+    mutationFn: () => portalApi.deleteMusic(),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["portal", "settings"] });
+      clearMusic();
+      toast.success("Custom music removed — default bg_music.mp3 will be used");
+    },
+    onError: () => toast.error("Failed to remove music"),
+  });
+
+  const handleBanner = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const typeOk =
+      BANNER_ALLOWED.includes(file.type) || /\.(png|jpe?g)$/i.test(file.name);
+    if (!typeOk) {
+      toast.error("Only PNG or JPEG allowed");
+      return;
+    }
+    if (file.size > BANNER_MAX_BYTES) {
+      toast.error("Banner exceeds 2 MB limit");
+      return;
+    }
+    if (bannerPreview?.startsWith("blob:")) URL.revokeObjectURL(bannerPreview);
+    setBannerBlob(file);
+    setBannerSize(file.size);
+    setBannerName(file.name);
+    setBannerPreview(URL.createObjectURL(file));
+    toast.success(`Banner ready (${(file.size / 1024).toFixed(1)} KiB)`);
+  };
+
+  const handleMusic = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".mp3") && file.type !== "audio/mpeg") {
+      toast.error("Only MP3 files are allowed");
+      return;
+    }
+    if (file.size > MUSIC_MAX_BYTES) {
+      toast.error("Music exceeds 2 MB limit");
+      return;
+    }
+    setMusicFile(file);
+  };
+
   return (
     <div>
       <PageHeader
@@ -223,13 +177,12 @@ export default function CaptivePortalPage() {
           <Input
             ref={bannerRef}
             type="file"
-            accept="image/png,image/jpeg,image/webp"
+            accept="image/png,image/jpeg,.png,.jpg,.jpeg"
             onChange={handleBanner}
             className="h-9 text-xs"
           />
           <p className="text-[11px] text-muted-foreground">
-            Recommended: WEBP, max 100 KiB. Hard limit 200 KiB. Falls back to Default-Banner.png when
-            none is uploaded.
+            PNG or JPEG, maximum 2 MB. Falls back to Default-Banner.png when none is uploaded.
           </p>
           <p className="text-[11px]">
             {bannerConfigured ? (
@@ -238,7 +191,6 @@ export default function CaptivePortalPage() {
               <span className="text-muted-foreground">Using default banner (Default-Banner.png)</span>
             )}
           </p>
-
           {bannerPreview && (
             <div className="relative inline-block mt-2">
               <img
@@ -262,14 +214,13 @@ export default function CaptivePortalPage() {
               ) : null}
             </div>
           )}
-
           {bannerConfigured && !bannerBlob ? (
             <Button
               size="sm"
               variant="outline"
               className="mt-2"
-              onClick={() => deleteBannerMutation.mutate()}
-              disabled={deleteBannerMutation.isPending}
+              disabled={removeBannerMutation.isPending}
+              onClick={() => removeBannerMutation.mutate()}
             >
               <Trash2 className="h-3.5 w-3.5" /> Remove custom banner
             </Button>
@@ -277,7 +228,7 @@ export default function CaptivePortalPage() {
         </div>
 
         <div className="space-y-1">
-          <Label className="text-xs">Background Music Upload</Label>
+          <Label className="text-xs">Background Music</Label>
           <Input
             ref={musicRef}
             type="file"
@@ -286,8 +237,7 @@ export default function CaptivePortalPage() {
             className="h-9 text-xs"
           />
           <p className="text-[11px] text-muted-foreground">
-            MP3 only. Recommended 950 KiB, hard limit 1000 KiB. Falls back to bg_music.mp3 when none
-            is uploaded.
+            MP3 only, maximum 2 MB. Falls back to bg_music.mp3 when none is uploaded.
           </p>
           <p className="text-[11px]">
             {musicConfigured ? (
@@ -297,32 +247,20 @@ export default function CaptivePortalPage() {
             )}
           </p>
           {musicConfigured && settings?.musicUrl && !musicFile ? (
-            <audio controls preload="none" className="w-full mt-2 h-8">
-              <source
-                src={resolvePortalAssetUrl(settings.musicUrl)}
-                type="audio/mpeg"
-              />
-            </audio>
+            <audio controls className="w-full mt-2" src={resolvePortalAssetUrl(settings.musicUrl)} />
           ) : null}
           {musicFile && (
-            <div className="flex items-center gap-2 mt-1 text-xs">
-              <Music className="h-3.5 w-3.5 text-muted-foreground" />
-              <span>{musicFile.name}</span>
-              <span className="text-muted-foreground">
-                ({(musicFile.size / 1024).toFixed(1)} KiB)
-              </span>
-              <button type="button" onClick={clearMusic} className="text-destructive hover:underline">
-                Remove
-              </button>
-            </div>
+            <p className="text-[11px] text-muted-foreground">
+              {musicFile.name} ({(musicFile.size / 1024).toFixed(1)} KiB)
+            </p>
           )}
           {musicConfigured && !musicFile ? (
             <Button
               size="sm"
               variant="outline"
               className="mt-2"
-              onClick={() => deleteMusicMutation.mutate()}
-              disabled={deleteMusicMutation.isPending}
+              disabled={removeMusicMutation.isPending}
+              onClick={() => removeMusicMutation.mutate()}
             >
               <Trash2 className="h-3.5 w-3.5" /> Remove custom music
             </Button>
@@ -331,10 +269,11 @@ export default function CaptivePortalPage() {
 
         <Button
           size="sm"
-          onClick={() => saveMutation.mutate()}
           disabled={saveMutation.isPending || (!bannerBlob && !musicFile)}
+          onClick={() => saveMutation.mutate()}
         >
-          <Upload /> Save Settings
+          <Upload className="h-3.5 w-3.5" />
+          {saveMutation.isPending ? "Saving…" : "Save branding"}
         </Button>
       </div>
     </div>

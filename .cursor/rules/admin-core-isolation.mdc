@@ -1,0 +1,46 @@
+---
+description: Admin Dashboard is an optional client of Renz-Fi Core — never a Core dependency
+globs: src/**/*.{ts,tsx},ESP32_S3_Firmware/src/ApiServer.cpp,ESP32_S3_Firmware/src/web/AdminServer.cpp,ESP32_S3_Firmware/src/EventBus.cpp
+alwaysApply: true
+---
+
+# Admin / Core Isolation
+
+The Admin Dashboard is an **optional management client**. It is not part of the Piso WiFi operational chain.
+
+## Core (must run without Admin)
+
+Coin, Session, Sales, Router Adapter / MikroTik Driver, PortalServer, SetupServer, StorageManager, InstallationStateManager, W5500, watchdog / loopTask.
+
+## Admin (client only)
+
+Admin talks to Core through existing REST + SSE (`/api/health`, `/api/status`, `/api/events`, existing job APIs).
+
+## Admin synchronization meaning
+
+Synchronizes the Admin UI with authoritative **Renz-Fi Core** state.
+
+It does **not** transfer MikroTik credentials to the browser and does **not** open a new RouterOS login on every Admin connection.
+
+- Fresh router cache → `GET /api/status` only
+- Stale cache + credentials present → existing `POST /api/router/cache/sync` worker job (202), never RouterOS on `async_tcp`
+- RouterOS unavailable → Dashboard still loads with degraded/unavailable router status
+
+## Never
+
+- Coin / session / sale / internet grant depending on Admin being open
+- Live RouterOS login or command sequences on every Admin connect
+- Periodic Admin polling of MikroTik (use cached `/api/status` + SSE)
+- New `/api/admin/sync` that opens RouterOS
+- SD / `writeJson` / RouterOS on `async_tcp`
+- Copying MikroTik passwords into browser storage
+- Claiming "credentials synchronized" unless a real credential/provisioning operation occurred
+- Redesigning Setup Wizard, Captive Portal, or Core managers for Admin UX
+
+## Connect flow
+
+`CONNECT` → existing auth → Core state sync (`GET /api/status`, optional stale worker refresh) → existing Dashboard.
+
+## Sales
+
+ESP32 persists first, then may emit `sales.changed` / `sale.created`. Admin applies a targeted UI patch from `sale.created`. If no SSE client is connected, EventBus must no-op. Core continues.

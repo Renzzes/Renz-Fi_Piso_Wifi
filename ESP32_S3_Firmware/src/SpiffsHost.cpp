@@ -1,5 +1,7 @@
 #include "SpiffsHost.h"
 
+#include "RenzFiDebug.h"
+
 #include <SPIFFS.h>
 
 namespace {
@@ -69,7 +71,11 @@ bool hasFilesUnderAssetsPrefix() {
 }  // namespace
 
 void logSpiffsInventory() {
-  Serial.println("[boot] SPIFFS inventory:");
+#if !RENZFI_DEBUG_SPIFFS
+  return;
+#endif
+
+  Serial.println("[boot] SPIFFS inventory (debug):");
 
   File root = SPIFFS.open("/");
   if (root && root.isDirectory()) {
@@ -110,15 +116,9 @@ String resolveSpiffsServePath(const String &requestPath, bool *gzipOut) {
 
   if (path.isEmpty()) path = "/";
 
-  // ── Customer portal root paths → serve captive portal ──────────────
-  // "/" and "/portal" always serve the customer portal, not the admin SPA.
-  if (path == "/" || path == "/portal" || path == "/portal/") {
-    if (existsOnSpiffs("/portal/index.html")) return "/portal/index.html";
-    if (existsOnSpiffs("/portal/index.html.gz")) {
-      if (gzipOut) *gzipOut = true;
-      return "/portal/index.html.gz";
-    }
-    // Portal not uploaded yet — fall through to admin SPA as fallback
+  // Captive portal paths are owned exclusively by PortalServer.
+  if (path == "/" || path == "/portal" || path.startsWith("/portal/")) {
+    return "";
   }
 
   if (path.endsWith("/")) path += "index.html";
@@ -135,7 +135,6 @@ String resolveSpiffsServePath(const String &requestPath, bool *gzipOut) {
     return "";  // serveStatic() handles /assets/*; nothing to resolve here
   }
 
-  // /portal/* assets that are missing from SPIFFS get a 404, not the admin SPA.
   if (path.startsWith("/portal/")) {
     return "";
   }
@@ -147,11 +146,14 @@ String resolveSpiffsServePath(const String &requestPath, bool *gzipOut) {
 
   // Admin SPA and any other extensionless path → serve React index.html
   if (!hasFileExtension(path) || path == "/admin" || path.startsWith("/admin/")) {
-    if (existsOnSpiffs("/index.html")) return "/index.html";
+    // Prefer gzip when both exist. Uncompressed index.html is the SPA shell
+    // served for /dashboard and /system-configuration; gzip=no was observed
+    // at 140–1565 ms vs 22–83 ms for small assets.
     if (existsOnSpiffs("/index.html.gz")) {
       if (gzipOut) *gzipOut = true;
       return "/index.html.gz";
     }
+    if (existsOnSpiffs("/index.html")) return "/index.html";
     return "";
   }
 

@@ -1,20 +1,15 @@
-import { useCallback, useEffect, useState } from "react";
-import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { AdminLayout } from "@/components/AdminLayout";
+import { AdminSyncScreen } from "@/components/AdminSyncScreen";
 import { AuthCheckingScreen } from "@/components/AuthCheckingScreen";
 import { ConnectionLostOverlay } from "@/components/ConnectionLostOverlay";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { ChangeAdminPasswordForm } from "@/components/ChangeAdminPasswordForm";
 import { SessionExpiryWarningDialog } from "@/components/SessionExpiryWarningDialog";
 import AuthPage from "@/pages/AuthPage";
+import ChangePasswordPage from "@/pages/ChangePasswordPage";
 import DashboardPage from "@/pages/DashboardPage";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import PromoRatesPage from "@/pages/PromoRatesPage";
 import VouchersPage from "@/pages/VouchersPage";
 import ActiveUsersPage from "@/pages/ActiveUsersPage";
@@ -27,9 +22,14 @@ import LogsPage from "@/pages/LogsPage";
 import FirmwarePage from "@/pages/FirmwarePage";
 import SystemSettingsPage from "@/pages/SystemSettingsPage";
 import { toast } from "sonner";
-import { authApi, setRememberedIp } from "@/services/auth";
+import { authApi, setRememberedIp, type AuthRole } from "@/services/auth";
 import { ApiError } from "@/services/api";
 import { setUnauthorizedHandler } from "@/services/authSession";
+import {
+  DEFAULT_OPERATOR_PERMISSIONS,
+  normalizeOperatorPermissions,
+  type OperatorPermission,
+} from "@/lib/operatorPermissions";
 import {
   clearReloginRequired,
   isReloginRequired,
@@ -40,22 +40,57 @@ import {
   stopLogoutRetry,
 } from "@/services/sessionGate";
 import { getEmbeddedHost } from "@/services/embeddedApi";
+import { synchronizeAdminClient, type AdminSyncPhase } from "@/services/adminSync";
 import { useDashboardEvents } from "@/hooks/useDashboardEvents";
 import { useAdminApiMonitor } from "@/hooks/useAdminApiMonitor";
 import { useSessionIdleTimeout } from "@/hooks/useSessionIdleTimeout";
 import { RealtimeProvider, type RealtimeContextValue } from "@/contexts/RealtimeContext";
+import { DeviceRegistryProvider } from "@/contexts/DeviceRegistryContext";
+import type { RegisteredDevice } from "@/types/deviceProfile";
+
+function RequireOwner({ isOwner, children }: { isOwner: boolean; children: ReactNode }) {
+  if (!isOwner) return <Navigate to="/dashboard" replace />;
+  return <>{children}</>;
+}
+
+function RequirePermission({
+  isOwner,
+  permissions,
+  permission,
+  children,
+}: {
+  isOwner: boolean;
+  permissions: OperatorPermission[];
+  permission: OperatorPermission;
+  children: ReactNode;
+}) {
+  if (isOwner) return <>{children}</>;
+  if (!permissions.includes(permission)) {
+    return <Navigate to="/dashboard" replace />;
+  }
+  return <>{children}</>;
+}
 
 export default function App() {
   const navigate = useNavigate();
+  const location = useLocation();
   const queryClient = useQueryClient();
   const [adminIp] = useState(() => getEmbeddedHost());
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  const [role, setRole] = useState<AuthRole>("none");
+  const [permissions, setPermissions] = useState<OperatorPermission[]>([
+    ...DEFAULT_OPERATOR_PERMISSIONS,
+  ]);
   const [connecting, setConnecting] = useState(false);
-  const [showPasswordChange, setShowPasswordChange] = useState(false);
+  const [passwordChangeRequired, setPasswordChangeRequired] = useState(false);
   const [connectionRetrying, setConnectionRetrying] = useState(false);
+  const [coreSyncDone, setCoreSyncDone] = useState(false);
+  const [syncPhase, setSyncPhase] = useState<AdminSyncPhase>("device");
+  const [syncError, setSyncError] = useState<string | null>(null);
 
   const sessionChecked = authenticated !== null;
   const isLoggedIn = authenticated === true;
+  const isOwner = role === "owner";
 
   const handleDisconnect = useCallback(async () => {
     try {
@@ -71,16 +106,48 @@ export default function App() {
       startLogoutRetryUntilSuccess();
     } finally {
       setAuthenticated(false);
-      setShowPasswordChange(false);
+      setPasswordChangeRequired(false);
+      setRole("none");
+      setPermissions([...DEFAULT_OPERATOR_PERMISSIONS]);
+      setCoreSyncDone(false);
       navigate("/login", { replace: true });
     }
   }, [navigate]);
+
+  const runCoreSync = useCallback(async () => {
+    setSyncError(null);
+    setSyncPhase("device");
+    try {
+      await synchronizeAdminClient((phase) => setSyncPhase(phase));
+      setCoreSyncDone(true);
+      return true;
+    } catch (err) {
+      setSyncError(
+        err instanceof ApiError
+          ? err.message
+          : "Unable to synchronize with the appliance.",
+      );
+      setCoreSyncDone(false);
+      return false;
+    }
+  }, []);
+
+  const handlePasswordChangeComplete = useCallback(async () => {
+    setPasswordChangeRequired(false);
+    setCoreSyncDone(false);
+    const synced = await runCoreSync();
+    if (!synced) return;
+    await queryClient.invalidateQueries();
+    navigate("/dashboard", { replace: true });
+  }, [navigate, queryClient, runCoreSync]);
 
   const handleReconnectRequireLogin = useCallback(async () => {
     markReloginRequired("reconnect");
     queryClient.clear();
     setAuthenticated(false);
-    setShowPasswordChange(false);
+    setRole("none");
+    setPasswordChangeRequired(false);
+    setCoreSyncDone(false);
     navigate("/login", { replace: true });
     toast.message("Connection restored. Please sign in again.");
 
@@ -90,8 +157,10 @@ export default function App() {
     }
   }, [navigate, queryClient]);
 
+  const dashboardEvents = useDashboardEvents(isLoggedIn && !passwordChangeRequired);
   const { connectionLost, adminApiReachable, retryConnection } = useAdminApiMonitor({
-    enabled: isLoggedIn,
+    enabled: isLoggedIn && !passwordChangeRequired,
+    sseConnected: dashboardEvents.sseConnected,
     onReconnectRequireLogin: handleReconnectRequireLogin,
   });
 
@@ -104,7 +173,33 @@ export default function App() {
     }
   }, [retryConnection]);
 
-  const dashboardEvents = useDashboardEvents(isLoggedIn);
+  const handleDeviceSwitch = useCallback(
+    async (_device: RegisteredDevice) => {
+      queryClient.clear();
+      stopLogoutRetry();
+      setPasswordChangeRequired(false);
+      try {
+        const json = await authApi.health();
+        const serverAuthenticated = Boolean(json?.session?.authenticated);
+        const authed = resolveBootstrapAuth(serverAuthenticated);
+        setAuthenticated(authed);
+        setRole(authed ? json?.session?.role ?? "none" : "none");
+        setPermissions(
+          normalizeOperatorPermissions(json?.session?.permissions),
+        );
+        if (!authed) {
+          navigate("/login", { replace: true, state: { from: location.pathname } });
+        }
+      } catch {
+        setAuthenticated(false);
+        setRole("none");
+        setPermissions([...DEFAULT_OPERATOR_PERMISSIONS]);
+        navigate("/login", { replace: true, state: { from: location.pathname } });
+      }
+    },
+    [location.pathname, navigate, queryClient],
+  );
+
   const realtime: RealtimeContextValue = {
     ...dashboardEvents,
     connectionLost,
@@ -112,7 +207,7 @@ export default function App() {
   };
 
   const { showWarning, stayLoggedIn } = useSessionIdleTimeout({
-    enabled: isLoggedIn && !connectionLost,
+    enabled: isLoggedIn && !connectionLost && !passwordChangeRequired,
     onExpire: () => {
       toast.message("Session expired due to inactivity.");
       void handleDisconnect();
@@ -131,10 +226,30 @@ export default function App() {
           });
         }
         if (!cancelled) {
-          setAuthenticated(resolveBootstrapAuth(serverAuthenticated));
+          const authed = resolveBootstrapAuth(serverAuthenticated);
+          setAuthenticated(authed);
+          setRole(authed ? json?.session?.role ?? "none" : "none");
+          setPermissions(
+            normalizeOperatorPermissions(json?.session?.permissions),
+          );
+          const needsPasswordChange = authed && Boolean(json?.session?.mustChangePassword);
+          setPasswordChangeRequired(needsPasswordChange);
+          if (needsPasswordChange) {
+            setCoreSyncDone(true);
+            navigate("/change-password", { replace: true });
+          } else if (authed) {
+            void runCoreSync();
+          } else {
+            setCoreSyncDone(true);
+          }
         }
       } catch {
-        if (!cancelled) setAuthenticated(false);
+        if (!cancelled) {
+          setAuthenticated(false);
+          setRole("none");
+          setPermissions([...DEFAULT_OPERATOR_PERMISSIONS]);
+          setCoreSyncDone(true);
+        }
       }
     })();
 
@@ -142,11 +257,13 @@ export default function App() {
       cancelled = true;
       stopLogoutRetry();
     };
-  }, []);
+  }, [navigate, runCoreSync]);
 
   useEffect(() => {
     setUnauthorizedHandler(() => {
-      toast.message("Your session has ended. Please sign in again.");
+      toast.message(
+        "Device was factory reset or your session ended. Reconnect through Setup if needed.",
+      );
       void handleDisconnect();
     });
 
@@ -157,6 +274,8 @@ export default function App() {
 
   const handleConnect = async (ipAddress: string, password: string, rememberIpAddress: boolean) => {
     setConnecting(true);
+    setCoreSyncDone(false);
+    setSyncError(null);
     try {
       const health = await authApi.health();
       if (!health.ok) {
@@ -170,8 +289,17 @@ export default function App() {
       clearReloginRequired();
       stopLogoutRetry();
       setAuthenticated(true);
-      setShowPasswordChange(Boolean(login.mustChangePassword));
-      navigate("/dashboard", { replace: true });
+      setRole(login.role ?? "owner");
+      setPermissions(normalizeOperatorPermissions(login.permissions));
+      const needsPasswordChange = Boolean(login.mustChangePassword);
+      setPasswordChangeRequired(needsPasswordChange);
+      if (needsPasswordChange) {
+        setCoreSyncDone(true);
+        navigate("/change-password", { replace: true });
+        return;
+      }
+      const synced = await runCoreSync();
+      if (synced) navigate("/dashboard", { replace: true });
     } catch (err) {
       if (err instanceof ApiError) {
         toast.error(err.message);
@@ -188,16 +316,29 @@ export default function App() {
     return <AuthCheckingScreen />;
   }
 
+  if (isLoggedIn && !passwordChangeRequired && !coreSyncDone) {
+    return (
+      <AdminSyncScreen
+        phase={syncPhase}
+        error={syncError}
+        onRetry={() => void runCoreSync()}
+      />
+    );
+  }
+
+  const postLoginTarget = passwordChangeRequired ? "/change-password" : "/dashboard";
+
   const adminEntry = isLoggedIn ? (
-    <Navigate to="/dashboard" replace />
+    <Navigate to={postLoginTarget} replace />
   ) : (
     <Navigate to="/login" replace />
   );
 
   return (
+    <DeviceRegistryProvider onDeviceSwitch={(device) => void handleDeviceSwitch(device)}>
     <RealtimeProvider value={realtime}>
       <ConnectionLostOverlay
-        open={isLoggedIn && connectionLost}
+        open={isLoggedIn && !passwordChangeRequired && connectionLost}
         onRetry={() => void handleConnectionRetry()}
         retrying={connectionRetrying}
       />
@@ -208,9 +349,40 @@ export default function App() {
           path="/login"
           element={
             isLoggedIn ? (
-              <Navigate to="/dashboard" replace />
+              <Navigate to={postLoginTarget} replace />
             ) : (
               <AuthPage onConnect={handleConnect} connecting={connecting} />
+            )
+          }
+        />
+        <Route
+          path="/change-password"
+          element={
+            isLoggedIn ? (
+              passwordChangeRequired ? (
+                <ChangePasswordPage
+                  onComplete={handlePasswordChangeComplete}
+                  onLogout={handleDisconnect}
+                />
+              ) : (
+                <Navigate to="/dashboard" replace />
+              )
+            ) : (
+              <Navigate to="/login" replace />
+            )
+          }
+        />
+        <Route
+          path="/setup"
+          element={
+            isLoggedIn ? (
+              passwordChangeRequired ? (
+                <Navigate to="/change-password" replace />
+              ) : (
+                <Navigate to="/system-settings" replace />
+              )
+            ) : (
+              <Navigate to="/login" replace />
             )
           }
         />
@@ -219,67 +391,178 @@ export default function App() {
           path="/"
           element={
             isLoggedIn ? (
-              <AdminLayout
-                adminIp={adminIp}
-                onDisconnect={handleDisconnect}
-                connectionLost={connectionLost}
-              />
+              passwordChangeRequired ? (
+                <Navigate to="/change-password" replace />
+              ) : (
+                <AdminLayout
+                  adminIp={adminIp}
+                  onDisconnect={handleDisconnect}
+                  connectionLost={connectionLost}
+                  isOwner={isOwner}
+                  permissions={permissions}
+                />
+              )
             ) : (
               <Navigate to="/login" replace />
             )
           }
         >
           <Route index element={<Navigate to="/dashboard" replace />} />
-          <Route path="dashboard" element={<DashboardPage />} />
-          <Route path="promo-rates" element={<PromoRatesPage />} />
-          <Route path="vouchers" element={<VouchersPage />} />
-          <Route path="active-users" element={<ActiveUsersPage />} />
-          <Route path="sales-reports" element={<SalesReportsPage />} />
-          <Route path="captive-portal" element={<CaptivePortalPage />} />
-          <Route path="coin-settings" element={<CoinSettingsPage />} />
-          <Route path="system-configuration" element={<SystemConfigurationPage />} />
-          <Route path="router-settings" element={<RouterSettingsPage />} />
-          <Route path="logs" element={<LogsPage />} />
-          <Route path="firmware" element={<FirmwarePage />} />
+          <Route
+            path="dashboard"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="dashboard"
+              >
+                <ErrorBoundary>
+                  <DashboardPage />
+                </ErrorBoundary>
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="promo-rates"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="promo-rates"
+              >
+                <PromoRatesPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="vouchers"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="vouchers"
+              >
+                <VouchersPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="active-users"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="active-users"
+              >
+                <ActiveUsersPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="sales-reports"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="sales-reports"
+              >
+                <SalesReportsPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="captive-portal"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="captive-portal"
+              >
+                <CaptivePortalPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="coin-settings"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="coin-settings"
+              >
+                <CoinSettingsPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="system-configuration"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="system-configuration"
+              >
+                <SystemConfigurationPage />
+              </RequirePermission>
+            }
+          />
+          {/* Compatibility bookmark: former Router nav → System Configuration */}
+          <Route
+            path="router-settings"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="system-configuration"
+              >
+                <RouterSettingsPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="logs"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="logs"
+              >
+                <LogsPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="firmware"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="firmware"
+              >
+                <FirmwarePage />
+              </RequirePermission>
+            }
+          />
           <Route
             path="system-settings"
-            element={<SystemSettingsPage onPasswordChanged={handleDisconnect} />}
+            element={
+              <RequireOwner isOwner={isOwner}>
+                <SystemSettingsPage onPasswordChanged={handleDisconnect} />
+              </RequireOwner>
+            }
           />
+          {/* Obsolete fleet/devices bookmarks → Dashboard (standalone appliance) */}
+          <Route path="devices" element={<Navigate to="/dashboard" replace />} />
+          <Route path="fleet" element={<Navigate to="/dashboard" replace />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Route>
       </Routes>
-      <ChangePasswordDialog open={isLoggedIn && showPasswordChange} onChanged={handleDisconnect} />
       <SessionExpiryWarningDialog
-        open={isLoggedIn && showWarning}
+        open={isLoggedIn && !passwordChangeRequired && showWarning}
         onStayLoggedIn={stayLoggedIn}
         onLogout={() => void handleDisconnect()}
       />
     </RealtimeProvider>
-  );
-}
-
-function ChangePasswordDialog({
-  open,
-  onChanged,
-}: {
-  open: boolean;
-  onChanged: () => void | Promise<void>;
-}) {
-  return (
-    <Dialog open={open} onOpenChange={() => undefined}>
-      <DialogContent
-        className="sm:max-w-md"
-        onEscapeKeyDown={(event) => event.preventDefault()}
-        onPointerDownOutside={(event) => event.preventDefault()}
-      >
-        <DialogHeader>
-          <DialogTitle>Change Password</DialogTitle>
-          <DialogDescription>
-            Change the default admin password before continuing.
-          </DialogDescription>
-        </DialogHeader>
-        <ChangeAdminPasswordForm defaultOldPassword="admin" onSuccess={onChanged} />
-      </DialogContent>
-    </Dialog>
+    </DeviceRegistryProvider>
   );
 }

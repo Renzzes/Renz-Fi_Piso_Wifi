@@ -7,10 +7,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -22,12 +22,10 @@ import com.renzfi.owner.model.VendoDevice
 @Composable
 fun DeviceCard(
     device: VendoDevice,
-    onOpenDashboard: () -> Unit,
+    onLoginToAdmin: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
-    onOverview: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
-    showOverviewAction: Boolean = true,
 ) {
     Card(
         modifier = modifier.fillMaxWidth(),
@@ -46,35 +44,20 @@ fun DeviceCard(
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
             )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = device.mikrotikDdns.ifBlank { "No DDNS configured" },
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
-            )
+            Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text = device.esp32LocalIp,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
             )
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(4.dp))
             OnlineStatusBadge(device = device)
             Spacer(modifier = Modifier.height(16.dp))
-            Row(
+            Button(
+                onClick = onLoginToAdmin,
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                OutlinedButton(
-                    onClick = onOpenDashboard,
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Text("Open Dashboard")
-                }
-                if (showOverviewAction && onOverview != null) {
-                    TextButton(onClick = onOverview) {
-                        Text("Overview")
-                    }
-                }
+                Text("Login to Admin")
             }
             Row(
                 modifier = Modifier.fillMaxWidth(),

@@ -91,14 +91,22 @@ If Arduino IDE asks to move the sketch, allow it to create/use `ESP32_S3_Firmwar
 
 The ESP32-S3 serves the built React PWA directly from **SPIFFS**. `/api/*` remains same-origin with the embedded REST API on the ESP32 STA address or fallback AP address.
 
-Final Arduino IDE 2.x production workflow:
+Final production workflow (from repo root):
 
 ```text
-npm run build:esp32
-upload sketch
-upload SPIFFS image (PlatformIO: uploadfs)
+npm run deploy:esp32
+```
+
+Or step by step:
+
+```text
+npm run build:esp32    # stages admin (dist/) + portal (portal/) → data/
+pio run -t upload
+pio run -t uploadfs
 open http://192.168.30.252/admin
 ```
+
+Do not edit `ESP32_S3_Firmware/data/` manually. Portal sources live in `portal/`. See `docs/ESP32_STAGING.md`.
 
 Expected filesystem contents (Vite must emit bundles under `assets/`):
 

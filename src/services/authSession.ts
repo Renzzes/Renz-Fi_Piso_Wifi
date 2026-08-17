@@ -8,6 +8,7 @@ export function setUnauthorizedHandler(handler: (() => void) | null) {
 export function handleUnauthorizedResponse(path: string) {
   if (handlingUnauthorized) return;
   if (path.includes("/auth/login")) return;
+  if (path.includes("/api/system/factory-reset")) return;
 
   if (!unauthorizedHandler) return;
 

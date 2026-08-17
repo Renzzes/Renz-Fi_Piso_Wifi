@@ -1,0 +1,35 @@
+---
+description: Setup wizard is frozen — no new steps unless solving a real customer problem
+globs: ESP32_S3_Firmware/src/web/SetupWizardPageHtml.h,ESP32_S3_Firmware/src/web/SetupServer.cpp,ESP32_S3_Firmware/src/SetupProvisioningManager.*
+alwaysApply: true
+---
+
+# Setup Wizard Freeze (v0.5.0+)
+
+The Renz-Fi setup wizard is **frozen**. Do not add steps, panels, or backend wizard phases unless they solve a **real, reported customer problem**.
+
+## Allowed flow (do not change order or count)
+
+1. Owner Information
+2. Router Connection
+3. Router Scan
+4. Wi-Fi Configuration
+5. Administrator & Operator
+6. Installation Summary
+
+## Allowed changes without a customer problem
+
+- Wording, layout, and copy on existing steps
+- Bug fixes that preserve the same flow
+- Installation Summary content (support info, firmware version display)
+
+## Not allowed without explicit product approval
+
+- New wizard steps or panels
+- Extra RouterOS scans, validations, or background jobs in setup
+- Splitting or merging steps beyond the list above
+- Engineering diagnostics exposed to installers
+
+## Before proposing a wizard change
+
+Ask: *Does this solve a problem an installer or customer actually reported?* If no, do not change the wizard structure.

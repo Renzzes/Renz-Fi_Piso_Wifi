@@ -69,6 +69,19 @@ class EventBusService {
     }
   }
 
+  /** Raw SSE payload — matches ESP32 EventBus.emit(event, json) shape. */
+  publishRaw(eventName: string, payload: unknown) {
+    const data = JSON.stringify(payload);
+    for (const [id, client] of this.clients) {
+      try {
+        client.res.write(`event: ${eventName}\n`);
+        client.res.write(`data: ${data}\n\n`);
+      } catch {
+        this.clients.delete(id);
+      }
+    }
+  }
+
   getConnectionCount() {
     return this.clients.size;
   }

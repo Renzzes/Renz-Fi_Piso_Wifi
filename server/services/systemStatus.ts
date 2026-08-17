@@ -74,9 +74,23 @@ export function getSystemStatus(): SystemStatus {
     mikrotik: { ok: routerConfigured, host, latencyMs: 0 },
     internet: { ok: false, latencyMs: 0, known: false },
     coinSlot: {
+      enabled: getSetting("coin_settings", "enabled", "1") === "1",
+      hardwareState: getSetting("coin_settings", "hardware_state", "WAITING_FOR_ACTIVITY"),
+      lastPulseTimestamp: null,
+      lastCoinTimestamp: null,
+      totalPulseCount: Number(getSetting("coin_settings", "total_pulses", "0") || 0),
+      totalCoinCount: Number(getSetting("coin_settings", "total_coins", "0") || 0),
       ok: getSetting("coin_settings", "enabled", "1") === "1",
       state: getSetting("coin_settings", "state", ""),
       pulsesToday: Number(getSetting("coin_settings", "total_today", "0") || 0),
+    },
+    storageStatus: {
+      storageMode: "SD",
+      sdPresent: true,
+      sdMounted: true,
+      capacity: 512,
+      used: 0,
+      fallbackActive: false,
     },
     hotspot: { ok: routerConfigured && ssid.trim().length > 0, ssid },
     esp32: {

@@ -1,15 +1,20 @@
 import { api } from "./api";
 import { apiUrl, embeddedApi } from "./embeddedApi";
+import type { OperatorPermission } from "@/lib/operatorPermissions";
 
 const REMEMBER_IP_KEY = "renz_admin_ip";
+
+export type AuthRole = "owner" | "operator" | "none";
 
 export const authApi = {
   login: (password: string) =>
     api.post<{
       authenticated: boolean;
-      username: string;
       rememberIp: boolean;
       mustChangePassword?: boolean;
+      firstBootCompleted?: boolean;
+      role?: AuthRole;
+      permissions?: OperatorPermission[];
     }>(`${embeddedApi.auth}/login`, {
       password,
     }),
@@ -17,16 +22,34 @@ export const authApi = {
   logout: () => api.post<{ success: boolean; message: string }>(`${embeddedApi.auth}/logout`),
 
   changePassword: (payload: { oldPassword: string; newPassword: string }) =>
-    api.post<{ ok: boolean }>(`${embeddedApi.auth}/change-password`, payload),
+    api.post<{ ok: boolean; mustChangePassword?: boolean; firstBootCompleted?: boolean }>(
+      `${embeddedApi.auth}/change-password`,
+      payload,
+    ),
 
   health: () =>
     fetch(apiUrl(embeddedApi.health), { credentials: "include" }).then(async (res) => {
       if (!res.ok) throw new Error(`Health check failed: ${res.status}`);
       const json = (await res.json()) as {
         success?: boolean;
-        data?: { ok: boolean; session?: { authenticated?: boolean } };
+        data?: {
+          ok: boolean;
+          session?: {
+            authenticated?: boolean;
+            mustChangePassword?: boolean;
+            firstBootCompleted?: boolean;
+            role?: AuthRole;
+            permissions?: OperatorPermission[];
+          };
+        };
         ok?: boolean;
-        session?: { authenticated?: boolean };
+        session?: {
+          authenticated?: boolean;
+          mustChangePassword?: boolean;
+          firstBootCompleted?: boolean;
+          role?: AuthRole;
+          permissions?: OperatorPermission[];
+        };
       };
       return json.data ?? { ok: Boolean(json.ok), session: json.session };
     }),

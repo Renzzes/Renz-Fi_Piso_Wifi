@@ -1,7 +1,10 @@
 #include "ApiServer.h"
 
+#include "AuthRole.h"
+
 #include <Update.h>
 #include <MD5Builder.h>
+#include <esp_heap_caps.h>
 #include <esp_ota_ops.h>
 #include <vector>
 
@@ -9,39 +12,28 @@
 #include <SPIFFS.h>
 
 #include "Config.h"
+#include "AssetManager.h"
+#include "DeviceIdentity.h"
+#include "DmaMemoryMonitor.h"
+#include "JsonHeap.h"
+#include "ManagementApConfig.h"
+#include "ManagementApManager.h"
+#include "NetworkDiagnostics.h"
+#include "NetworkStatusModel.h"
 #include "PortalConfigManager.h"
-#include "RenzFiPortalRoutes.h"
+#include "ProductionHandoff.h"
+#include "RouterApiTransportGate.h"
 #include "SalesTime.h"
-#include "SpiffsHost.h"
-#include "W5500Config.h"
+#include "SetupProvisioningManager.h"
+#include "StoragePaths.h"
+#include "web/HttpPlaneGate.h"
+#include "web/WebRequestDiagnostics.h"
+#include "web/WebResponse.h"
+#include "web/WebServerManager.h"
 
 // ── File-scope helpers ────────────────────────────────────────────────────────
 
 namespace {
-
-// Inline fallback page served when SPIFFS is not mounted or /index.html missing.
-const char SPIFFS_FALLBACK_PAGE[] PROGMEM = R"rawliteral(<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Renz-Fi Admin Dashboard</title>
-  <style>
-    body{font-family:Arial,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;display:grid;min-height:100vh;place-items:center}
-    main{max-width:640px;padding:32px}
-    a{color:#38bdf8}
-    code{background:#1e293b;padding:2px 6px;border-radius:4px}
-  </style>
-</head>
-<body>
-  <main>
-    <h1>Renz-Fi Admin Dashboard</h1>
-    <p>The ESP32-S3 hotspot and backend are running in degraded mode, but the SPIFFS frontend image is not available.</p>
-    <p>Build the React app, copy <code>dist/*</code> into <code>ESP32_S3_Firmware/data/</code>, upload the SPIFFS image, then reopen the admin dashboard at <code>/admin</code> on the ESP32 STA address or fallback setup AP.</p>
-    <p>Backend health: <a href="/api/health">/api/health</a></p>
-  </main>
-</body>
-</html>)rawliteral";
 
 String urlDecode(String value) {
   value.replace("%20", " ");
@@ -50,17 +42,6 @@ String urlDecode(String value) {
   value.replace("%3A", ":");
   value.replace("%3a", ":");
   return value;
-}
-
-const char *methodStr(WebRequestMethodComposite method) {
-  switch (method) {
-    case HTTP_GET:     return "GET";
-    case HTTP_POST:    return "POST";
-    case HTTP_PUT:     return "PUT";
-    case HTTP_DELETE:  return "DELETE";
-    case HTTP_OPTIONS: return "OPTIONS";
-    default:           return "HTTP";
-  }
 }
 
 // Body accumulation handler.  Pass as the ArBodyHandlerFunction (5th arg) to
@@ -124,16 +105,37 @@ void mergedActiveUserStats(SessionManager       *sessions,
 
 // Safe JSON when ENABLE_COIN_MANAGER=false (_coin == nullptr in ApiServer).
 void fillCoinDisabledStatus(JsonObject coinSlot) {
-  coinSlot["ok"]          = false;
-  coinSlot["state"]       = "disabled";
-  coinSlot["pulsesToday"] = 0;
+  coinSlot["enabled"]           = false;
+  coinSlot["state"]             = "DISABLED";
+  coinSlot["hardwareState"]     = "DISABLED";
+  coinSlot["lastPulseTimestamp"] = nullptr;
+  coinSlot["lastCoinTimestamp"]  = nullptr;
+  coinSlot["totalPulseCount"]   = 0;
+  coinSlot["totalCoinCount"]    = 0;
+  coinSlot["uptimePulseCount"]  = 0;
+  coinSlot["uptimeCoinCount"]   = 0;
+  coinSlot["ok"]                = false;
+  coinSlot["stateLabel"]        = "disabled";
+  coinSlot["pulsesToday"]       = 0;
+}
+
+void fillCoinDisabledCoinStatus(JsonObject out) {
+  out["enabled"] = false;
+  out["state"] = "DISABLED";
+  out["totalPulseCount"] = 0;
+  out["totalCoinCount"] = 0;
+  out["uptimePulseCount"] = 0;
+  out["uptimeCoinCount"] = 0;
+  out["lastPulseTimestamp"] = nullptr;
+  out["lastCoinTimestamp"] = nullptr;
 }
 
 void fillCoinDisabledSettings(JsonDocument &doc) {
+  doc["pulsesPerPeso"]         = "1";
+  doc["pesoPerPulse"]          = "1";
   doc["pulse_width_ms"]        = String(RenzFiConfig::COIN_DEBOUNCE_MS);
   doc["calibration"]           = "1";
   doc["timeout_seconds"]       = String(RenzFiConfig::COIN_INSERT_TIMEOUT_SEC);
-  doc["pesoPerPulse"]          = "1";
   doc["defaultMinutesPerPeso"] = "5";
   doc["debounceMs"]            = String(RenzFiConfig::COIN_DEBOUNCE_MS);
   doc["settleMs"]              = String(RenzFiConfig::COIN_SETTLE_MS);
@@ -156,22 +158,20 @@ void fillCoinDisabledDiagnostics(JsonDocument &doc) {
   doc["logs"].to<JsonArray>();
 }
 
-IPAddress requestRemoteIp(AsyncWebServerRequest *req) {
-  if (!req) return IPAddress();
-  AsyncClient *client = req->client();
-  return client ? client->remoteIP() : IPAddress();
-}
-
 struct PortalAssetUpload {
   enum class Kind { None, Banner, Music } kind = Kind::None;
   enum class Source { None, Multipart, RawBody, Upload } source = Source::None;
   String filename;
-  std::vector<uint8_t> buffer;
+  AsyncWebServerRequest *owner = nullptr;
+  bool active = false;
+  bool authenticated = false;
+  bool authFailed = false;
   bool rejected = false;
   String rejectReason;
   bool streamActive = false;
   bool streamFinished = false;
   bool bodySeen = false;
+  uint32_t startedAt = 0;
   size_t expectedTotal = 0;
   size_t bytesReceived = 0;
 };
@@ -189,10 +189,14 @@ struct FirmwareOtaUpload {
 
 struct RestoreUpload {
   File file;
+  AsyncWebServerRequest *owner = nullptr;
   bool active = false;
+  bool authenticated = false;
+  bool authFailed = false;
   bool rejected = false;
   String rejectReason;
   size_t received = 0;
+  uint32_t startedAt = 0;
 };
 
 PortalAssetUpload gPortalUpload;
@@ -208,57 +212,84 @@ bool isBinFirmware(const String &filename) {
 
 // ── ApiServer::begin ──────────────────────────────────────────────────────────
 
-void ApiServer::begin(AsyncWebServer      *server,
-                      StorageManager       *storage,
+void ApiServer::begin(StorageManager       *storage,
                       AuthManager          *auth,
                       SessionManager       *sessions,
                       PromoManager         *promos,
                       VoucherManager       *vouchers,
                       CoinManager          *coin,
-                      MikroTikManager      *mikrotik,
+                      RouterPlatform       *router,
                       Logger               *logger,
                       EventBus             *events,
                       EthernetManager      *eth,
                       PortalSessionManager *portalSessions,
-                      PortalConfigManager  *portalConfig) {
-  _server         = server;
+                      PortalConfigManager  *portalConfig,
+                      AssetManager         *assets,
+                      RgbController        *rgb,
+                      SystemHealthService  *health,
+                      BuildMetadata        *build,
+                      InstallationStateManager *installation,
+                      ManagementApManager  *mgmtAp,
+                      ManagementApLifecycle *mgmtApLifecycle,
+                      NetworkSettingsManager *networkSettings,
+                      RouterProvisioningWorker *routerWorker,
+                      FactoryResetWorker *factoryReset) {
+  _server         = nullptr;
   _storage        = storage;
   _auth           = auth;
   _sessions       = sessions;
   _promos         = promos;
   _vouchers       = vouchers;
   _coin           = coin;
-  _mikrotik       = mikrotik;
+  _router         = router;
   _logger         = logger;
   _events         = events;
   _eth            = eth;
   _portalSessions = portalSessions;
   _portalConfig   = portalConfig;
-  _backup.begin(_storage, _logger, _auth, _portalConfig);
-
-  registerRoutes();
+  _assets         = assets;
+  _rgb            = rgb;
+  _health         = health;
+  _build          = build;
+  _installation   = installation;
+  _mgmtAp         = mgmtAp;
+  _mgmtApLifecycle = mgmtApLifecycle;
+  _networkSettings = networkSettings;
+  _routerWorker    = routerWorker;
+  _factoryReset    = factoryReset;
+  _backup.begin(_storage, _logger, _auth, _portalConfig, _assets, _installation);
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────
 
-bool ApiServer::requireAuth(AsyncWebServerRequest *req) {
+bool ApiServer::requireAuth(AsyncWebServerRequest *req,
+                            AuthRequirement requirement) {
   String cookie = req->hasHeader("Cookie")
                     ? req->getHeader("Cookie")->value()
                     : String("");
-  if (_auth && _auth->isAuthenticated(cookie)) return true;
-  sendError(req, 401, "Authentication required", "UNAUTHENTICATED");
-  return false;
+  if (!_auth || !_auth->isAuthenticated(cookie)) {
+    sendError(req, 401, "Authentication required", "UNAUTHENTICATED");
+    return false;
+  }
+  if (requirement == AuthRequirement::OwnerOnly &&
+      !_auth->isAuthenticatedWithRole(cookie, AuthRole::Owner)) {
+    sendError(req, 403, "Owner privileges required", "OWNER_REQUIRED");
+    return false;
+  }
+  if (requirement == AuthRequirement::FullAccess &&
+      _auth->mustChangePassword()) {
+    sendError(req, 403, "Password change required", "PASSWORD_CHANGE_REQUIRED");
+    return false;
+  }
+  return true;
+}
+
+bool ApiServer::requireOwnerAuth(AsyncWebServerRequest *req) {
+  return requireAuth(req, AuthRequirement::OwnerOnly);
 }
 
 void ApiServer::addCorsHeaders(AsyncWebServerResponse *res) {
-  res->addHeader("Access-Control-Allow-Origin", "*");
-  res->addHeader("Access-Control-Allow-Methods",
-                 "GET, POST, PUT, DELETE, OPTIONS");
-  res->addHeader("Access-Control-Allow-Headers",
-                 "Content-Type, Authorization");
-  res->addHeader("X-Content-Type-Options", "nosniff");
-  res->addHeader("X-Frame-Options", "SAMEORIGIN");
-  res->addHeader("Referrer-Policy", "same-origin");
+  WebResponse::addCorsHeaders(res);
 }
 
 void ApiServer::sendOk(AsyncWebServerRequest *req, JsonDocument &data,
@@ -309,114 +340,121 @@ void ApiServer::sendError(AsyncWebServerRequest *req, int status,
   req->send(res);
 }
 
+void ApiServer::sendWorkerResult(AsyncWebServerRequest *req,
+                                 const RouterProvisioningWorker::Result &result) {
+  logRequest(req, result.ok ? "api-ok" : "api-error");
+  AsyncWebServerResponse *res =
+      req->beginResponse(result.httpStatus, "application/json", result.body);
+  addCorsHeaders(res);
+  res->addHeader("Cache-Control", "no-store");
+  req->send(res);
+}
+
+void ApiServer::sendAdminJobAccepted(AsyncWebServerRequest *req, uint32_t jobId,
+                                     const char *typeLabel) {
+  DynamicJsonDocument doc(192);
+  doc["success"] = true;
+  JsonObject data = doc.createNestedObject("data");
+  data["jobId"] = jobId;
+  data["state"] = "queued";
+  if (typeLabel && typeLabel[0]) data["type"] = typeLabel;
+  String body;
+  serializeJson(doc, body);
+  logRequest(req, "admin-router-job-accepted");
+  Serial.printf("[admin-router-api] accepted job=%u type=%s\n",
+                static_cast<unsigned>(jobId), typeLabel ? typeLabel : "?");
+  AsyncWebServerResponse *res = req->beginResponse(202, "application/json", body);
+  addCorsHeaders(res);
+  res->addHeader("Cache-Control", "no-store");
+  req->send(res);
+}
+
 String ApiServer::getBody(AsyncWebServerRequest *req) {
   if (req->_tempObject) return String(static_cast<char *>(req->_tempObject));
   return "";
 }
 
 void ApiServer::logRequest(AsyncWebServerRequest *req, const char *handler) {
-  IPAddress remoteIp = requestRemoteIp(req);
-  Serial.printf("[tcp] %s %s from=%s via=ETH local=%s host=%s handler=%s\n",
-                methodStr(req->method()),
-                req->url().c_str(),
-                remoteIp.toString().c_str(),
-                W5500Config::IP.toString().c_str(),
-                req->host().c_str(),
-                handler);
+  WebRequestDiagnostics::logRequest(req, handler);
 }
 
-// ── Static / SPA helpers ──────────────────────────────────────────────────────
 
-void ApiServer::sendStaticOrIndex(AsyncWebServerRequest *req) {
-  String path = req->url();
-  const int query = path.indexOf('?');
-  if (query >= 0) path = path.substring(0, query);
-  logRequest(req, "static");
+void ApiServer::appendAssetInfoJson(JsonObject obj,
+                                    const AssetInfo &info) const {
+  obj["type"] = assetTypeLabel(info.type);
+  obj["filename"] = info.filename;
+  obj["mimeType"] = info.mimeType;
+  obj["size"] = info.size;
+  obj["lastModified"] = info.lastModified;
+  obj["checksum"] = info.checksum;
+  obj["storageLocation"] = assetStorageLocationLabel(info.storageLocation);
+  obj["path"] = info.path;
+  if (info.slot > 0) obj["slot"] = info.slot;
+}
 
-  bool         gzip      = false;
-  const String spiffsPath = resolveSpiffsServePath(path, &gzip);
-
-  if (spiffsPath.isEmpty()) {
-    if (path.startsWith("/assets/") || path.startsWith("/portal/") ||
-        path == "/manifest.webmanifest" || path == "/sw.js" ||
-        path == "/favicon.svg"          || path == "/favicon.ico") {
-      Serial.printf("[http] 404 path=%s reason=missing-static-asset\n",
-                    path.c_str());
-      AsyncWebServerResponse *res =
-          req->beginResponse(404, "text/plain", "Not Found");
-      addCorsHeaders(res);
-      res->addHeader("Cache-Control", "no-store");
-      req->send(res);
-      return;
-    }
-    Serial.printf("[http] 200 path=%s reason=spa-fallback-page\n", path.c_str());
-    AsyncWebServerResponse *res = req->beginResponse(
-        200, "text/html; charset=utf-8", String(FPSTR(SPIFFS_FALLBACK_PAGE)));
-    addCorsHeaders(res);
-    res->addHeader("Cache-Control", "no-store");
-    req->send(res);
-    return;
+void ApiServer::appendUploadResultJson(
+    JsonObject root, const AssetOperationResult &result) const {
+  root["revision"] = result.revisionUpdated;
+  root["storedPath"] = result.storedPath;
+  root["bytesWritten"] = result.bytesWritten;
+  if (result.warning.length() > 0) root["warning"] = result.warning;
+  if (result.success && result.asset.present()) {
+    JsonObject asset = root["asset"].to<JsonObject>();
+    appendAssetInfoJson(asset, result.asset);
   }
-
-  String typePath = path;
-  if (spiffsPath.endsWith("index.html") ||
-      spiffsPath.endsWith("index.html.gz")) {
-    typePath = "/index.html";
-  } else if (spiffsPath.endsWith(".gz")) {
-    typePath = spiffsPath.substring(0, spiffsPath.length() - 3);
-  }
-
-  if (!SPIFFS.exists(spiffsPath)) {
-    Serial.printf("[http] 404 path=%s spiffs=%s reason=open-failed\n",
-                  path.c_str(), spiffsPath.c_str());
-    AsyncWebServerResponse *res = req->beginResponse(
-        200, "text/html; charset=utf-8", String(FPSTR(SPIFFS_FALLBACK_PAGE)));
-    addCorsHeaders(res);
-    res->addHeader("Cache-Control", "no-store");
-    req->send(res);
-    return;
-  }
-
-  const String cacheControl = path.startsWith("/assets/")
-                                  ? "public, max-age=31536000, immutable"
-                                  : "no-cache";
-
-  Serial.printf("[http] 200 path=%s spiffs=%s gzip=%s contentType=%s\n",
-                path.c_str(), spiffsPath.c_str(), gzip ? "yes" : "no",
-                _storage->contentType(typePath).c_str());
-
-  AsyncWebServerResponse *res = req->beginResponse(
-      SPIFFS, spiffsPath, _storage->contentType(typePath));
-  if (gzip) res->addHeader("Content-Encoding", "gzip");
-  addCorsHeaders(res);
-  res->addHeader("Cache-Control", cacheControl);
-  req->send(res);
 }
 
 void ApiServer::sendSdFile(AsyncWebServerRequest *req, const char *sdPath,
                            const char *filename) {
+  if (!_storage || !_storage->healthy() || !_storage->sdIoAllowed()) {
+    sendError(req, 503, "SD storage unavailable", "SD_UNAVAILABLE");
+    return;
+  }
   if (!SD.exists(sdPath)) {
     sendError(req, 404, "File not found", "FILE_NOT_FOUND");
     return;
   }
-  AsyncWebServerResponse *res =
-      req->beginResponse(SD, sdPath, "application/json");
-  res->addHeader("Content-Disposition",
-                 String("attachment; filename=\"") + filename + "\"");
-  res->addHeader("Cache-Control", "no-store");
-  addCorsHeaders(res);
-  req->send(res);
+  WebResponse::serveDownload(req, SD, sdPath, filename, "application/json");
 }
+
+
+#define RENZFI_APPLIANCE_GATE(req) \
+  do { \
+    if (!HttpPlaneGate::ensureAppliancePlane((req))) return; \
+  } while (0)
+
+// Privileged Admin / system APIs — production plane AND (Management LAN OR
+// authenticated Admin/Operator session). Hotspot guests are never trusted by
+// subnet alone; AuthManager session is required after login.
+#define RENZFI_PROD_GATE(req) \
+  do { \
+    if (!HttpPlaneGate::ensureAdminAccess((req))) return; \
+  } while (0)
+
+// Customer captive portal APIs — any production-plane client (incl. guest).
+#define RENZFI_PORTAL_GATE(req) \
+  do { \
+    if (!HttpPlaneGate::ensureProductionPlane((req))) return; \
+  } while (0)
 
 // ── Route registration ────────────────────────────────────────────────────────
 
-void ApiServer::registerRoutes() {
-  // ── Static assets (served before API or SPA handlers) ────────────────────
-  _server->serveStatic("/assets/", SPIFFS, "/assets/")
-         .setCacheControl("public, max-age=31536000, immutable");
+
+void ApiServer::registerSetupRoutes(WebServerManager &web,
+                                    SetupProvisioningManager *setupProvisioning,
+                                    RouterProvisioningManager *routerProvisioning) {
+  _server = &web.routeServer();
+  _web = &web;
+  _setupProvisioning = setupProvisioning;
+  _routerProvisioning = routerProvisioning;
+  if (!_server) return;
+
+  Serial.println("[web] ApiServer registering setup-plane routes");
 
   // ── CORS preflight (OPTIONS /api/) ───────────────────────────────────────
+  // Must remain reachable from Hotspot guests (MikroTik-hosted portal origin).
   _server->on("/api/", HTTP_OPTIONS, [this](AsyncWebServerRequest *req) {
+    RENZFI_PORTAL_GATE(req);
     AsyncWebServerResponse *res = req->beginResponse(204, "text/plain", "");
     addCorsHeaders(res);
     req->send(res);
@@ -424,14 +462,140 @@ void ApiServer::registerRoutes() {
 
   // ── Health ───────────────────────────────────────────────────────────────
   _server->on("/api/health", HTTP_GET, [this](AsyncWebServerRequest *req) {
+    RENZFI_APPLIANCE_GATE(req);
     String cookie = req->hasHeader("Cookie")
                       ? req->getHeader("Cookie")->value()
                       : String("");
-    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+
+    // Hotspot guests may bootstrap Admin login (session check + ok) without
+    // receiving infrastructure inventory (ethernet/router/coin/storage).
+    if (HttpPlaneGate::isCustomerPortalClient(req)) {
+      DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+      data["ok"] = true;
+      data["httpPlane"] = HttpPlaneGate::planeLabel(req);
+      data["accessClass"] = HttpPlaneGate::accessClassLabel(req);
+      data["session"]["authenticated"] = _auth->isAuthenticated(cookie);
+      data["session"]["mustChangePassword"] = _auth->mustChangePassword();
+      data["session"]["firstBootCompleted"] = _auth->firstBootCompleted();
+      data["session"]["role"] =
+          _auth->isAuthenticated(cookie)
+              ? authRoleLabel(_auth->sessionRole(cookie))
+              : "none";
+      if (_auth->isAuthenticated(cookie) &&
+          _auth->sessionRole(cookie) == AuthRole::Operator) {
+        JsonArray perms = data["session"]["permissions"].to<JsonArray>();
+        _auth->fillOperatorPermissions(perms);
+      }
+      sendOk(req, data);
+      return;
+    }
+
+    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
     data["ok"]                            = true;
-    data["storage"]["ok"]                 = _storage->healthy();
+    data["httpPlane"]                     = HttpPlaneGate::planeLabel(req);
+    data["storage"]["ok"]                 = _storage->healthy() || _storage->usingFallback();
+    _storage->fillStorageStatus(data["storage"].to<JsonObject>());
+    data["storage"]["spiffsReady"]        = _storage->isSpiffsMounted();
+
+    if (_installation) {
+      DynamicJsonDocument installDoc(RenzFiConfig::JSON_DOC_SMALL);
+      _installation->fillStatus(installDoc);
+      data["installation"].set(installDoc.as<JsonObjectConst>());
+      data["installationState"] = data["installation"]["state"];
+    } else {
+      data["installationState"] = nullptr;
+    }
+
+    ProductionHandoff::Context handoffCtx;
+    handoffCtx.auth               = _auth;
+    handoffCtx.setupProvisioning  = _setupProvisioning;
+    handoffCtx.installation       = _installation;
+    handoffCtx.router             = _router;
+    handoffCtx.routerProvisioning = _routerProvisioning;
+    handoffCtx.eth                = _eth;
+    handoffCtx.storage            = _storage;
+    handoffCtx.web                = _web;
+    const ProductionHandoff::Status handoff =
+        ProductionHandoff::evaluate(handoffCtx);
+    ProductionHandoff::fillHealthFields(data.as<JsonObject>(), handoff);
+
+    // Non-secret Ethernet status — no router credentials here. Safe to
+    // expose on this public/unauthenticated endpoint so the setup wizard
+    // and mobile app can read link/address state before any session exists.
+    JsonObject ethObj = data["ethernet"].to<JsonObject>();
+    ethObj["driverReady"] = _eth && _eth->driverReady();
+    ethObj["link"]        = _eth && _eth->linkUp();
+    ethObj["hasIp"]       = _eth && _eth->hasIp();
+    ethObj["mode"]        = _eth ? _eth->addressModeLabel() : "dhcp";
+    ethObj["ip"]          = _eth ? _eth->ip() : "";
+    ethObj["gateway"]     = _eth ? _eth->gateway() : "";
+    ethObj["mac"]         = _eth ? _eth->macAddress() : "";
+
+    JsonObject routerObj = data["router"].to<JsonObject>();
+    if (_router) {
+      _router->fillHealthStatus(routerObj);
+    } else {
+      routerObj["configured"] = false;
+      routerObj["driverId"] = nullptr;
+      routerObj["status"] = "unavailable";
+    }
+
+    if (_portalConfig) {
+      JsonObject portalObj = data["portal"].to<JsonObject>();
+      portalObj["revision"]   = _portalConfig->revision();
+      portalObj["hasBanner"]  = _portalConfig->hasCustomBanner();
+      portalObj["hasMusic"]   = _portalConfig->hasCustomMusic();
+      portalObj["assetsReady"] = _assets && _assets->ready();
+    }
+
+    JsonObject coinObj = data["coin"].to<JsonObject>();
+    if (_coin) {
+      coinObj["enabled"] = true;
+      _coin->fillCoinStatus(coinObj);
+    } else {
+      coinObj["enabled"] = false;
+    }
+
+    data["uptimeSeconds"] = millis() / 1000U;
+    data["serverTimeMs"]  = millis();
+
     data["session"]["authenticated"]      = _auth->isAuthenticated(cookie);
     data["session"]["mustChangePassword"] = _auth->mustChangePassword();
+    data["session"]["firstBootCompleted"] = _auth->firstBootCompleted();
+    // Exposes the caller's role ("owner" / "operator") so the admin
+    // dashboard can hide Administrator-only menus/routes for Operator
+    // sessions (Rule #6/#7). Absent/"none" when not authenticated.
+    data["session"]["role"] =
+        _auth->isAuthenticated(cookie)
+            ? authRoleLabel(_auth->sessionRole(cookie))
+            : "none";
+    if (_auth->isAuthenticated(cookie) &&
+        _auth->sessionRole(cookie) == AuthRole::Operator) {
+      JsonArray perms = data["session"]["permissions"].to<JsonArray>();
+      _auth->fillOperatorPermissions(perms);
+    }
+    DeviceIdentity::fillRuntimeProfile(data["device"].to<JsonObject>());
+    data["deviceId"]   = data["device"]["deviceId"];
+    data["deviceName"] = data["device"]["friendlyName"];
+    data["version"]    = RenzFiConfig::FIRMWARE_VERSION;
+    if (_build) {
+      _build->fillJson(data["build"].to<JsonObject>());
+    }
+
+    JsonObject mgmtApObj = data["managementAp"].to<JsonObject>();
+    if (_mgmtAp) {
+      _mgmtAp->fillStatus(mgmtApObj);
+      if (_mgmtApLifecycle) {
+        _mgmtApLifecycle->patchStatus(mgmtApObj);
+      }
+    } else {
+      mgmtApObj["enabled"]          = false;
+      mgmtApObj["running"]          = false;
+      mgmtApObj["mode"]             = "disabled";
+      mgmtApObj["ssid"]             = nullptr;
+      mgmtApObj["ip"]               = nullptr;
+    }
+
     sendOk(req, data);
   });
 
@@ -439,16 +603,18 @@ void ApiServer::registerRoutes() {
   _server->on(
       "/api/auth/login", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
+    RENZFI_APPLIANCE_GATE(req);
         DynamicJsonDocument body(RenzFiConfig::JSON_DOC_SMALL);
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
 
         DynamicJsonDocument response(RenzFiConfig::JSON_DOC_SMALL);
+        String              username   = body["username"]   | "";
         String              password   = body["password"]   | "";
         bool                rememberIp = body["rememberIp"] | false;
         String              setCookieVal;
 
-        if (!_auth->login(password, rememberIp, response, setCookieVal)) {
+        if (!_auth->login(username, password, rememberIp, response, setCookieVal)) {
           sendError(req, 401, "Invalid password", "INVALID_CREDENTIALS");
           return;
         }
@@ -470,6 +636,7 @@ void ApiServer::registerRoutes() {
   _server->on(
       "/api/auth/logout", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
+    RENZFI_APPLIANCE_GATE(req);
         String cookie = req->hasHeader("Cookie")
                           ? req->getHeader("Cookie")->value()
                           : String("");
@@ -489,22 +656,339 @@ void ApiServer::registerRoutes() {
   _server->on(
       "/api/auth/change-password", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
-        if (!requireAuth(req)) return;
+    RENZFI_APPLIANCE_GATE(req);
+        if (!requireAuth(req, AuthRequirement::Session)) return;
         DynamicJsonDocument body(256);
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
         if (_auth->changePassword(body["oldPassword"] | "",
-                                  body["newPassword"] | ""))
-          sendOk(req);
-        else
+                                  body["newPassword"] | "")) {
+          DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+          data["ok"] = true;
+          data["mustChangePassword"] = _auth->mustChangePassword();
+          data["firstBootCompleted"] = _auth->firstBootCompleted();
+          sendOk(req, data);
+        } else
           sendError(req, 400, "Unable to change password",
                     "PASSWORD_CHANGE_FAILED");
       },
       nullptr, bodyCollect);
 
+  // Setup Unlock Password — owner-only. Returns decrypted credential from the
+  // RAM-resident protected blob. Never returns the hash. Never logs plaintext.
+  _server->on("/api/settings/setup-unlock", HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_APPLIANCE_GATE(req);
+                if (!requireOwnerAuth(req)) return;
+                DynamicJsonDocument data(768);
+                const bool configured =
+                    _setupProvisioning &&
+                    _setupProvisioning->setupUnlockConfigured();
+                data["configured"] = configured;
+                String recovered;
+                const bool recoverable =
+                    configured &&
+                    _setupProvisioning->recoverSetupUnlockPassword(recovered);
+                data["recoverable"] = recoverable;
+                if (recoverable) {
+                  data["password"] = recovered;
+                }
+                recovered = "";
+                sendOk(req, data);
+              });
+
+  _server->on(
+      "/api/settings/setup-unlock", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+    RENZFI_APPLIANCE_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        if (!_setupProvisioning) {
+          sendError(req, 503, "Setup provisioning unavailable",
+                    "SETUP_PROVISIONING_UNAVAILABLE");
+          return;
+        }
+        DynamicJsonDocument body(384);
+        String raw = getBody(req);
+        if (raw.length() > 0) deserializeJson(body, raw);
+        const String currentPassword = body["currentPassword"] | "";
+        const String newPassword     = body["newPassword"] | "";
+        const String confirmPassword = body["confirmPassword"] | "";
+        if (newPassword != confirmPassword) {
+          sendError(req, 400, "New password confirmation does not match",
+                    "SETUP_UNLOCK_PASSWORD_MISMATCH");
+          return;
+        }
+        String errorCode;
+        if (!_setupProvisioning->changeSetupUnlockPassword(
+                currentPassword, newPassword, errorCode)) {
+          const int status =
+              (errorCode == "SETUP_UNLOCK_INVALID") ? 403 : 400;
+          const char *message =
+              (errorCode == "SETUP_UNLOCK_INVALID")
+                  ? "Current Setup Unlock Password is incorrect"
+              : (errorCode == "SETUP_UNLOCK_PASSWORD_TOO_SHORT")
+                    ? "New Setup Unlock Password must be at least 8 characters"
+              : (errorCode == "SETUP_UNLOCK_PASSWORD_UNCHANGED")
+                    ? "New password must differ from the current password"
+                    : "Unable to change Setup Unlock Password";
+          sendError(req, status, message,
+                    errorCode.isEmpty() ? "SETUP_UNLOCK_CHANGE_FAILED"
+                                        : errorCode.c_str());
+          return;
+        }
+        DynamicJsonDocument data(128);
+        data["ok"]         = true;
+        data["configured"] = true;
+        sendOk(req, data);
+      },
+      nullptr, bodyCollect);
+
+  // Optional Operator account — same AuthManager NVS store as Setup createOperator.
+  _server->on("/api/settings/operator", HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_APPLIANCE_GATE(req);
+                if (!requireOwnerAuth(req)) return;
+                DynamicJsonDocument data(512);
+                const bool configured =
+                    _auth && _auth->hasOperatorNvsCredentials();
+                data["configured"] = configured;
+                if (configured) {
+                  data["username"] = _auth->operatorUsername();
+                  JsonArray perms = data["permissions"].to<JsonArray>();
+                  _auth->fillOperatorPermissions(perms);
+                }
+                sendOk(req, data);
+              });
+
+  _server->on(
+      "/api/settings/operator", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+    RENZFI_APPLIANCE_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        if (!_auth) {
+          sendError(req, 503, "Authentication service unavailable",
+                    "AUTH_UNAVAILABLE");
+          return;
+        }
+        DynamicJsonDocument body(768);
+        String raw = getBody(req);
+        if (raw.length() > 0) deserializeJson(body, raw);
+
+        // Update permissions on an existing operator (no password required).
+        if (_auth->hasOperatorNvsCredentials() &&
+            body["permissions"].is<JsonArrayConst>() &&
+            !body["username"].is<const char *>() &&
+            !body["password"].is<const char *>()) {
+          String csv;
+          for (JsonVariantConst v : body["permissions"].as<JsonArrayConst>()) {
+            const char *p = v.as<const char *>();
+            if (!p || !p[0]) continue;
+            if (!csv.isEmpty()) csv += ',';
+            csv += p;
+          }
+          String errorCode;
+          if (!_auth->setOperatorPermissions(csv, errorCode)) {
+            sendError(req, 400,
+                      errorCode.isEmpty() ? "Unable to update permissions"
+                                          : errorCode.c_str(),
+                      errorCode.isEmpty() ? "OPERATOR_PERMS_FAILED"
+                                          : errorCode.c_str());
+            return;
+          }
+          DynamicJsonDocument data(256);
+          data["ok"] = true;
+          data["configured"] = true;
+          data["username"] = _auth->operatorUsername();
+          JsonArray perms = data["permissions"].to<JsonArray>();
+          _auth->fillOperatorPermissions(perms);
+          sendOk(req, data);
+          return;
+        }
+
+        if (_auth->hasOperatorNvsCredentials()) {
+          sendError(req, 409, "An operator account already exists",
+                    "OPERATOR_ALREADY_EXISTS");
+          return;
+        }
+        const String username        = body["username"] | "";
+        const String password        = body["password"] | "";
+        const String confirmPassword = body["confirmPassword"] | "";
+        if (username.length() < 3) {
+          sendError(req, 400, "Operator username is required",
+                    "USERNAME_INVALID");
+          return;
+        }
+        if (password.length() < 8) {
+          sendError(req, 400, "Password must be at least 8 characters",
+                    "PASSWORD_TOO_SHORT");
+          return;
+        }
+        if (password != confirmPassword) {
+          sendError(req, 400, "Password and confirmation do not match",
+                    "PASSWORD_MISMATCH");
+          return;
+        }
+        if (username == _auth->ownerUsername()) {
+          sendError(req, 400, "Operator username must differ from the owner",
+                    "USERNAME_CONFLICT");
+          return;
+        }
+        String errorCode;
+        // Do not invalidate the owner's Admin session when creating operator.
+        if (!_auth->provisionOperatorCredentials(username, password, errorCode,
+                                                 false)) {
+          sendError(req, 400,
+                    errorCode.isEmpty() ? "Unable to create operator"
+                                        : errorCode.c_str(),
+                    errorCode.isEmpty() ? "OPERATOR_CREATE_FAILED"
+                                        : errorCode.c_str());
+          return;
+        }
+        if (body["permissions"].is<JsonArrayConst>()) {
+          String csv;
+          for (JsonVariantConst v : body["permissions"].as<JsonArrayConst>()) {
+            const char *p = v.as<const char *>();
+            if (!p || !p[0]) continue;
+            if (!csv.isEmpty()) csv += ',';
+            csv += p;
+          }
+          String permsError;
+          _auth->setOperatorPermissions(csv, permsError);
+        }
+        DynamicJsonDocument data(256);
+        data["ok"]         = true;
+        data["configured"] = true;
+        data["username"]   = username;
+        JsonArray perms = data["permissions"].to<JsonArray>();
+        _auth->fillOperatorPermissions(perms);
+        sendOk(req, data);
+      },
+      nullptr, bodyCollect);
+
+
+  // ── Network status (Management AP + Ethernet) ─────────────────────────────
+  auto networkStatus = [this](AsyncWebServerRequest *req) {
+    RENZFI_APPLIANCE_GATE(req);
+    if (!requireAuth(req)) return;
+    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+    NetworkStatusModel::fill(data.to<JsonObject>(), _eth, _mgmtAp, _mgmtApLifecycle);
+    sendOk(req, data);
+  };
+  _server->on("/api/system/network", HTTP_GET, networkStatus);
+  _server->on("/api/system/wifi",    HTTP_GET, networkStatus);  // backward-compat
+
+  auto mgmtApStart = [this](AsyncWebServerRequest *req) {
+    RENZFI_APPLIANCE_GATE(req);
+    if (!requireAuth(req)) return;
+    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+    const bool ok = _mgmtApLifecycle && _mgmtApLifecycle->startMaintenance();
+    if (!ok) {
+      sendError(req, 400, "Unable to start maintenance access point",
+                "MGMT_AP_START_FAILED");
+      return;
+    }
+    if (_mgmtAp) {
+      _mgmtAp->fillStatus(data["managementAp"].to<JsonObject>());
+      if (_mgmtApLifecycle) {
+        _mgmtApLifecycle->patchStatus(data["managementAp"].to<JsonObject>());
+      }
+    }
+    sendOk(req, data, "Maintenance access point started");
+  };
+  _server->on("/api/system/management-ap/start", HTTP_POST, mgmtApStart);
+
+  auto mgmtApStop = [this](AsyncWebServerRequest *req) {
+    RENZFI_APPLIANCE_GATE(req);
+    if (!requireAuth(req)) return;
+    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+    const bool ok = _mgmtApLifecycle && _mgmtApLifecycle->stopMaintenance();
+    if (!ok) {
+      sendError(req, 400, "Unable to stop maintenance access point",
+                "MGMT_AP_STOP_FAILED");
+      return;
+    }
+    if (_mgmtAp) {
+      _mgmtAp->fillStatus(data["managementAp"].to<JsonObject>());
+      if (_mgmtApLifecycle) {
+        _mgmtApLifecycle->patchStatus(data["managementAp"].to<JsonObject>());
+      }
+    }
+    sendOk(req, data, "Maintenance access point stopped");
+  };
+  _server->on("/api/system/management-ap/stop", HTTP_POST, mgmtApStop);
+
+  _server->on(
+      "/api/system/management-ap/temporary", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+    RENZFI_APPLIANCE_GATE(req);
+        if (!requireAuth(req)) return;
+        DynamicJsonDocument body(RenzFiConfig::JSON_DOC_SMALL);
+        String raw = getBody(req);
+        if (raw.length() > 0) deserializeJson(body, raw);
+        const uint32_t durationSeconds =
+            body["durationSeconds"] | ManagementApConfig::MAINTENANCE_TIMEOUT_SECONDS;
+        DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+        if (!_mgmtApLifecycle ||
+            !_mgmtApLifecycle->startTemporary(durationSeconds)) {
+          sendError(req, 400,
+                    "Unable to start temporary maintenance access point",
+                    "MGMT_AP_TEMPORARY_FAILED");
+          return;
+        }
+        if (_mgmtAp) {
+          _mgmtAp->fillStatus(data["managementAp"].to<JsonObject>());
+          if (_mgmtApLifecycle) {
+            _mgmtApLifecycle->patchStatus(data["managementAp"].to<JsonObject>());
+          }
+        }
+        data["durationSeconds"] = durationSeconds;
+        sendOk(req, data, "Temporary maintenance access point started");
+      },
+      nullptr, bodyCollect);
+
+  _server->on(
+      "/api/system/management-ap/post-setup", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+    RENZFI_APPLIANCE_GATE(req);
+        if (!requireAuth(req)) return;
+        DynamicJsonDocument body(RenzFiConfig::JSON_DOC_SMALL);
+        String raw = getBody(req);
+        if (raw.length() > 0) deserializeJson(body, raw);
+        const bool keepEnabled = body["keepEnabled"] | false;
+        DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+        if (!_mgmtApLifecycle ||
+            !_mgmtApLifecycle->applyPostSetupPreference(keepEnabled)) {
+          sendError(req, 400, "Unable to apply Management AP preference",
+                    "MGMT_AP_POST_SETUP_FAILED");
+          return;
+        }
+        if (_mgmtAp) {
+          _mgmtAp->fillStatus(data["managementAp"].to<JsonObject>());
+          if (_mgmtApLifecycle) {
+            _mgmtApLifecycle->patchStatus(data["managementAp"].to<JsonObject>());
+          }
+        }
+        data["keepEnabledAfterSetup"] = keepEnabled;
+        sendOk(req, data, keepEnabled
+                              ? "Management access point kept enabled"
+                              : "Management access point disabled");
+      },
+      nullptr, bodyCollect);
+
+
+}
+
+void ApiServer::registerProductionRoutes(WebServerManager &web) {
+  _server = &web.routeServer();
+  if (!_server) return;
+
+  Serial.println("[web] ApiServer registering production-plane routes");
+
   // ── Dashboard status ──────────────────────────────────────────────────────
   _server->on("/api/status", HTTP_GET, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
+    const uint32_t t0 = millis();
     DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
     DynamicJsonDocument salesToday(256);
     DynamicJsonDocument salesWeek(256);
@@ -514,7 +998,7 @@ void ApiServer::registerRoutes() {
     _sessions->salesMonth(salesMonth);
     data["server"]["ok"]                 = true;
     data["server"]["uptimeSeconds"]      = millis() / 1000;
-    data["database"]["ok"]               = _storage->healthy();
+    data["database"]["ok"]               = _storage->healthy() || _storage->usingFallback();
     data["database"]["path"]             = _storage->usingFallback()
                                                ? "SPIFFS Fallback"
                                                : "SD";
@@ -524,31 +1008,96 @@ void ApiServer::registerRoutes() {
     data["sales"]["weekly"]["sessions"]  = salesWeek["sessions"]  | 0;
     data["sales"]["monthly"]["amount"]   = salesMonth["amount"]   | 0;
     data["sales"]["monthly"]["sessions"] = salesMonth["sessions"] | 0;
-    salesLogDiagnostics(salesToday["amount"] | 0, salesWeek["amount"] | 0,
-                        salesMonth["amount"] | 0);
     int activeCount = 0;
     int pausedCount = 0;
-    mergedActiveUserStats(_sessions, _portalSessions, activeCount, pausedCount);
+    _sessions->cachedActiveUserStats(activeCount, pausedCount);
     data["activeUsers"]["count"]         = activeCount;
     data["activeUsers"]["paused"]        = pausedCount;
     data["activeUsers"]["idle"]          = 0;
 
-    DynamicJsonDocument routerDoc(RenzFiConfig::JSON_DOC_SMALL);
     String routerHost;
-    String routerSsid;
     bool routerConfigured = false;
-    if (_mikrotik && _mikrotik->load(routerDoc)) {
-      routerHost = routerDoc["host"] | "";
-      routerSsid = routerDoc["ssid"] | "";
-      routerConfigured = routerHost.length() > 0;
+    if (_router) {
+      routerConfigured = _router->cachedRouterConfigured();
+      routerHost = _router->cachedRouterHost();
     }
-    data["mikrotik"]["ok"]               = routerConfigured;
-    data["mikrotik"]["host"]             = routerHost;
-    data["mikrotik"]["latencyMs"]        = 0;
 
+    // Configured ≠ Online. Host/credentials present means configured only.
+    data["mikrotik"]["configured"] = routerConfigured;
+    data["mikrotik"]["ok"]         = routerConfigured;  // legacy: "Configured" UI
+    data["mikrotik"]["host"]       = routerHost;
+    data["mikrotik"]["latencyMs"]  = 0;
+    data["mikrotik"]["connectivity"] = "unknown";
+    data["mikrotik"]["lastSuccessfulContactAt"] = "";
+    data["mikrotik"]["lastContactError"]        = "";
+
+    if (_router && _router->cachePopulated()) {
+      _router->fillHealthStatus(data["mikrotik"].to<JsonObject>());
+      // fillHealthStatus may overwrite ok/status — restore configured semantics.
+      data["mikrotik"]["configured"] = routerConfigured;
+      data["mikrotik"]["ok"]         = routerConfigured;
+      data["mikrotik"]["host"]       = routerHost;
+    }
+
+    // Observational connectivity / hotspot / WAN from last RouterOS Sync/Test.
+    data["hotspot"]["ok"]     = false;
+    data["hotspot"]["status"] = "unknown";
     data["internet"]["ok"]               = false;
     data["internet"]["known"]            = false;
     data["internet"]["latencyMs"]        = 0;
+    data["wan"]["known"]         = false;
+    data["wan"]["interface"]     = "";
+    data["wan"]["link"]          = "unknown";
+    data["wan"]["dhcp"]          = "unknown";
+    data["wan"]["ip"]            = "";
+    data["wan"]["gateway"]       = "";
+    data["wan"]["defaultRoute"]  = "unknown";
+    data["wan"]["internet"]      = "unknown";
+    data["wan"]["dns"]           = "unknown";
+    data["wan"]["note"]          = "";
+    if (_router) {
+      DynamicJsonDocument cacheStatus(1536);
+      JsonObject statusObj = cacheStatus.to<JsonObject>();
+      _router->fillRouterCacheStatus(statusObj);
+      if (statusObj["observation"].is<JsonObjectConst>()) {
+        JsonObjectConst obs = statusObj["observation"].as<JsonObjectConst>();
+        const char *connectivity = obs["connectivity"] | "unknown";
+        data["mikrotik"]["connectivity"] = connectivity;
+        data["mikrotik"]["lastSuccessfulContactAt"] =
+            obs["lastSuccessfulContactAt"] | "";
+        data["mikrotik"]["lastContactError"] = obs["lastContactError"] | "";
+
+        const char *hsStatus = obs["hotspotStatus"] | "unknown";
+        data["hotspot"]["status"]    = hsStatus;
+        data["hotspot"]["ok"]        = (strcmp(hsStatus, "available") == 0);
+        data["hotspot"]["server"]    = obs["hotspotServer"] | "";
+        data["hotspot"]["interface"] = obs["hotspotInterface"] | "";
+
+        if (obs["wan"].is<JsonObjectConst>()) {
+          JsonObjectConst wanObs = obs["wan"].as<JsonObjectConst>();
+          const bool wanKnown = wanObs["known"] | false;
+          data["wan"]["known"]        = wanKnown;
+          data["wan"]["interface"]    = wanObs["interface"] | "";
+          data["wan"]["link"]         = wanObs["link"] | "unknown";
+          data["wan"]["dhcp"]         = wanObs["dhcp"] | "unknown";
+          data["wan"]["ip"]           = wanObs["ip"] | "";
+          data["wan"]["gateway"]      = wanObs["gateway"] | "";
+          data["wan"]["defaultRoute"] = wanObs["defaultRoute"] | "unknown";
+          data["wan"]["internet"]     = wanObs["internet"] | "unknown";
+          data["wan"]["dns"]          = wanObs["dns"] | "unknown";
+          data["wan"]["note"]         = wanObs["note"] | "";
+          if (wanKnown) {
+            const char *inet = wanObs["internet"] | "unknown";
+            const bool inetKnown = (strcmp(inet, "unknown") != 0);
+            data["internet"]["known"] = inetKnown;
+            data["internet"]["ok"]    = (strcmp(inet, "online") == 0);
+            // Explicit Sync/Test probe — not a continuous latency sample.
+            data["internet"]["latencyMs"] =
+                (strcmp(inet, "online") == 0) ? 1 : 0;
+          }
+        }
+      }
+    }
 
     if (_coin) {
       _coin->fillStatus(data["coinSlot"].to<JsonObject>());
@@ -556,49 +1105,307 @@ void ApiServer::registerRoutes() {
       fillCoinDisabledStatus(data["coinSlot"].to<JsonObject>());
     }
 
-    data["hotspot"]["ok"]                = routerConfigured && routerSsid.length() > 0;
-    data["hotspot"]["ssid"]              = routerSsid;
+    if (_router) {
+      _router->fillRouterCacheStatus(data["routerCache"].to<JsonObject>());
+    } else {
+      data["routerCache"]["populated"] = false;
+    }
 
     data["esp32"]["uptime"]              = String(millis() / 1000) + "s";
     data["esp32"]["lastSeen"]            = nullptr;
     {
-      const uint64_t spiffsUsed = _storage->getSpiffsUsedBytes();
-      const uint64_t spiffsTotal = _storage->getSpiffsTotalBytes();
-      data["storage"]["flashUsedMb"] =
-          round((spiffsUsed / 1024.0 / 1024.0) * 10.0) / 10.0;
-      data["storage"]["flashTotalMb"] =
-          round((spiffsTotal / 1024.0 / 1024.0) * 10.0) / 10.0;
+      const uint32_t internalTotal = ESP.getHeapSize();
+      const uint32_t internalFree  = ESP.getFreeHeap();
       data["storage"]["ramUsedKb"] =
-          (ESP.getHeapSize() - ESP.getFreeHeap()) / 1024;
-      data["storage"]["ramTotalKb"] = ESP.getHeapSize() / 1024;
-      size_t logsBytes = _storage->fileSizeBytes(RenzFiConfig::LOGS_FILE);
-      data["storage"]["logsUsedKb"] = (logsBytes + 1023) / 1024;
-      data["storage"]["logsTotalKb"] = RenzFiConfig::LOGS_QUOTA_KB;
-      _storage->fillSdStatus(data["storage"]["sd"].to<JsonObject>());
+          (internalTotal > internalFree ? (internalTotal - internalFree) : 0) /
+          1024;
+      data["storage"]["ramTotalKb"] = internalTotal / 1024;
+      data["storage"]["ramLabel"] = "internal-heap";
+
+      JsonObject internalHeap = data["storage"]["internalHeap"].to<JsonObject>();
+      internalHeap["totalKb"] = internalTotal / 1024;
+      internalHeap["freeKb"]  = internalFree / 1024;
+      internalHeap["usedKb"] =
+          (internalTotal > internalFree ? (internalTotal - internalFree) : 0) /
+          1024;
+      internalHeap["minFreeKb"] = ESP.getMinFreeHeap() / 1024;
+      internalHeap["largestKb"] = ESP.getMaxAllocHeap() / 1024;
+
+      JsonObject psram = data["storage"]["psram"].to<JsonObject>();
+#if defined(BOARD_HAS_PSRAM)
+      const uint32_t psramTotal = ESP.getPsramSize();
+      const uint32_t psramFree  = ESP.getFreePsram();
+      psram["present"] = psramTotal > 0;
+      psram["totalKb"] = psramTotal / 1024;
+      psram["freeKb"]  = psramFree / 1024;
+      psram["usedKb"] =
+          (psramTotal > psramFree ? (psramTotal - psramFree) : 0) / 1024;
+      psram["minFreeKb"] = ESP.getMinFreePsram() / 1024;
+#else
+      psram["present"] = false;
+      psram["totalKb"] = 0;
+      psram["freeKb"]  = 0;
+      psram["usedKb"]  = 0;
+#endif
+
+      JsonObject dma = data["storage"]["dma"].to<JsonObject>();
+      const size_t dmaFree = heap_caps_get_free_size(MALLOC_CAP_DMA);
+      const size_t dmaLargest =
+          heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+      dma["freeKb"]     = dmaFree / 1024;
+      dma["largestKb"]  = dmaLargest / 1024;
+      dma["minimumKb"]  = heap_caps_get_minimum_free_size(MALLOC_CAP_DMA) / 1024;
+
+      _storage->fillDashboardStatus(data["storage"].to<JsonObject>(),
+                                    data["storage"]["sd"].to<JsonObject>(),
+                                    data["storageStatus"].to<JsonObject>());
     }
     data["sync"]["pending"]              = 0;
     data["sync"]["lastSyncAt"]           = nullptr;
     sendOk(req, data);
+    const uint32_t elapsedMs = millis() - t0;
+    if (elapsedMs >= 50U) {
+      static uint32_t s_lastStatusSlowLogMs = 0;
+      const uint32_t now = millis();
+      if (s_lastStatusSlowLogMs == 0 || (now - s_lastStatusSlowLogMs) >= 5000U) {
+        s_lastStatusSlowLogMs = now;
+        Serial.printf(
+            "[http-status] elapsedMs=%u storageIo=0 routerIo=0 snapshotAgeMs=%u\n",
+            static_cast<unsigned>(elapsedMs),
+            static_cast<unsigned>(_storage->dashboardSnapshotAgeMs()));
+      }
+    }
   });
 
   // ── System ────────────────────────────────────────────────────────────────
   _server->on("/api/storage/retry-sd", HTTP_POST,
               [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
                 if (!requireAuth(req)) return;
                 logRequest(req, "storage.retry-sd");
-                if (_storage->retrySd()) {
-                  DynamicJsonDocument data(128);
-                  data["healthy"]  = _storage->healthy();
-                  data["fallback"] = _storage->usingFallback();
-                  sendOk(req, data);
-                } else {
-                  sendError(req, 500, "SD mount failed", "SD_MOUNT_FAILED");
-                }
+                _storage->retrySd();
+                DynamicJsonDocument data(128);
+                data["healthy"]  = _storage->healthy();
+                data["fallback"] = _storage->usingFallback();
+                data["recoveryQueued"] = true;
+                sendOk(req, data);
               });
+
+  _server->on("/api/storage/status", HTTP_GET, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireAuth(req)) return;
+    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
+    _storage->fillStorageStatus(data.to<JsonObject>());
+    Serial.printf(
+        "[storage-api] status snapshot state=%s recoveryInProgress=%s\n",
+        data["sdLifecycle"] | "unknown",
+        (data["recoveryInProgress"] | false) ? "yes" : "no");
+    if (_backup.lastSuccessfulBackup().isEmpty())
+      data["lastSuccessfulBackup"] = nullptr;
+    else
+      data["lastSuccessfulBackup"] = _backup.lastSuccessfulBackup();
+    if (_backup.hasSuccessfulBackup())
+      data["lastSuccessfulBackupAgeSeconds"] =
+          _backup.lastSuccessfulBackupAgeSeconds();
+    else
+      data["lastSuccessfulBackupAgeSeconds"] = nullptr;
+    sendOk(req, data);
+  });
+
+  _server->on("/api/system/health", HTTP_GET, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireAuth(req)) return;
+    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
+    if (_health) {
+      _health->fillHealth(data.to<JsonObject>());
+    }
+    sendOk(req, data);
+  });
+
+  _server->on("/api/system/build", HTTP_GET, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+    data["runningFirmwareVersion"] = RenzFiConfig::FIRMWARE_VERSION;
+    if (_build) {
+      _build->fillJson(data["staged"].to<JsonObject>());
+    }
+    sendOk(req, data);
+  });
+
+  _server->on("/api/system/coin", HTTP_GET, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireAuth(req)) return;
+    DynamicJsonDocument data(512);
+    if (_coin) {
+      _coin->fillCoinStatus(data.to<JsonObject>());
+    } else {
+      fillCoinDisabledCoinStatus(data.to<JsonObject>());
+    }
+    sendOk(req, data);
+  });
+
+  auto rgbSystemGet = [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireAuth(req)) return;
+    DynamicJsonDocument data(512);
+    if (_rgb) {
+      // Return full status (mode, color, signal, brightness, enabled)
+      _rgb->fillStatus(data.to<JsonObject>());
+    } else {
+      data["enabled"]    = false;
+      data["brightness"] = 0;
+      data["mode"]       = "SYSTEM_STATUS";
+      data["state"]      = "OFF";
+      data["colorName"]  = "OFF";
+      data["color"]["red"]   = 0;
+      data["color"]["green"] = 0;
+      data["color"]["blue"]  = 0;
+    }
+    sendOk(req, data);
+  };
+  _server->on("/api/system/rgb", HTTP_GET, rgbSystemGet);
+
+  // PUT /api/system/rgb — full manual control:
+  // { enabled, brightness, mode, red, green, blue }
+  // mode values: "AUTOMATIC" (= SYSTEM_STATUS), "OFF", "SOLID", "BREATHING", "RAINBOW"
+  auto rgbSystemPut = [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireAuth(req)) return;
+    if (!_rgb) {
+      sendError(req, 503, "RGB controller unavailable", "RGB_DISABLED");
+      return;
+    }
+    DynamicJsonDocument body(512);
+    String raw = getBody(req);
+    if (raw.length() > 0 && deserializeJson(body, raw)) {
+      sendError(req, 400, "Invalid JSON body", "BAD_REQUEST");
+      return;
+    }
+    JsonObjectConst root = body.as<JsonObjectConst>();
+    RgbSettings cur = _rgb->settings();
+    bool enabled = cur.enabled;
+    uint8_t brightness = cur.brightness;
+    bool changed = false;
+
+    if (root["enabled"].is<bool>()) {
+      enabled = root["enabled"].as<bool>();
+    } else if (root["enabled"].is<const char *>()) {
+      enabled = String(root["enabled"].as<const char *>()) == "true";
+    }
+    if (root["brightness"].is<int>()) {
+      brightness = static_cast<uint8_t>(root["brightness"].as<int>());
+    }
+
+    // Apply enabled + brightness together
+    changed |= _rgb->applySettings(enabled, brightness);
+
+    // Mode: accept "AUTOMATIC" as alias for SYSTEM_STATUS
+    if (root["mode"].is<const char *>()) {
+      const char *modeStr = root["mode"].as<const char *>();
+      RgbMode mode = RgbMode::SystemStatus;
+      if (strcmp(modeStr, "OFF") == 0)             mode = RgbMode::Off;
+      else if (strcmp(modeStr, "SOLID") == 0)      mode = RgbMode::Solid;
+      else if (strcmp(modeStr, "BREATHING") == 0)  mode = RgbMode::Breathing;
+      else if (strcmp(modeStr, "RAINBOW") == 0)    mode = RgbMode::Rainbow;
+      // "AUTOMATIC" or "SYSTEM_STATUS" → RgbMode::SystemStatus (default)
+      changed |= _rgb->setMode(mode);
+    }
+
+    // Color (used when mode is SOLID/BREATHING/RAINBOW)
+    if (root["red"].is<int>() || root["green"].is<int>() || root["blue"].is<int>()) {
+      uint8_t r = root["red"].is<int>()   ? static_cast<uint8_t>(root["red"].as<int>())   : cur.red;
+      uint8_t g = root["green"].is<int>() ? static_cast<uint8_t>(root["green"].as<int>()) : cur.green;
+      uint8_t b = root["blue"].is<int>()  ? static_cast<uint8_t>(root["blue"].as<int>())  : cur.blue;
+      changed |= _rgb->setColor(r, g, b);
+    }
+
+    if (changed) {
+      DynamicJsonDocument data(512);
+      _rgb->fillStatus(data.to<JsonObject>());
+      sendOk(req, data, "RGB settings saved");
+    } else {
+      sendError(req, 500, "Failed to save RGB settings", "RGB_SAVE_FAILED");
+    }
+  };
+  _server->on("/api/system/rgb", HTTP_PUT, rgbSystemPut, nullptr, bodyCollect);
+
+  _server->on("/api/rgb/status", HTTP_GET, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireAuth(req)) return;
+    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+    if (_rgb) {
+      _rgb->fillStatus(data.to<JsonObject>());
+    }
+    sendOk(req, data);
+  });
+
+  _server->on(
+      "/api/rgb/mode", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+        if (!requireAuth(req)) return;
+        if (!_rgb) {
+          sendError(req, 503, "RGB controller unavailable", "RGB_DISABLED");
+          return;
+        }
+        DynamicJsonDocument body(RenzFiConfig::JSON_DOC_SMALL);
+        String raw = getBody(req);
+        if (raw.length() > 0) deserializeJson(body, raw);
+        const char *modeStr = body["mode"] | "SYSTEM_STATUS";
+        RgbMode mode = RgbMode::SystemStatus;
+        if (strcmp(modeStr, "OFF") == 0) mode = RgbMode::Off;
+        else if (strcmp(modeStr, "SOLID") == 0) mode = RgbMode::Solid;
+        else if (strcmp(modeStr, "BREATHING") == 0) mode = RgbMode::Breathing;
+        else if (strcmp(modeStr, "RAINBOW") == 0) mode = RgbMode::Rainbow;
+        if (_rgb->setMode(mode)) sendOk(req);
+        else sendError(req, 500, "Unable to save RGB mode", "RGB_MODE_FAILED");
+      },
+      nullptr, bodyCollect);
+
+  _server->on(
+      "/api/rgb/color", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+        if (!requireAuth(req)) return;
+        if (!_rgb) {
+          sendError(req, 503, "RGB controller unavailable", "RGB_DISABLED");
+          return;
+        }
+        DynamicJsonDocument body(RenzFiConfig::JSON_DOC_SMALL);
+        String raw = getBody(req);
+        if (raw.length() > 0) deserializeJson(body, raw);
+        const uint8_t red = body["red"] | 0;
+        const uint8_t green = body["green"] | 0;
+        const uint8_t blue = body["blue"] | 255;
+        if (_rgb->setColor(red, green, blue)) sendOk(req);
+        else sendError(req, 500, "Unable to save RGB color", "RGB_COLOR_FAILED");
+      },
+      nullptr, bodyCollect);
+
+  _server->on(
+      "/api/rgb/brightness", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+        if (!requireAuth(req)) return;
+        if (!_rgb) {
+          sendError(req, 503, "RGB controller unavailable", "RGB_DISABLED");
+          return;
+        }
+        DynamicJsonDocument body(RenzFiConfig::JSON_DOC_SMALL);
+        String raw = getBody(req);
+        if (raw.length() > 0) deserializeJson(body, raw);
+        const uint8_t brightness = body["brightness"] | 80;
+        if (_rgb->setBrightness(brightness)) sendOk(req);
+        else
+          sendError(req, 500, "Unable to save RGB brightness",
+                    "RGB_BRIGHTNESS_FAILED");
+      },
+      nullptr, bodyCollect);
 
   _server->on("/api/system/reboot", HTTP_POST,
               [this](AsyncWebServerRequest *req) {
-                if (!requireAuth(req)) return;
+    RENZFI_PROD_GATE(req);
+                if (!requireOwnerAuth(req)) return;
                 sendOk(req, "Rebooting");
                 delay(250);
                 ESP.restart();
@@ -607,23 +1414,104 @@ void ApiServer::registerRoutes() {
   _server->on(
       "/api/system/factory-reset", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
-        if (!requireAuth(req)) return;
-        String error;
-        if (!_backup.performFactoryReset(error)) {
-          sendError(req, 500, error.isEmpty() ? "Factory reset failed"
-                                            : error,
-                    "FACTORY_RESET_FAILED");
+    RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        if (!_factoryReset) {
+          sendError(req, 503, "Factory reset unavailable",
+                    "FACTORY_RESET_UNAVAILABLE");
           return;
         }
-        DynamicJsonDocument data(128);
-        data["rebooting"] = true;
-        sendOk(req, data, "Factory reset complete — rebooting");
-        delay(500);
-        ESP.restart();
+        uint32_t jobId = _factoryReset->enqueue();
+        if (jobId == 0) {
+          sendError(req, 409, "Factory reset already in progress",
+                    "FACTORY_RESET_IN_PROGRESS");
+          return;
+        }
+        DynamicJsonDocument envelope(256);
+        envelope["success"] = true;
+        JsonObject data     = envelope.createNestedObject("data");
+        data["ok"]          = true;
+        data["jobId"]       = jobId;
+        data["status"]      = "queued";
+        data["state"]       = "queued";
+        envelope["message"] = "Factory reset queued";
+        String body;
+        serializeJson(envelope, body);
+        logRequest(req, "factory-reset-accepted");
+        AsyncWebServerResponse *res =
+            req->beginResponse(202, "application/json", body);
+        addCorsHeaders(res);
+        res->addHeader("Cache-Control", "no-store");
+        req->send(res);
+      });
+
+  _server->on("/api/system/factory-reset/status", HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+                if (!requireOwnerAuth(req)) return;
+                if (!_factoryReset) {
+                  sendError(req, 503, "Factory reset unavailable",
+                            "FACTORY_RESET_UNAVAILABLE");
+                  return;
+                }
+                FactoryResetWorker::Snapshot snap;
+                if (req->hasParam("jobId")) {
+                  const uint32_t jobId =
+                      static_cast<uint32_t>(req->getParam("jobId")->value().toInt());
+                  if (!_factoryReset->poll(jobId, snap)) {
+                    sendError(req, 404, "Factory reset job not found",
+                              "FACTORY_RESET_JOB_NOT_FOUND");
+                    return;
+                  }
+                } else {
+                  _factoryReset->fillSnapshot(snap);
+                }
+                DynamicJsonDocument data(256);
+                data["jobId"]     = snap.jobId;
+                data["status"]    = snap.status;
+                data["state"]     = snap.status;
+                data["phase"]     = snap.phase;
+                data["progress"]  = snap.progress;
+                data["rebooting"] = snap.rebooting;
+                if (snap.error && snap.error[0]) data["error"] = snap.error;
+                sendOk(req, data);
+              });
+
+  _server->on(
+      "/api/system/reconfigure", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+        RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        if (!_installation || !_installation->isReady()) {
+          sendError(req, 409, "Device is not in production mode", "NOT_PRODUCTION");
+          return;
+        }
+        if (!_installation->reopenSetupWizard()) {
+          sendError(req, 500, "Unable to reopen setup wizard", "RECONFIGURE_FAILED");
+          return;
+        }
+        if (_storage) {
+          _storage->removeBinary(StoragePaths::NetworkAdoptionWorkflowFile, nullptr);
+          _storage->removeBinary(StoragePaths::ExistingNetworkScanFile, nullptr);
+        }
+        if (_mgmtApLifecycle) {
+          _mgmtApLifecycle->startMaintenance();
+        }
+        DynamicJsonDocument data(192);
+        data["setupWizardEnabled"] = true;
+        // Reconfigure reopens at Wi-Fi review: skip existing-network "complete"
+        // shortcut so the installer lands on review, not the operator step.
+        data["wizardStep"] =
+            _setupProvisioning
+                ? _setupProvisioning->wizardStepForPhase(false, false, true)
+                : "review";
+        data["managementAp"]       = true;
+        sendOk(req, data, "Setup wizard reopened — connect to Management Wi-Fi");
       });
 
   // ── Promos ────────────────────────────────────────────────────────────────
   _server->on("/api/promos", HTTP_GET, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
     DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
     if (_promos->list(data)) sendOk(req, data);
@@ -633,6 +1521,7 @@ void ApiServer::registerRoutes() {
   _server->on(
       "/api/promos", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
         if (!requireAuth(req)) return;
         DynamicJsonDocument body(RenzFiConfig::JSON_DOC_MEDIUM);
         String raw = getBody(req);
@@ -645,8 +1534,12 @@ void ApiServer::registerRoutes() {
       },
       nullptr, bodyCollect);
 
-  // ── Vouchers ──────────────────────────────────────────────────────────────
-  _server->on("/api/vouchers", HTTP_GET, [this](AsyncWebServerRequest *req) {
+  // Exact match required: default BackwardCompatible URI matching would also
+  // capture /api/vouchers/bulk-delete and /api/vouchers/jobs/* (Generate
+  // validation + list responses stealing job polls).
+  _server->on(AsyncURIMatcher::exact("/api/vouchers"), HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
     DynamicJsonDocument data(RenzFiConfig::JSON_DOC_LARGE);
     if (_vouchers->list(data)) sendOk(req, data);
@@ -654,25 +1547,156 @@ void ApiServer::registerRoutes() {
   });
 
   _server->on(
-      "/api/vouchers", HTTP_POST,
+      AsyncURIMatcher::exact("/api/vouchers"), HTTP_POST,
       [this](AsyncWebServerRequest *req) {
-        if (!requireAuth(req)) return;
+        RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        if (!_vouchers) {
+          sendError(req, 503, "Voucher service unavailable", "INTERNAL_ERROR");
+          return;
+        }
         DynamicJsonDocument body(RenzFiConfig::JSON_DOC_MEDIUM);
         String raw = getBody(req);
-        if (raw.length() > 0) deserializeJson(body, raw);
-        DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
-        if (_vouchers->generate(body["count"] | 1, body["amount"] | 1,
-                                body["minutes"] | 5, body["expires"] | "",
-                                data))
-          sendOk(req, data);
-        else
-          sendError(req, 500, "Unable to generate vouchers",
+        if (raw.length() == 0) {
+          sendError(req, 400, "Request body required", "INVALID_REQUEST");
+          return;
+        }
+        if (deserializeJson(body, raw)) {
+          sendError(req, 400, "Invalid JSON body", "INVALID_REQUEST");
+          return;
+        }
+        if (body["count"].isNull() || body["amount"].isNull() ||
+            body["minutes"].isNull()) {
+          sendError(req, 400,
+                    "count, amount, and minutes are required",
+                    "INVALID_REQUEST");
+          return;
+        }
+        const int count = body["count"] | 0;
+        const int amount = body["amount"] | -1;
+        const int minutes = body["minutes"] | 0;
+        if (count < 1 || count > 20 || amount < 0 || minutes <= 0 ||
+            minutes > 525600) {
+          sendError(req, 400,
+                    "count must be 1–20, amount ≥ 0, minutes 1–525600",
+                    "INVALID_REQUEST");
+          return;
+        }
+        bool alreadyRunning = false;
+        const uint32_t jobId =
+            _vouchers->enqueueGenerate(body.as<JsonObjectConst>(), alreadyRunning);
+        if (jobId == 0) {
+          sendError(req, 500, "Unable to enqueue voucher generation",
                     "VOUCHER_CREATE_FAILED");
+          return;
+        }
+        DynamicJsonDocument doc(256);
+        doc["success"] = true;
+        JsonObject data = doc.createNestedObject("data");
+        data["jobId"] = jobId;
+        data["state"] = alreadyRunning ? "running" : "queued";
+        data["type"] = "voucher-generate";
+        if (alreadyRunning) {
+          data["duplicate"] = true;
+          doc["message"] = "Generation already running";
+        }
+        String out;
+        serializeJson(doc, out);
+        AsyncWebServerResponse *res =
+            req->beginResponse(202, "application/json", out);
+        addCorsHeaders(res);
+        res->addHeader("Cache-Control", "no-store");
+        req->send(res);
       },
       nullptr, bodyCollect);
 
+  _server->on(
+      "/api/vouchers/bulk-delete", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+        RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        if (!_vouchers) {
+          sendError(req, 503, "Voucher service unavailable", "INTERNAL_ERROR");
+          return;
+        }
+        DynamicJsonDocument body(RenzFiConfig::JSON_DOC_MEDIUM);
+        String raw = getBody(req);
+        if (raw.length() > 0) deserializeJson(body, raw);
+        JsonArrayConst codes = body["codes"].as<JsonArrayConst>();
+        if (codes.isNull() || codes.size() == 0 || codes.size() > 20) {
+          sendError(req, 400, "codes must be 1–20 voucher codes",
+                    "INVALID_REQUEST");
+          return;
+        }
+        bool alreadyRunning = false;
+        const uint32_t jobId =
+            _vouchers->enqueueBulkDelete(codes, alreadyRunning);
+        if (jobId == 0) {
+          sendError(req, 500, "Unable to enqueue voucher delete",
+                    "VOUCHER_DELETE_FAILED");
+          return;
+        }
+        DynamicJsonDocument doc(256);
+        doc["success"] = true;
+        JsonObject data = doc.createNestedObject("data");
+        data["jobId"] = jobId;
+        data["state"] = alreadyRunning ? "running" : "queued";
+        data["type"] = "voucher-bulk-delete";
+        if (alreadyRunning) {
+          data["duplicate"] = true;
+          doc["message"] = "Voucher job already running";
+        }
+        String out;
+        serializeJson(doc, out);
+        AsyncWebServerResponse *res =
+            req->beginResponse(202, "application/json", out);
+        addCorsHeaders(res);
+        res->addHeader("Cache-Control", "no-store");
+        req->send(res);
+      },
+      nullptr, bodyCollect);
+
+  _server->on("/api/vouchers/jobs/*", HTTP_GET, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_vouchers) {
+      sendError(req, 503, "Voucher service unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    const String url = req->url();
+    const int marker = url.lastIndexOf('/');
+    if (marker < 0 || marker + 1 >= static_cast<int>(url.length())) {
+      sendError(req, 400, "Job id required", "INVALID_JOB_ID");
+      return;
+    }
+    const uint32_t jobId =
+        static_cast<uint32_t>(url.substring(marker + 1).toInt());
+    VoucherManager::GenerateJobSnapshot snap;
+    if (!_vouchers->pollGenerateJob(jobId, snap)) {
+      sendError(req, 404, "Voucher job not found", "NOT_FOUND");
+      return;
+    }
+    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
+    data["jobId"] = snap.jobId;
+    data["state"] = snap.state;
+    data["status"] = snap.state;  // alias for Admin clients
+    data["type"] = snap.type;
+    data["ok"] = snap.ok;
+    if (snap.count > 0) data["count"] = snap.count;
+    if (snap.error.length() > 0) data["error"] = snap.error;
+    if (strcmp(snap.state, "completed") == 0 && snap.resultJson.length() > 0) {
+      DynamicJsonDocument parsed(RenzFiConfig::JSON_DOC_MEDIUM);
+      if (!deserializeJson(parsed, snap.resultJson)) {
+        data["result"] = parsed.as<JsonVariant>();
+      }
+    }
+    sendOk(req, data, "Voucher job");
+  });
+
   // ── Users ─────────────────────────────────────────────────────────────────
+  // Rule #7 (Setup Simplification Pass): Active Users is Administrator-only.
   _server->on("/api/users", HTTP_GET, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
     DynamicJsonDocument data(RenzFiConfig::JSON_DOC_LARGE);
     fillActiveUsers(_sessions, _portalSessions, data);
@@ -682,14 +1706,19 @@ void ApiServer::registerRoutes() {
   _server->on(
       "/api/users/disconnect", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
-        if (!requireAuth(req)) return;
-        DynamicJsonDocument body(256);
+    RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        HeapJsonDocument bodyHeap(256);
+        DynamicJsonDocument &body = bodyHeap.doc();
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
         String mac = body["mac"] | "";
-        _mikrotik->disconnectHotspotUser(mac);
         bool removed = false;
-        if (_portalSessions && _portalSessions->reset(mac)) removed = true;
+        if (_portalSessions && _portalSessions->reset(mac)) {
+          removed = true;
+        } else if (_portalSessions) {
+          _portalSessions->deferRouterDisconnect(mac);
+        }
         if (_sessions->disconnect(mac)) removed = true;
         if (removed) sendOk(req);
         else sendError(req, 404, "Active user not found", "USER_NOT_FOUND");
@@ -699,7 +1728,8 @@ void ApiServer::registerRoutes() {
   _server->on(
       "/api/users/pause", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
-        if (!requireAuth(req)) return;
+    RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
         DynamicJsonDocument body(256);
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
@@ -709,7 +1739,10 @@ void ApiServer::registerRoutes() {
           return;
         }
         if (_portalSessions && _portalSessions->hasSession(mac)) {
-          if (_portalSessions->pause(mac)) sendOk(req, "Session paused");
+          // Owner pause is an operational override — not subject to the
+          // customer's per-session pause budget.
+          if (_portalSessions->pause(mac, nullptr, false))
+            sendOk(req, "Session paused");
           else
             sendError(req, 400, "Session cannot be paused", "INVALID_STATE");
           return;
@@ -722,7 +1755,8 @@ void ApiServer::registerRoutes() {
   _server->on(
       "/api/users/resume", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
-        if (!requireAuth(req)) return;
+    RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
         DynamicJsonDocument body(256);
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
@@ -743,8 +1777,52 @@ void ApiServer::registerRoutes() {
       nullptr, bodyCollect);
 
   // ── Sales ─────────────────────────────────────────────────────────────────
+  // Rule #7 (Setup Simplification Pass): Reports/Sales is Administrator-only.
+  auto registerHistoryDownload =
+      [this](const char *route, NdjsonLedger::Kind kind) {
+        _server->on(route, HTTP_GET,
+                    [this, kind](AsyncWebServerRequest *req) {
+          RENZFI_PROD_GATE(req);
+          if (!requireOwnerAuth(req)) return;
+          if (!req->hasParam("month")) {
+            sendError(req, 400, "month must be YYYY-MM or undated",
+                      "INVALID_HISTORY_MONTH");
+            return;
+          }
+          const String month = req->getParam("month")->value();
+          String path;
+          if (!_storage->historyPath(kind, month, path)) {
+            sendError(req, 400, "month must be YYYY-MM or undated",
+                      "INVALID_HISTORY_MONTH");
+            return;
+          }
+          if (!_storage->isSdReadable() || !_storage->exists(path.c_str())) {
+            sendError(req, 404, "History file not found", "HISTORY_NOT_FOUND");
+            return;
+          }
+          AsyncWebServerResponse *res =
+              req->beginResponse(SD, path.c_str(), "application/x-ndjson");
+          res->addHeader(
+              "Content-Disposition",
+              String("attachment; filename=\"") +
+                  NdjsonLedger::kindName(kind) + "-" + month + ".ndjson\"");
+          res->addHeader("Cache-Control", "no-store");
+          addCorsHeaders(res);
+          req->send(res);
+        });
+      };
+  registerHistoryDownload("/api/history/sales/download",
+                          NdjsonLedger::Kind::Sales);
+  registerHistoryDownload("/api/history/sessions/download",
+                          NdjsonLedger::Kind::Sessions);
+  registerHistoryDownload("/api/history/vouchers/download",
+                          NdjsonLedger::Kind::Vouchers);
+  registerHistoryDownload("/api/history/logs/download",
+                          NdjsonLedger::Kind::Logs);
+
   _server->on("/api/sales/today", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
                 if (!requireAuth(req)) return;
                 DynamicJsonDocument data(256);
                 _sessions->salesToday(data);
@@ -753,6 +1831,7 @@ void ApiServer::registerRoutes() {
 
   _server->on("/api/sales/weekly", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
                 if (!requireAuth(req)) return;
                 DynamicJsonDocument data(256);
                 _sessions->salesWeek(data);
@@ -761,6 +1840,7 @@ void ApiServer::registerRoutes() {
 
   _server->on("/api/sales/monthly", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
                 if (!requireAuth(req)) return;
                 DynamicJsonDocument data(256);
                 _sessions->salesMonth(data);
@@ -769,15 +1849,33 @@ void ApiServer::registerRoutes() {
 
   _server->on("/api/sales/history", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
                 if (!requireAuth(req)) return;
-                DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
-                _sessions->salesHistory(data);
-                sendOk(req, data);
+                PsramJsonDocument dataHeap;
+                _sessions->salesHistory(dataHeap.doc());
+                sendOk(req, dataHeap.doc());
+              });
+
+  _server->on("/api/sales/records", HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+                RENZFI_PROD_GATE(req);
+                if (!requireAuth(req)) return;
+                size_t limit = req->hasArg("limit")
+                                   ? static_cast<size_t>(req->arg("limit").toInt())
+                                   : 20U;
+                PsramJsonDocument dataHeap;
+                if (_sessions->listSalesRecords(dataHeap.doc(), limit)) {
+                  sendOk(req, dataHeap.doc());
+                } else {
+                  sendError(req, 500, "Unable to load sale records",
+                            "SALES_RECORDS_ERROR");
+                }
               });
 
   _server->on("/api/sales/export", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
-                if (!requireAuth(req)) return;
+    RENZFI_PROD_GATE(req);
+                if (!requireOwnerAuth(req)) return;
                 String csv;
                 String filename;
                 _sessions->buildSalesCsv(csv, filename);
@@ -791,9 +1889,54 @@ void ApiServer::registerRoutes() {
                 req->send(res);
               });
 
+  _server->on("/api/sales/reset", HTTP_POST,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+                if (!requireOwnerAuth(req)) return;
+                if (!_sessions || !_sessions->resetSales()) {
+                  sendError(req, 500, "Unable to reset sales",
+                            "SALES_RESET_FAILED");
+                  return;
+                }
+                DynamicJsonDocument data(64);
+                data["ok"] = true;
+                sendOk(req, data, "Sales reset");
+              });
+
+  auto registerSalesChartRoute = [this](const char *path, int days) {
+    _server->on(path, HTTP_GET, [this, days](AsyncWebServerRequest *req) {
+      RENZFI_PROD_GATE(req);
+      if (!requireAuth(req)) return;
+      // Monthly (180d) labels+data need ~6–8 KB; 2048 overflowed and forced
+      // extra internal realloc pressure beside W5500 DMA demand.
+      if (!DmaMemoryMonitor::hasEthTransmitHeadroom()) {
+        DmaMemoryMonitor::logSnapshot("sales-chart-http-dma-low");
+        sendError(req, 503, "Sales chart deferred — SPI DMA memory low",
+                  "SPI_DMA_LOW");
+        return;
+      }
+      PsramJsonDocument dataHeap;
+      if (_sessions->salesChart(dataHeap.doc(), days)) {
+        if (!DmaMemoryMonitor::hasEthTransmitHeadroom()) {
+          DmaMemoryMonitor::logSnapshot("sales-chart-post-dma-low");
+          sendError(req, 503, "Sales chart deferred — SPI DMA memory low",
+                    "SPI_DMA_LOW");
+          return;
+        }
+        sendOk(req, dataHeap.doc());
+      } else {
+        sendError(req, 500, "Unable to build sales chart", "SALES_CHART_ERROR");
+      }
+    });
+  };
+  registerSalesChartRoute("/api/sales/chart/daily", 7);
+  registerSalesChartRoute("/api/sales/chart/weekly", 28);
+  registerSalesChartRoute("/api/sales/chart/monthly", 180);
+
   // ── Captive portal branding (admin) — register BEFORE /api/settings ───────
   _server->on("/api/settings/portal", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
                 if (!requireAuth(req)) return;
                 if (!_portalConfig) {
                   sendError(req, 500, "Portal config unavailable", "NOT_READY");
@@ -801,7 +1944,7 @@ void ApiServer::registerRoutes() {
                 }
                 JsonDocument data;
                 JsonObject root = data.to<JsonObject>();
-                const String base = "http://" + W5500Config::IP.toString();
+                const String base = WebRequestDiagnostics::requestBaseUrl(req, _eth);
                 _portalConfig->fillSettingsJson(root, base);
                 Serial.printf(
                     "[portal] settings has_banner=%s bannerConfigured=%s "
@@ -826,19 +1969,30 @@ void ApiServer::registerRoutes() {
             (unsigned)total, final ? "yes" : "no", filename.c_str(),
             (unsigned)req->contentLength(), req->contentType().c_str());
 
-        gPortalUpload.bodySeen = true;
         const size_t maxBytes =
-            isBanner ? (200U * 1024U) : RenzFiConfig::PORTAL_MUSIC_MAX_BYTES;
-
-        if (total > maxBytes) {
-          gPortalUpload.rejected = true;
-          gPortalUpload.rejectReason =
-              isBanner ? "Banner exceeds 200 KiB limit"
-                       : "Music exceeds 1000 KiB limit";
-          return;
-        }
+            isBanner ? RenzFiConfig::PORTAL_BANNER_MAX_BYTES
+                     : RenzFiConfig::PORTAL_MUSIC_MAX_BYTES;
 
         if (index == 0) {
+          if (gPortalUpload.active && gPortalUpload.owner != req) {
+            if (millis() - gPortalUpload.startedAt <= 120000U) return;
+            if (_assets) _assets->abortSaveAsset();
+            gPortalUpload = PortalAssetUpload{};
+          }
+          gPortalUpload = PortalAssetUpload{};
+          gPortalUpload.active = true;
+          gPortalUpload.owner = req;
+          gPortalUpload.startedAt = millis();
+          gPortalUpload.source =
+              strcmp(via, "UPLOAD") == 0
+                  ? PortalAssetUpload::Source::Upload
+                  : PortalAssetUpload::Source::RawBody;
+          if (!requireAuth(req)) {
+            gPortalUpload.authFailed = true;
+            return;
+          }
+          gPortalUpload.authenticated = true;
+          gPortalUpload.bodySeen = true;
           gPortalUpload.kind =
               isBanner ? PortalAssetUpload::Kind::Banner
                        : PortalAssetUpload::Kind::Music;
@@ -848,11 +2002,29 @@ void ApiServer::registerRoutes() {
                   : (isBanner ? "raw-body.webp" : "raw-body.mp3");
           gPortalUpload.rejected = false;
           gPortalUpload.rejectReason = "";
-          gPortalUpload.buffer.clear();
           gPortalUpload.streamActive = false;
           gPortalUpload.streamFinished = false;
           gPortalUpload.expectedTotal = total;
           gPortalUpload.bytesReceived = 0;
+
+          if (total > maxBytes) {
+            gPortalUpload.rejected = true;
+            gPortalUpload.rejectReason =
+                isBanner ? "Banner exceeds 2 MB limit"
+                         : "Music exceeds 2 MB limit";
+            return;
+          }
+
+          if (isBanner && filename.length() > 0) {
+            String lower = filename;
+            lower.toLowerCase();
+            if (!lower.endsWith(".png") && !lower.endsWith(".jpg") &&
+                !lower.endsWith(".jpeg")) {
+              gPortalUpload.rejected = true;
+              gPortalUpload.rejectReason = "Only PNG and JPEG banners are allowed";
+              return;
+            }
+          }
 
           if (!isBanner && filename.length() > 0 &&
               !filename.endsWith(".mp3") && !filename.endsWith(".MP3")) {
@@ -861,40 +2033,45 @@ void ApiServer::registerRoutes() {
             return;
           }
 
-          if (_portalConfig && total > 0) {
-            const bool began =
-                isBanner
-                    ? _portalConfig->beginBannerUpload(total,
-                                                       gPortalUpload.filename)
-                    : _portalConfig->beginMusicUpload(total,
-                                                      gPortalUpload.filename);
-            gPortalUpload.streamActive = began;
+          if (_assets) {
+            const AssetType assetType =
+                isBanner ? AssetType::Banner : AssetType::Music;
+            const AssetOperationResult began = _assets->beginSaveAsset(
+                assetType, total, gPortalUpload.filename);
+            gPortalUpload.streamActive = began.success;
+            if (!began.success) {
+              gPortalUpload.rejected = true;
+              gPortalUpload.rejectReason =
+                  began.errorMessage.length() > 0
+                      ? began.errorMessage
+                      : String("Unable to begin upload");
+            }
           }
         }
 
-        if (gPortalUpload.rejected) return;
+        if (gPortalUpload.owner != req || gPortalUpload.authFailed ||
+            gPortalUpload.rejected) {
+          return;
+        }
 
         const bool isFinal = final || (total > 0 && index + len >= total);
 
-        if (gPortalUpload.streamActive && _portalConfig && len > 0) {
-          if (!_portalConfig->appendUploadChunk(data, len, index, isFinal)) {
+        if (gPortalUpload.streamActive && _assets && len > 0) {
+          const AssetOperationResult chunk = _assets->appendSaveChunk(
+              data, len, index, isFinal);
+          if (!chunk.success) {
             gPortalUpload.rejected = true;
-            gPortalUpload.rejectReason = "Unable to write upload chunk";
-            _portalConfig->abortUpload();
+            gPortalUpload.rejectReason =
+                chunk.errorMessage.length() > 0
+                    ? chunk.errorMessage
+                    : String("Unable to write upload chunk");
+            _assets->abortSaveAsset();
             return;
           }
           gPortalUpload.bytesReceived += len;
         } else if (len > 0) {
-          if (gPortalUpload.buffer.size() + len > maxBytes) {
-            gPortalUpload.rejected = true;
-            gPortalUpload.rejectReason =
-                isBanner ? "Banner exceeds 200 KiB limit"
-                         : "Music exceeds 1000 KiB limit";
-            return;
-          }
-          gPortalUpload.buffer.insert(gPortalUpload.buffer.end(), data,
-                                      data + len);
-          gPortalUpload.bytesReceived += len;
+          gPortalUpload.rejected = true;
+          gPortalUpload.rejectReason = "Asset manager unavailable";
         }
 
         if (isFinal) gPortalUpload.streamFinished = true;
@@ -907,10 +2084,8 @@ void ApiServer::registerRoutes() {
             gPortalUpload.bodySeen) {
           return;
         }
-        if (index == 0) {
-          gPortalUpload = PortalAssetUpload{};
+        if (index == 0 && !gPortalUpload.active)
           gPortalUpload.source = PortalAssetUpload::Source::RawBody;
-        }
         portalHandleChunk(req, true, data, len, index, total,
                           total > 0 && index + len >= total, "BODY",
                           gPortalUpload.filename);
@@ -923,10 +2098,8 @@ void ApiServer::registerRoutes() {
             gPortalUpload.bodySeen) {
           return;
         }
-        if (index == 0) {
-          gPortalUpload = PortalAssetUpload{};
+        if (index == 0 && !gPortalUpload.active)
           gPortalUpload.source = PortalAssetUpload::Source::RawBody;
-        }
         portalHandleChunk(req, false, data, len, index, total,
                           total > 0 && index + len >= total, "BODY",
                           gPortalUpload.filename);
@@ -940,12 +2113,9 @@ void ApiServer::registerRoutes() {
             gPortalUpload.bodySeen) {
           return;
         }
-        if (index == 0) {
-          gPortalUpload = PortalAssetUpload{};
+        if (index == 0 && !gPortalUpload.active)
           gPortalUpload.source = PortalAssetUpload::Source::Upload;
-        }
-        size_t total = req->contentLength();
-        if (total == 0 && final && len > 0) total = index + len;
+        size_t total = final ? index + len : 0;
         portalHandleChunk(req, true, data, len, index, total, final, "UPLOAD",
                           filename);
       };
@@ -958,17 +2128,15 @@ void ApiServer::registerRoutes() {
             gPortalUpload.bodySeen) {
           return;
         }
-        if (index == 0) {
-          gPortalUpload = PortalAssetUpload{};
+        if (index == 0 && !gPortalUpload.active)
           gPortalUpload.source = PortalAssetUpload::Source::Upload;
-        }
-        size_t total = req->contentLength();
-        if (total == 0 && final && len > 0) total = index + len;
+        size_t total = final ? index + len : 0;
         portalHandleChunk(req, false, data, len, index, total, final, "UPLOAD",
                           filename);
       };
 
   auto portalBannerComplete = [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
     Serial.printf(
         "[portal-upload] COMPLETE banner contentLength=%u contentType=%s "
         "bodySeen=%s bytes=%u streamActive=%s streamFinished=%s\n",
@@ -977,15 +2145,23 @@ void ApiServer::registerRoutes() {
         gPortalUpload.streamActive ? "yes" : "no",
         gPortalUpload.streamFinished ? "yes" : "no");
 
-    if (!requireAuth(req)) return;
-    if (!_portalConfig) {
-      sendError(req, 500, "Portal config unavailable", "NOT_READY");
+    if (gPortalUpload.owner != req) {
+      sendError(req, 409, "Another asset upload is active", "UPLOAD_BUSY");
+      return;
+    }
+    if (gPortalUpload.authFailed) {
+      gPortalUpload = PortalAssetUpload{};
+      return;
+    }
+    if (!gPortalUpload.authenticated && !requireAuth(req)) return;
+    if (!_assets) {
+      sendError(req, 500, "Asset manager unavailable", "NOT_READY");
       return;
     }
 
     if (gPortalUpload.rejected) {
       sendError(req, 400, gPortalUpload.rejectReason, "INVALID_UPLOAD");
-      _portalConfig->abortUpload();
+      _assets->abortSaveAsset();
       gPortalUpload = PortalAssetUpload{};
       return;
     }
@@ -994,37 +2170,46 @@ void ApiServer::registerRoutes() {
       sendError(req, 400,
                 "No upload body received (body/upload callback did not run)",
                 "INVALID_UPLOAD");
-      _portalConfig->abortUpload();
+      _assets->abortSaveAsset();
       gPortalUpload = PortalAssetUpload{};
       return;
     }
 
-    bool ok = false;
+    AssetOperationResult result;
     if (gPortalUpload.streamActive) {
-      ok = _portalConfig->finishBannerUpload();
-      if (!ok) _portalConfig->abortUpload();
-    } else if (!gPortalUpload.buffer.empty()) {
-      ok = _portalConfig->uploadBanner(gPortalUpload.buffer.data(),
-                                       gPortalUpload.buffer.size());
+      result = _assets->finishSaveAsset();
     } else {
       sendError(req, 400, "Empty banner upload", "INVALID_UPLOAD");
       gPortalUpload = PortalAssetUpload{};
       return;
     }
 
-    if (ok) {
+    if (result.success) {
+      if (_portalConfig) _portalConfig->loadMeta();
       JsonDocument payload;
       JsonObject root = payload.to<JsonObject>();
-      const String base = "http://" + W5500Config::IP.toString();
-      _portalConfig->fillSettingsJson(root, base);
+      const String base = WebRequestDiagnostics::requestBaseUrl(req, _eth);
+      if (_portalConfig) _portalConfig->fillSettingsJson(root, base);
+      appendUploadResultJson(root, result);
       sendOk(req, payload, "Banner uploaded");
     } else {
-      sendError(req, 500, "Unable to save banner", "STORAGE_ERROR");
+      const int status =
+          (result.errorCode == AssetErrorCode::InvalidUpload ||
+           result.errorCode == AssetErrorCode::InvalidType ||
+           result.errorCode == AssetErrorCode::SizeExceeded ||
+           result.errorCode == AssetErrorCode::TranscodeFailed)
+              ? 400
+              : 500;
+      sendError(req, status,
+                result.errorMessage.length() > 0 ? result.errorMessage
+                                                 : String("Unable to save banner"),
+                assetErrorCodeLabel(result.errorCode));
     }
     gPortalUpload = PortalAssetUpload{};
   };
 
   auto portalMusicComplete = [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
     Serial.printf(
         "[portal-upload] COMPLETE music contentLength=%u contentType=%s "
         "bodySeen=%s bytes=%u streamActive=%s streamFinished=%s\n",
@@ -1033,15 +2218,23 @@ void ApiServer::registerRoutes() {
         gPortalUpload.streamActive ? "yes" : "no",
         gPortalUpload.streamFinished ? "yes" : "no");
 
-    if (!requireAuth(req)) return;
-    if (!_portalConfig) {
-      sendError(req, 500, "Portal config unavailable", "NOT_READY");
+    if (gPortalUpload.owner != req) {
+      sendError(req, 409, "Another asset upload is active", "UPLOAD_BUSY");
+      return;
+    }
+    if (gPortalUpload.authFailed) {
+      gPortalUpload = PortalAssetUpload{};
+      return;
+    }
+    if (!gPortalUpload.authenticated && !requireAuth(req)) return;
+    if (!_assets) {
+      sendError(req, 500, "Asset manager unavailable", "NOT_READY");
       return;
     }
 
     if (gPortalUpload.rejected) {
       sendError(req, 400, gPortalUpload.rejectReason, "INVALID_UPLOAD");
-      _portalConfig->abortUpload();
+      _assets->abortSaveAsset();
       gPortalUpload = PortalAssetUpload{};
       return;
     }
@@ -1050,32 +2243,39 @@ void ApiServer::registerRoutes() {
       sendError(req, 400,
                 "No upload body received (body/upload callback did not run)",
                 "INVALID_UPLOAD");
-      _portalConfig->abortUpload();
+      _assets->abortSaveAsset();
       gPortalUpload = PortalAssetUpload{};
       return;
     }
 
-    bool ok = false;
+    AssetOperationResult result;
     if (gPortalUpload.streamActive) {
-      ok = _portalConfig->finishMusicUpload();
-      if (!ok) _portalConfig->abortUpload();
-    } else if (!gPortalUpload.buffer.empty()) {
-      ok = _portalConfig->uploadMusic(gPortalUpload.buffer.data(),
-                                      gPortalUpload.buffer.size());
+      result = _assets->finishSaveAsset();
     } else {
       sendError(req, 400, "Empty music upload", "INVALID_UPLOAD");
       gPortalUpload = PortalAssetUpload{};
       return;
     }
 
-    if (ok) {
+    if (result.success) {
+      if (_portalConfig) _portalConfig->loadMeta();
       JsonDocument payload;
       JsonObject root = payload.to<JsonObject>();
-      const String base = "http://" + W5500Config::IP.toString();
-      _portalConfig->fillSettingsJson(root, base);
+      const String base = WebRequestDiagnostics::requestBaseUrl(req, _eth);
+      if (_portalConfig) _portalConfig->fillSettingsJson(root, base);
+      appendUploadResultJson(root, result);
       sendOk(req, payload, "Music uploaded");
     } else {
-      sendError(req, 500, "Unable to save music", "STORAGE_ERROR");
+      const int status =
+          (result.errorCode == AssetErrorCode::InvalidUpload ||
+           result.errorCode == AssetErrorCode::InvalidType ||
+           result.errorCode == AssetErrorCode::SizeExceeded)
+              ? 400
+              : 500;
+      sendError(req, status,
+                result.errorMessage.length() > 0 ? result.errorMessage
+                                                 : String("Unable to save music"),
+                assetErrorCodeLabel(result.errorCode));
     }
     gPortalUpload = PortalAssetUpload{};
   };
@@ -1096,28 +2296,43 @@ void ApiServer::registerRoutes() {
 
   _server->on("/api/settings/portal/banner", HTTP_DELETE,
               [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
                 if (!requireAuth(req)) return;
-                if (!_portalConfig) {
-                  sendError(req, 500, "Portal config unavailable", "NOT_READY");
+                if (!_assets) {
+                  sendError(req, 500, "Asset manager unavailable", "NOT_READY");
                   return;
                 }
-                if (_portalConfig->deleteBanner()) sendOk(req);
-                else sendError(req, 500, "Unable to remove banner", "STORAGE_ERROR");
+                const AssetOperationResult result =
+                    _assets->deleteAsset(AssetType::Banner);
+                if (result.success) {
+                  if (_portalConfig) _portalConfig->loadMeta();
+                  sendOk(req);
+                } else {
+                  sendError(req, 500, "Unable to remove banner", "STORAGE_ERROR");
+                }
               });
 
   _server->on("/api/settings/portal/music", HTTP_DELETE,
               [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
                 if (!requireAuth(req)) return;
-                if (!_portalConfig) {
-                  sendError(req, 500, "Portal config unavailable", "NOT_READY");
+                if (!_assets) {
+                  sendError(req, 500, "Asset manager unavailable", "NOT_READY");
                   return;
                 }
-                if (_portalConfig->deleteMusic()) sendOk(req);
-                else sendError(req, 500, "Unable to remove music", "STORAGE_ERROR");
+                const AssetOperationResult result =
+                    _assets->deleteAsset(AssetType::Music);
+                if (result.success) {
+                  if (_portalConfig) _portalConfig->loadMeta();
+                  sendOk(req);
+                } else {
+                  sendError(req, 500, "Unable to remove music", "STORAGE_ERROR");
+                }
               });
 
   // ── Settings ──────────────────────────────────────────────────────────────
   _server->on("/api/settings", HTTP_GET, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
     DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
     _storage->readJson(RenzFiConfig::SETTINGS_FILE, data);
@@ -1125,41 +2340,47 @@ void ApiServer::registerRoutes() {
   });
 
   auto settingsSave = [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
     DynamicJsonDocument body(RenzFiConfig::JSON_DOC_MEDIUM);
     String raw = getBody(req);
     if (raw.length() > 0) deserializeJson(body, raw);
     DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
     data.set(body);
-    if (_storage->writeJson(RenzFiConfig::SETTINGS_FILE, data)) sendOk(req);
-    else sendError(req, 500, "Unable to save settings", "STORAGE_ERROR");
+    if (_storage->writeJson(RenzFiConfig::SETTINGS_FILE, data)) {
+      DeviceIdentity::invalidateRuntimeProfile();
+      sendOk(req);
+    } else sendError(req, 500, "Unable to save settings", "STORAGE_ERROR");
   };
   _server->on("/api/settings", HTTP_POST, settingsSave, nullptr, bodyCollect);
   _server->on("/api/settings", HTTP_PUT,  settingsSave, nullptr, bodyCollect);
 
   _server->on("/api/settings/admin", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
                 if (!requireAuth(req)) return;
                 DynamicJsonDocument data(128);
-                data["username"] = "admin";
+                if (_eth) data["adminIp"] = _eth->ip();
                 sendOk(req, data);
               });
 
   _server->on("/api/settings/admin", HTTP_PUT,
               [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
                 if (!requireAuth(req)) return;
                 sendOk(req);
               });
 
   _server->on("/api/settings/backup", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
-                if (!requireAuth(req)) return;
+    RENZFI_PROD_GATE(req);
+                if (!requireOwnerAuth(req)) return;
                 if (!_backup.isSdAvailable()) {
                   sendError(req, 503, "SD Card is not available",
                             "SD_UNAVAILABLE");
                   return;
                 }
-                if (_logger) _logger->info("backup", "export started");
+                if (_logger) _logger->infoLocal("backup", "export started");
                 Serial.println("[backup] export started");
 
                 String outPath;
@@ -1189,18 +2410,30 @@ void ApiServer::registerRoutes() {
                 addCorsHeaders(res);
                 req->send(res);
 
-                if (_logger) _logger->info("backup", "export completed");
+                if (_logger) _logger->infoLocal("backup", "export completed");
                 Serial.println("[backup] export completed");
               });
 
   auto restoreUploadHandler = [this](AsyncWebServerRequest *req, String filename,
                                      size_t index, uint8_t *data, size_t len,
                                      bool final) {
-    (void)req;
     (void)filename;
     if (index == 0) {
+      if (gRestoreUpload.active && gRestoreUpload.owner != req) {
+        if (millis() - gRestoreUpload.startedAt <= 120000U) return;
+        if (gRestoreUpload.file) gRestoreUpload.file.close();
+        SD.remove(BackupManager::TEMP_RESTORE_PATH);
+        gRestoreUpload = RestoreUpload{};
+      }
       gRestoreUpload = RestoreUpload{};
       gRestoreUpload.active = true;
+      gRestoreUpload.owner = req;
+      gRestoreUpload.startedAt = millis();
+      if (!requireOwnerAuth(req)) {
+        gRestoreUpload.authFailed = true;
+        return;
+      }
+      gRestoreUpload.authenticated = true;
       if (!_backup.isSdAvailable()) {
         gRestoreUpload.rejected = true;
         gRestoreUpload.rejectReason = "SD Card is not available";
@@ -1217,13 +2450,22 @@ void ApiServer::registerRoutes() {
         gRestoreUpload.rejectReason = "Unable to store restore upload";
         return;
       }
-      if (_logger) _logger->info("restore", "restore started");
+      if (_logger) _logger->infoLocal("restore", "restore started");
       Serial.println("[restore] restore started");
     }
 
-    if (gRestoreUpload.rejected || !gRestoreUpload.file) return;
+    if (gRestoreUpload.owner != req || gRestoreUpload.authFailed ||
+        gRestoreUpload.rejected || !gRestoreUpload.file) {
+      return;
+    }
     if (len > 0) {
-      gRestoreUpload.file.write(data, len);
+      if (gRestoreUpload.file.write(data, len) != len) {
+        gRestoreUpload.rejected = true;
+        gRestoreUpload.rejectReason = "Unable to store restore upload";
+        gRestoreUpload.file.close();
+        SD.remove(BackupManager::TEMP_RESTORE_PATH);
+        return;
+      }
       gRestoreUpload.received += len;
       if (gRestoreUpload.received > 3 * 1024 * 1024) {
         gRestoreUpload.rejected = true;
@@ -1238,7 +2480,17 @@ void ApiServer::registerRoutes() {
   _server->on(
       "/api/settings/restore", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
-        if (!requireAuth(req)) return;
+    RENZFI_PROD_GATE(req);
+        if (gRestoreUpload.active && gRestoreUpload.owner != req) {
+          sendError(req, 409, "Another restore upload is active",
+                    "RESTORE_BUSY");
+          return;
+        }
+        if (gRestoreUpload.authFailed) {
+          gRestoreUpload = RestoreUpload{};
+          return;
+        }
+        if (!gRestoreUpload.authenticated && !requireOwnerAuth(req)) return;
 
         String error;
         bool restored = false;
@@ -1278,7 +2530,8 @@ void ApiServer::registerRoutes() {
         }
 
         if (_portalConfig) _portalConfig->loadMeta();
-        if (_logger) _logger->info("restore", "restore completed");
+        if (_assets) _assets->loadMetadata();
+        if (_logger) _logger->infoLocal("restore", "restore completed");
         Serial.println("[restore] restore completed");
 
         DynamicJsonDocument data(128);
@@ -1290,9 +2543,11 @@ void ApiServer::registerRoutes() {
       restoreUploadHandler, bodyCollect);
 
   // ── Firmware OTA ────────────────────────────────────────────────────────────
+  // Rule #7 (Setup Simplification Pass): Firmware is Administrator-only.
   _server->on("/api/system/firmware", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
-                if (!requireAuth(req)) return;
+    RENZFI_PROD_GATE(req);
+                if (!requireOwnerAuth(req)) return;
                 DynamicJsonDocument data(512);
                 data["version"] = RenzFiConfig::FIRMWARE_VERSION;
                 data["build"] = __DATE__;
@@ -1327,10 +2582,10 @@ void ApiServer::registerRoutes() {
       if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
         gOtaUpload.rejected = true;
         gOtaUpload.rejectReason = "Unable to begin OTA update";
-        if (_logger) _logger->error("firmware", gOtaUpload.rejectReason);
+        if (_logger) _logger->errorLocal("firmware", gOtaUpload.rejectReason);
         return;
       }
-      if (_logger) _logger->info("firmware", "OTA upload started: " + filename);
+      if (_logger) _logger->infoLocal("firmware", "OTA upload started: " + filename);
     }
 
     if (gOtaUpload.rejected) return;
@@ -1341,7 +2596,7 @@ void ApiServer::registerRoutes() {
         Update.abort();
         gOtaUpload.rejected = true;
         gOtaUpload.rejectReason = "Flash write failed during OTA";
-        if (_logger) _logger->error("firmware", gOtaUpload.rejectReason);
+        if (_logger) _logger->errorLocal("firmware", gOtaUpload.rejectReason);
         return;
       }
       gOtaUpload.received += len;
@@ -1373,13 +2628,13 @@ void ApiServer::registerRoutes() {
       if (!Update.end(true)) {
         gOtaUpload.rejected = true;
         gOtaUpload.rejectReason = String("OTA verify failed: ") + Update.errorString();
-        if (_logger) _logger->error("firmware", gOtaUpload.rejectReason);
+        if (_logger) _logger->errorLocal("firmware", gOtaUpload.rejectReason);
         return;
       }
       gOtaUpload.finalized = true;
 
       if (_logger) {
-        _logger->info("firmware",
+        _logger->infoLocal("firmware",
                       "OTA complete md5=" + gOtaUpload.digest + " bytes=" +
                           String(gOtaUpload.received));
       }
@@ -1411,10 +2666,10 @@ void ApiServer::registerRoutes() {
       if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
         gOtaUpload.rejected = true;
         gOtaUpload.rejectReason = "Unable to begin OTA update";
-        if (_logger) _logger->error("firmware", gOtaUpload.rejectReason);
+        if (_logger) _logger->errorLocal("firmware", gOtaUpload.rejectReason);
         return;
       }
-      if (_logger) _logger->info("firmware", "OTA raw upload started");
+      if (_logger) _logger->infoLocal("firmware", "OTA raw upload started");
     }
     if (gOtaUpload.rejected || len == 0) return;
 
@@ -1423,7 +2678,7 @@ void ApiServer::registerRoutes() {
       Update.abort();
       gOtaUpload.rejected = true;
       gOtaUpload.rejectReason = "Flash write failed during OTA";
-      if (_logger) _logger->error("firmware", gOtaUpload.rejectReason);
+      if (_logger) _logger->errorLocal("firmware", gOtaUpload.rejectReason);
       return;
     }
     gOtaUpload.received += len;
@@ -1441,7 +2696,8 @@ void ApiServer::registerRoutes() {
   _server->on(
       "/api/system/firmware", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
-        if (!requireAuth(req)) return;
+    RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
 
         Serial.printf(
             "[firmware] POST complete active=%d finalized=%d rejected=%d "
@@ -1478,14 +2734,14 @@ void ApiServer::registerRoutes() {
             gOtaUpload.rejected = true;
             gOtaUpload.rejectReason =
                 String("OTA verify failed: ") + Update.errorString();
-            if (_logger) _logger->error("firmware", gOtaUpload.rejectReason);
+            if (_logger) _logger->errorLocal("firmware", gOtaUpload.rejectReason);
             sendError(req, 400, gOtaUpload.rejectReason, "OTA_REJECTED");
             gOtaUpload = FirmwareOtaUpload{};
             return;
           }
           gOtaUpload.finalized = true;
           if (_logger) {
-            _logger->info("firmware",
+            _logger->infoLocal("firmware",
                           "OTA complete md5=" + gOtaUpload.digest + " bytes=" +
                               String(gOtaUpload.received));
           }
@@ -1514,7 +2770,9 @@ void ApiServer::registerRoutes() {
       otaRawBodyCollect);
 
   // ── Logs ──────────────────────────────────────────────────────────────────
+  // Rule #7 (Setup Simplification Pass): Logs is Administrator-only.
   _server->on("/api/logs", HTTP_GET, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
     String q = req->hasArg("q") ? req->arg("q") : "";
     DynamicJsonDocument data(RenzFiConfig::JSON_DOC_LARGE);
@@ -1523,14 +2781,16 @@ void ApiServer::registerRoutes() {
   });
 
   _server->on("/api/logs", HTTP_DELETE, [this](AsyncWebServerRequest *req) {
-    if (!requireAuth(req)) return;
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
     if (_logger->clear()) sendOk(req);
     else sendError(req, 500, "Unable to clear logs", "STORAGE_ERROR");
   });
 
   _server->on("/api/logs/export", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
-                if (!requireAuth(req)) return;
+    RENZFI_PROD_GATE(req);
+                if (!requireOwnerAuth(req)) return;
                 DynamicJsonDocument data(RenzFiConfig::JSON_DOC_LARGE);
                 if (!_logger->exportRam(data)) {
                   sendError(req, 500, "Unable to export logs", "STORAGE_ERROR");
@@ -1549,6 +2809,7 @@ void ApiServer::registerRoutes() {
   // ── Coin slot ─────────────────────────────────────────────────────────────
   _server->on("/api/coin/settings", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
                 if (!requireAuth(req)) return;
                 DynamicJsonDocument data(512);
                 if (_coin) {
@@ -1560,6 +2821,7 @@ void ApiServer::registerRoutes() {
               });
 
   auto coinSave = [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
     if (!_coin) {
       sendError(req, 503, "Coin slot hardware is disabled", "COIN_DISABLED");
@@ -1576,6 +2838,7 @@ void ApiServer::registerRoutes() {
 
   _server->on("/api/coin/diagnostics", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
                 if (!requireAuth(req)) return;
                 DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
                 if (_coin) {
@@ -1587,6 +2850,7 @@ void ApiServer::registerRoutes() {
               });
 
   _server->on("/api/coin/test", HTTP_POST, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
     if (!_coin) {
       sendError(req, 503, "Coin slot hardware is disabled", "COIN_DISABLED");
@@ -1597,6 +2861,7 @@ void ApiServer::registerRoutes() {
   });
 
   _server->on("/api/coin/reset", HTTP_POST, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
     if (!_coin) {
       sendError(req, 503, "Coin slot hardware is disabled", "COIN_DISABLED");
@@ -1607,21 +2872,43 @@ void ApiServer::registerRoutes() {
   });
 
   // ── Router / MikroTik ─────────────────────────────────────────────────────
+  auto sendAdminEnqueueReject =
+      [this](AsyncWebServerRequest *req,
+             const RouterProvisioningWorker::EnqueueOutcome &outcome) {
+        const char *code =
+            (outcome.rejectCode && outcome.rejectCode[0])
+                ? outcome.rejectCode
+                : "ROUTER_WORKER_BUSY";
+        const char *msg =
+            (outcome.rejectMessage && outcome.rejectMessage[0])
+                ? outcome.rejectMessage
+                : "Router worker is busy";
+        sendError(req, 503, msg, code);
+      };
+
   _server->on("/api/router/settings", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
-                if (!requireAuth(req)) return;
+    RENZFI_PROD_GATE(req);
+                if (!requireOwnerAuth(req)) return;
                 DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
-                if (_mikrotik->fillPublicSettings(data)) sendOk(req, data);
+                if (_router->fillPublicSettings(data)) sendOk(req, data);
                 else sendError(req, 500, "Unable to load router settings", "STORAGE_ERROR");
               });
 
-  auto routerSave = [this](AsyncWebServerRequest *req) {
-    if (!requireAuth(req)) return;
-    DynamicJsonDocument body(RenzFiConfig::JSON_DOC_SMALL);
-    String raw = getBody(req);
-    if (raw.length() > 0) deserializeJson(body, raw);
-    if (_mikrotik->save(body.as<JsonObjectConst>())) sendOk(req);
-    else sendError(req, 500, "Unable to save router settings", "STORAGE_ERROR");
+  auto routerSave = [this, sendAdminEnqueueReject](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_routerWorker) {
+      sendError(req, 503, "Router worker unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    const auto outcome =
+        _routerWorker->enqueueAdminSaveSettings(getBody(req));
+    if (!outcome.accepted) {
+      sendAdminEnqueueReject(req, outcome);
+      return;
+    }
+    sendAdminJobAccepted(req, outcome.jobId, "admin-save-settings");
   };
   _server->on("/api/router/settings", HTTP_POST, routerSave, nullptr,
               bodyCollect);
@@ -1630,130 +2917,327 @@ void ApiServer::registerRoutes() {
 
   _server->on("/api/router/profiles", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
-                if (!requireAuth(req)) return;
+    RENZFI_PROD_GATE(req);
+                // Part 5 (UX Simplification Pass): Router is Administrator-only.
+                if (!requireOwnerAuth(req)) return;
                 DynamicJsonDocument result(RenzFiConfig::JSON_DOC_MEDIUM);
-                if (_mikrotik && _mikrotik->listProfiles(result)) {
-                  sendOk(req, result, "Profiles loaded");
+                if (_router && _router->listProfiles(result)) {
+                  sendOk(req, result, "Profiles loaded from cache");
                 } else {
                   const char *message = result["error"] | "Failed to load profiles";
                   sendOk(req, result, message);
                 }
               });
 
+  // One-shot profile refresh / rate-limit set / managed speed ensure via worker.
+  auto routerProfilesOp = [this, sendAdminEnqueueReject](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_routerWorker) {
+      sendError(req, 503, "Router worker unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    String body = getBody(req);
+    if (req->url() == "/api/router/profiles/refresh") {
+      body = "{\"action\":\"refresh\"}";
+    }
+    const auto outcome = _routerWorker->enqueueAdminUserProfileOp(body);
+    if (!outcome.accepted) {
+      sendAdminEnqueueReject(req, outcome);
+      return;
+    }
+    sendAdminJobAccepted(req, outcome.jobId, "admin-user-profile");
+  };
+  _server->on("/api/router/profiles/refresh", HTTP_POST, routerProfilesOp,
+              nullptr, bodyCollect);
+  _server->on("/api/router/profiles/op", HTTP_POST, routerProfilesOp, nullptr,
+              bodyCollect);
+
   _server->on(
       "/api/router/test", HTTP_POST,
-      [this](AsyncWebServerRequest *req) {
-        if (!requireAuth(req)) return;
-        DynamicJsonDocument body(RenzFiConfig::JSON_DOC_SMALL);
-        String raw = getBody(req);
-        if (raw.length() > 0) deserializeJson(body, raw);
-        DynamicJsonDocument result(RenzFiConfig::JSON_DOC_SMALL);
-        const bool ok = _mikrotik->test(body.as<JsonObjectConst>(), result);
-        const char *message =
-            ok ? "Router test passed"
-               : (result["error"] | "Router test failed");
-        sendOk(req, result, message);
+      [this, sendAdminEnqueueReject](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        if (!_routerWorker) {
+          sendError(req, 503, "Router worker unavailable", "INTERNAL_ERROR");
+          return;
+        }
+        const auto outcome = _routerWorker->enqueueAdminTest(getBody(req));
+        if (!outcome.accepted) {
+          sendAdminEnqueueReject(req, outcome);
+          return;
+        }
+        sendAdminJobAccepted(req, outcome.jobId, "admin-test");
       },
       nullptr, bodyCollect);
 
-  // ── Ethernet / network status ─────────────────────────────────────────────
-  auto ethStatus = [this](AsyncWebServerRequest *req) {
-    if (!requireAuth(req)) return;
-    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
-    bool link = _eth && _eth->linkUp();
-    data["mode"]                = "ethernet";
-    data["modeLabel"]           = link ? "W5500 wired (link up)"
-                                       : "W5500 wired (no link)";
-    data["ethernet"]["linkUp"]  = link;
-    data["ethernet"]["ip"]      = _eth ? _eth->ip()
-                                       : W5500Config::IP.toString();
-    data["ethernet"]["gateway"] = _eth ? _eth->gateway()
-                                       : W5500Config::GATEWAY.toString();
-    data["ethernet"]["subnet"]  = _eth ? _eth->subnet()
-                                       : W5500Config::SUBNET.toString();
-    data["ethernet"]["mac"]     = _eth ? _eth->macAddress() : "";
-    String mdns = _eth ? _eth->mdnsHostname()
-                       : String(RenzFiConfig::MDNS_NAME) + ".local";
-    data["mdns"]["hostname"] = mdns;
-    data["mdns"]["adminUrl"] = "http://" + mdns + "/admin";
-    sendOk(req, data);
-  };
-  _server->on("/api/system/network", HTTP_GET, ethStatus);
-  _server->on("/api/system/wifi",    HTTP_GET, ethStatus);  // backward-compat
+  // Cached RouterOS metadata — no live API on GET.
+  _server->on("/api/router/wireless", HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+                // Part 5 (UX Simplification Pass): Router is Administrator-only.
+                if (!requireOwnerAuth(req)) return;
+                DynamicJsonDocument result(RenzFiConfig::JSON_DOC_SMALL);
+                const bool ok = _router && _router->fillWireless(result);
+                const char *message =
+                    ok ? "Wireless settings loaded from cache"
+                       : (result["error"] | "Failed to load wireless settings");
+                sendOk(req, result, message);
+              });
 
+  auto routerWirelessSave = [this, sendAdminEnqueueReject](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_routerWorker) {
+      sendError(req, 503, "Router worker unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    const auto outcome =
+        _routerWorker->enqueueAdminSaveWireless(getBody(req));
+    if (!outcome.accepted) {
+      sendAdminEnqueueReject(req, outcome);
+      return;
+    }
+    sendAdminJobAccepted(req, outcome.jobId, "admin-save-wireless");
+  };
+  _server->on("/api/router/wireless", HTTP_POST, routerWirelessSave, nullptr, bodyCollect);
+  _server->on("/api/router/wireless", HTTP_PUT,  routerWirelessSave, nullptr, bodyCollect);
+
+  _server->on("/api/router/cache", HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+                RENZFI_PROD_GATE(req);
+                // Part 5 (UX Simplification Pass): Router is Administrator-only.
+                if (!requireOwnerAuth(req)) return;
+                DynamicJsonDocument result(RenzFiConfig::JSON_DOC_MEDIUM);
+                if (_router && _router->fillRouterCache(result)) {
+                  sendOk(req, result, "Router cache loaded");
+                } else {
+                  sendOk(req, result, result["error"] | "Router cache unavailable");
+                }
+              });
+
+  auto routerCacheEnqueue = [this, sendAdminEnqueueReject](
+                                   AsyncWebServerRequest *req,
+                                   bool telemetryRefresh,
+                                   const char *successMessage,
+                                   const char *jobTypeLabel) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_routerWorker) {
+      sendError(req, 503, "Router worker unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    const auto outcome =
+        telemetryRefresh
+            ? _routerWorker->enqueueAdminRefreshCache(successMessage)
+            : _routerWorker->enqueueAdminSyncCache(successMessage);
+    if (!outcome.accepted) {
+      sendAdminEnqueueReject(req, outcome);
+      return;
+    }
+    sendAdminJobAccepted(req, outcome.jobId, jobTypeLabel);
+  };
+
+  _server->on(
+      "/api/router/cache/sync", HTTP_POST,
+      [this, routerCacheEnqueue](AsyncWebServerRequest *req) {
+        routerCacheEnqueue(req, false, "Router configuration synchronized",
+                           "admin-sync-cache");
+      },
+      nullptr, bodyCollect);
+
+  _server->on(
+      "/api/router/cache/refresh", HTTP_POST,
+      [this, routerCacheEnqueue](AsyncWebServerRequest *req) {
+        routerCacheEnqueue(req, true, "Router information refreshed",
+                           "admin-refresh-cache");
+      },
+      nullptr, bodyCollect);
+
+  _server->on("/api/router/jobs/*", HTTP_GET, [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_routerWorker) {
+      sendError(req, 503, "Router worker unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    const String url = req->url();
+    const int marker = url.lastIndexOf('/');
+    if (marker < 0 || marker + 1 >= static_cast<int>(url.length())) {
+      sendError(req, 400, "Job id required", "INVALID_JOB_ID");
+      return;
+    }
+    const uint32_t jobId =
+        static_cast<uint32_t>(strtoul(url.c_str() + marker + 1, nullptr, 10));
+    if (jobId == 0) {
+      sendError(req, 400, "Job id required", "INVALID_JOB_ID");
+      return;
+    }
+    RouterProvisioningWorker::JobRecord job;
+    if (!_routerWorker->pollJob(jobId, job)) {
+      sendError(req, 404, "Job not found", "JOB_NOT_FOUND");
+      return;
+    }
+    // Admin Test/Sync envelopes include profile inventories — must fit the
+    // nested result JSON. A 384-byte doc truncates/drops result and the UI
+    // falsely shows "API unreachable / login failed" despite worker success.
+    const size_t capacity =
+        RenzFiConfig::JSON_DOC_MEDIUM +
+        (job.result.body.length() > 0 ? job.result.body.length() : 0);
+    DynamicJsonDocument doc(capacity);
+    doc["success"] = true;
+    JsonObject data = doc["data"].to<JsonObject>();
+    data["jobId"] = job.jobId;
+    data["state"] = RouterProvisioningWorker::jobStateLabel(job.state);
+    const bool terminal =
+        job.state == RouterProvisioningWorker::JobState::Completed ||
+        job.state == RouterProvisioningWorker::JobState::Failed;
+    if (terminal) {
+      data["httpStatus"] = job.result.httpStatus;
+      if (!job.result.body.isEmpty()) {
+        data["result"] = serialized(job.result.body);
+      }
+    }
+    if (!job.stageId.isEmpty()) data["stage"] = job.stageId;
+    if (!job.stageLabel.isEmpty()) data["label"] = job.stageLabel;
+    String body;
+    serializeJson(doc, body);
+    logRequest(req, "admin-router-job-poll");
+    AsyncWebServerResponse *res =
+        req->beginResponse(200, "application/json", body);
+    addCorsHeaders(res);
+    res->addHeader("Cache-Control", "no-store");
+    req->send(res);
+  });
+
+  // ── Ethernet network config (DHCP-first, optional static) ────────────────
+  // GET is intentionally readable pre-FullAccess (Session only) so the
+  // first-run setup wizard can show current mode/MAC before a password has
+  // been chosen; POST/PUT require FullAccess like other provisioning writes.
   _server->on("/api/system/wifi/config", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
-                if (!requireAuth(req)) return;
+    RENZFI_PROD_GATE(req);
+                if (!requireAuth(req, AuthRequirement::Session)) return;
+                const NetworkSettings settings = _networkSettings
+                    ? _networkSettings->settings()
+                    : NetworkSettingsManager::factoryDefaults();
+
                 DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
-                data["mode"]    = "ethernet-static";
-                data["ip"]      = W5500Config::IP.toString();
-                data["gateway"] = W5500Config::GATEWAY.toString();
-                data["subnet"]  = W5500Config::SUBNET.toString();
-                data["dns"]     = W5500Config::DNS.toString();
-                data["note"]    =
-                    "Network config is compile-time static (W5500Config.h). "
-                    "Reflash firmware to change IP settings.";
+                data["addressMode"] = ethernetAddressModeLabel(settings.addressMode);
+                data["provisioned"] = settings.provisioned;
+                data["staticIp"]           = settings.staticIp;
+                data["staticGateway"]      = settings.staticGateway;
+                data["staticSubnetMask"]   = settings.staticSubnetMask;
+                data["staticDnsPrimary"]   = settings.staticDnsPrimary;
+                data["staticDnsSecondary"] = settings.staticDnsSecondary;
+
+                // Live driver state — reflects what's actually running now,
+                // which may differ from the saved config until next reboot.
+                data["current"]["mode"]    = _eth ? _eth->addressModeLabel() : "dhcp";
+                data["current"]["ip"]      = _eth ? _eth->ip() : "";
+                data["current"]["gateway"] = _eth ? _eth->gateway() : "";
+                data["current"]["netmask"] = _eth ? _eth->subnet() : "";
+                data["current"]["dns"]     = _eth ? _eth->dns() : "";
+                data["current"]["mac"]     = _eth ? _eth->macAddress() : "";
+
+                // DHCP-reservation guidance for the setup wizard (MikroTik).
+                const String mac = _eth ? _eth->macAddress() : "";
+                data["dhcpReservation"]["mac"] = mac;
+                data["dhcpReservation"]["routerOsExample"] =
+                    mac.length() > 0
+                        ? "/ip dhcp-server lease add mac-address=" + mac +
+                              " address=<desired-ip> server=<dhcp-server-name>"
+                        : "";
+
                 sendOk(req, data);
               });
 
-  auto wifiConfigRO = [this](AsyncWebServerRequest *req) {
-    if (!requireAuth(req)) return;
-    sendError(req, 405,
-              "Network config is static (W5500 wired). "
-              "Edit W5500Config.h and reflash to change IP settings.",
-              "STATIC_CONFIG");
+  auto wifiConfigWrite = [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+
+    DynamicJsonDocument body(RenzFiConfig::JSON_DOC_SMALL);
+    String raw = getBody(req);
+    if (raw.length() > 0) deserializeJson(body, raw);
+
+    if (!_networkSettings) {
+      sendError(req, 500, "Network settings unavailable", "NETWORK_SETTINGS_UNAVAILABLE");
+      return;
+    }
+
+    NetworkSettings settings = _networkSettings->settings();
+
+    const char *modeStr = body["addressMode"] | ethernetAddressModeLabel(settings.addressMode);
+    settings.addressMode = parseEthernetAddressMode(modeStr);
+    if (!body["staticIp"].isNull())           settings.staticIp = body["staticIp"].as<const char *>();
+    if (!body["staticGateway"].isNull())      settings.staticGateway = body["staticGateway"].as<const char *>();
+    if (!body["staticSubnetMask"].isNull())   settings.staticSubnetMask = body["staticSubnetMask"].as<const char *>();
+    if (!body["staticDnsPrimary"].isNull())   settings.staticDnsPrimary = body["staticDnsPrimary"].as<const char *>();
+    if (!body["staticDnsSecondary"].isNull()) settings.staticDnsSecondary = body["staticDnsSecondary"].as<const char *>();
+    settings.provisioned = true;
+
+    String validationError;
+    if (!_networkSettings->save(settings, &validationError)) {
+      sendError(req, 400,
+                validationError.length() > 0 ? validationError : "Invalid network configuration",
+                "INVALID_NETWORK_CONFIG");
+      return;
+    }
+
+    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+    data["addressMode"] = ethernetAddressModeLabel(settings.addressMode);
+    data["provisioned"] = settings.provisioned;
+    data["rebootRequired"] = true;
+    sendOk(req, data,
+          "Network settings saved. Reboot the appliance to apply the new Ethernet configuration.");
   };
-  _server->on("/api/system/wifi/config", HTTP_POST, wifiConfigRO);
-  _server->on("/api/system/wifi/config", HTTP_PUT,  wifiConfigRO);
+  _server->on("/api/system/wifi/config", HTTP_POST, wifiConfigWrite, nullptr, bodyCollect);
+  _server->on("/api/system/wifi/config", HTTP_PUT,  wifiConfigWrite, nullptr, bodyCollect);
 
   // ── Portal session API (/api/portal/*) ────────────────────────────────────
   // These endpoints are intentionally open (no requireAuth) — called by the
   // MikroTik-hosted captive portal JS from the customer's device.
+  // Use RENZFI_PORTAL_GATE (not management) so Hotspot guests may call them.
+
+  // Explicit CORS preflight for cross-origin JSON POSTs from the MikroTik
+  // Hotspot origin. Prefix match (/api/portal/*) so OPTIONS for terminate,
+  // heartbeat, etc. is handled here — not only via onNotFound fallback.
+  // Policy is identical to WebResponse::serveOptions / addCorsHeaders.
+  _server->on("/api/portal/*", HTTP_OPTIONS, [this](AsyncWebServerRequest *req) {
+    RENZFI_PORTAL_GATE(req);
+    WebResponse::serveOptions(req);
+  });
 
   _server->on("/api/portal/branding", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
+    RENZFI_PORTAL_GATE(req);
+                NetworkDiagnostics::logPortalApiDebug(req, "/api/portal/branding");
                 if (!_portalConfig) {
                   sendError(req, 500, "Portal config unavailable", "NOT_READY");
                   return;
                 }
-                DynamicJsonDocument data(512);
-                String base = "http://" + W5500Config::IP.toString();
-                _portalConfig->fillBrandingJson(data.to<JsonObject>(), base);
-                sendOk(req, data);
-              });
-
-  _server->on("/api/portal/assets/banner", HTTP_GET,
-              [this](AsyncWebServerRequest *req) {
-                if (_portalConfig && _portalConfig->serveBanner(req)) return;
-                Serial.printf(
-                    "[portal] GET assets/banner NOT_FOUND hasCustom=%s\n",
-                    (_portalConfig && _portalConfig->hasCustomBanner()) ? "yes"
-                                                                        : "no");
-                sendError(req, 404, "Banner not found", "NOT_FOUND");
-              });
-
-  _server->on("/api/portal/assets/music", HTTP_GET,
-              [this](AsyncWebServerRequest *req) {
-                if (_portalConfig && _portalConfig->serveMusic(req)) return;
-                Serial.printf(
-                    "[portal] GET assets/music NOT_FOUND hasCustom=%s\n",
-                    (_portalConfig && _portalConfig->hasCustomMusic()) ? "yes"
-                                                                       : "no");
-                sendError(req, 404, "Music not found", "NOT_FOUND");
+                HeapJsonDocument dataHeap(512);
+                String base = (_eth && _eth->hasIp())
+                                  ? ("http://" + _eth->ip())
+                                  : String(ManagementApConfig::PORTAL_URL);
+                _portalConfig->fillBrandingJson(dataHeap.doc().to<JsonObject>(), base);
+                sendOk(req, dataHeap.doc());
               });
 
   _server->on("/api/portal/session", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
-                logRequest(req, "portal.session");
+    RENZFI_PORTAL_GATE(req);
+                NetworkDiagnostics::logPortalApiDebug(req, "/api/portal/session");
                 String mac = req->hasArg("mac") ? req->arg("mac") : "";
                 String ip  = req->hasArg("ip")  ? req->arg("ip")  : "";
                 if (mac.isEmpty()) {
                   sendError(req, 400, "mac parameter required", "MISSING_MAC");
                   return;
                 }
-                DynamicJsonDocument doc(RenzFiConfig::JSON_DOC_MEDIUM);
-                if (_portalSessions && _portalSessions->getSession(mac, ip, doc))
-                  sendOk(req, doc);
+                HeapJsonDocument docHeap(RenzFiConfig::JSON_DOC_SMALL);
+                if (_portalSessions &&
+                    _portalSessions->getSession(mac, ip, docHeap.doc()))
+                  sendOk(req, docHeap.doc());
                 else
                   sendError(req, 500, "Failed to load session", "SESSION_ERROR");
               });
@@ -1761,8 +3245,10 @@ void ApiServer::registerRoutes() {
   _server->on(
       "/api/portal/start-coin-session", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
-        logRequest(req, "portal.start-coin-session");
-        DynamicJsonDocument body(RenzFiConfig::JSON_DOC_MEDIUM);
+    RENZFI_PORTAL_GATE(req);
+        NetworkDiagnostics::logPortalApiDebug(req, "/api/portal/start-coin-session");
+        HeapJsonDocument bodyHeap(512);
+        DynamicJsonDocument &body = bodyHeap.doc();
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
         String mac = body["mac"] | "";
@@ -1776,9 +3262,9 @@ void ApiServer::registerRoutes() {
           return;
         }
         if (_portalSessions && _portalSessions->startCoinWindow(mac, ip)) {
-          DynamicJsonDocument out(RenzFiConfig::JSON_DOC_MEDIUM);
-          _portalSessions->getSession(mac, ip, out);
-          sendOk(req, out, "Coin window opened");
+          HeapJsonDocument outHeap(RenzFiConfig::JSON_DOC_SMALL);
+          _portalSessions->getSession(mac, ip, outHeap.doc());
+          sendOk(req, outHeap.doc(), "Coin window opened");
         } else {
           sendError(req, 500, "Failed to open coin window", "SESSION_ERROR");
         }
@@ -1788,8 +3274,132 @@ void ApiServer::registerRoutes() {
   _server->on(
       "/api/portal/done-paying", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
+    RENZFI_PORTAL_GATE(req);
         logRequest(req, "portal.done-paying");
-        DynamicJsonDocument body(RenzFiConfig::JSON_DOC_MEDIUM);
+        Serial.printf("[portal] heap before done-paying free=%u min=%u\n",
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)ESP.getMinFreeHeap());
+        HeapJsonDocument bodyHeap(512);
+        DynamicJsonDocument &body = bodyHeap.doc();
+        String raw = getBody(req);
+        if (raw.length() > 0) deserializeJson(body, raw);
+        String mac = body["mac"] | "";
+        String ip  = body["ip"] | "";
+        if (mac.isEmpty()) {
+          sendError(req, 400, "mac field required", "MISSING_MAC");
+          return;
+        }
+        if (!_portalSessions) {
+          sendError(req, 500, "Portal session manager not ready", "NOT_READY");
+          return;
+        }
+        String errorCode;
+        if (_portalSessions->donePaying(mac, errorCode, ip)) {
+          Serial.println("[portal] done-paying before response json");
+          HeapJsonDocument heapOut(RenzFiConfig::JSON_DOC_SMALL);
+          _portalSessions->getSession(mac, ip, heapOut.doc());
+          Serial.println("[portal] done-paying after response json");
+          Serial.println("[portal] done-paying before send");
+          sendOk(req, heapOut.doc(), "Session activating");
+          Serial.printf("[portal] heap after done-paying free=%u min=%u\n",
+                        (unsigned)ESP.getFreeHeap(),
+                        (unsigned)ESP.getMinFreeHeap());
+          Serial.println("[portal] done-paying after send");
+        } else if (errorCode == "NO_CREDITS") {
+          sendError(req, 400,
+                    "No credits to convert — insert coins first", "NO_CREDITS");
+        } else if (errorCode == "NO_MINUTES") {
+          sendError(req, 400, "No purchased minutes available", "NO_MINUTES");
+        } else if (errorCode == "ACTIVATION_QUEUE_FULL") {
+          sendError(req, 503, "Activation queue full — credits preserved",
+                    "ACTIVATION_QUEUE_FULL");
+        } else if (errorCode == "SESSION_NOT_FOUND") {
+          sendError(req, 404, "Portal session not found", "SESSION_NOT_FOUND");
+        } else if (errorCode == "VOUCHER_SESSION") {
+          sendError(req, 409, "Use voucher flow for voucher sessions",
+                    "VOUCHER_SESSION");
+        } else {
+          sendError(req, 500,
+                    errorCode.isEmpty() ? "Done paying failed" : errorCode.c_str(),
+                    errorCode.isEmpty() ? "SESSION_ERROR" : errorCode.c_str());
+        }
+      },
+      nullptr, bodyCollect);
+
+  _server->on(
+      "/api/portal/voucher/redeem", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+        RENZFI_PORTAL_GATE(req);
+        HeapJsonDocument bodyHeap(512);
+        DynamicJsonDocument &body = bodyHeap.doc();
+        String raw = getBody(req);
+        if (!raw.isEmpty()) deserializeJson(body, raw);
+        const String code = body["code"] | "";
+        const String mac = body["mac"] | "";
+        const String ip = body["ip"] | "";
+        if (code.isEmpty() || mac.isEmpty()) {
+          sendError(req, 400, "Voucher code and MAC are required",
+                    "INVALID_VOUCHER");
+          return;
+        }
+        HeapJsonDocument outHeap(RenzFiConfig::JSON_DOC_SMALL);
+        String errorCode;
+        if (_portalSessions &&
+            _portalSessions->redeemVoucher(code, mac, ip, outHeap.doc(),
+                                            errorCode)) {
+          sendOk(req, outHeap.doc(), "Voucher activating");
+          return;
+        }
+        int status = 409;
+        if (errorCode == "VOUCHER_NOT_FOUND") status = 404;
+        else if (errorCode == "CLOCK_NOT_READY" ||
+                 errorCode == "STORAGE_ERROR" ||
+                 errorCode == "ACTIVATION_QUEUE_FULL")
+          status = 503;
+        sendError(req, status, "Voucher redemption failed",
+                  errorCode.isEmpty() ? "VOUCHER_UNAVAILABLE" : errorCode);
+      },
+      nullptr, bodyCollect);
+
+  _server->on(
+      "/api/portal/voucher/reconnect", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+        RENZFI_PORTAL_GATE(req);
+        HeapJsonDocument bodyHeap(256);
+        DynamicJsonDocument &body = bodyHeap.doc();
+        String raw = getBody(req);
+        if (!raw.isEmpty()) deserializeJson(body, raw);
+        const String mac = body["mac"] | "";
+        const String ip = body["ip"] | "";
+        if (mac.isEmpty()) {
+          sendError(req, 400, "MAC is required", "MISSING_MAC");
+          return;
+        }
+        HeapJsonDocument outHeap(RenzFiConfig::JSON_DOC_SMALL);
+        String errorCode;
+        if (_portalSessions &&
+            _portalSessions->reconnectVoucher(mac, ip, outHeap.doc(),
+                                               errorCode)) {
+          sendOk(req, outHeap.doc(), "Voucher reconnect activating");
+          return;
+        }
+        int status = errorCode == "VOUCHER_EXPIRED" ? 410 : 409;
+        if (errorCode == "CLOCK_NOT_READY" ||
+            errorCode == "ACTIVATION_QUEUE_FULL")
+          status = 503;
+        sendError(req, status,
+                  "Voucher reconnect failed",
+                  errorCode.isEmpty() ? "VOUCHER_UNAVAILABLE" : errorCode);
+      },
+      nullptr, bodyCollect);
+
+  _server->on(
+      "/api/portal/pause", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+    RENZFI_PORTAL_GATE(req);
+        logRequest(req, "portal.pause");
+        HeapJsonDocument bodyHeap(256);
+        DynamicJsonDocument &body = bodyHeap.doc();
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
         String mac = body["mac"] | "";
@@ -1801,41 +3411,28 @@ void ApiServer::registerRoutes() {
           sendError(req, 500, "Portal session manager not ready", "NOT_READY");
           return;
         }
-        if (_portalSessions->donePaying(mac)) {
-          DynamicJsonDocument out(RenzFiConfig::JSON_DOC_MEDIUM);
-          _portalSessions->getSession(mac, "", out);
-          sendOk(req, out, "Session activated");
-        } else {
-          sendError(req, 400,
-                    "No credits to convert — insert coins first", "NO_CREDITS");
-        }
-      },
-      nullptr, bodyCollect);
-
-  _server->on(
-      "/api/portal/pause", HTTP_POST,
-      [this](AsyncWebServerRequest *req) {
-        logRequest(req, "portal.pause");
-        DynamicJsonDocument body(256);
-        String raw = getBody(req);
-        if (raw.length() > 0) deserializeJson(body, raw);
-        String mac = body["mac"] | "";
-        if (mac.isEmpty()) {
-          sendError(req, 400, "mac field required", "MISSING_MAC");
-          return;
-        }
-        if (_portalSessions && _portalSessions->pause(mac))
+        String errorCode;
+        if (_portalSessions->pause(mac, &errorCode)) {
           sendOk(req, "Session paused");
-        else
-          sendError(req, 404, "Session not found", "NOT_FOUND");
+        } else if (errorCode == "SESSION_NOT_FOUND") {
+          sendError(req, 404, "Session not found", "SESSION_NOT_FOUND");
+        } else if (errorCode == "PAUSE_LIMIT_REACHED") {
+          sendError(req, 409,
+                    "Pause limit reached for this session", "PAUSE_LIMIT_REACHED");
+        } else {
+          sendError(req, 409, "Session cannot be paused right now",
+                    errorCode.isEmpty() ? "PAUSE_NOT_ALLOWED" : errorCode.c_str());
+        }
       },
       nullptr, bodyCollect);
 
   _server->on(
       "/api/portal/resume", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
+    RENZFI_PORTAL_GATE(req);
         logRequest(req, "portal.resume");
-        DynamicJsonDocument body(256);
+        HeapJsonDocument bodyHeap(256);
+        DynamicJsonDocument &body = bodyHeap.doc();
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
         String mac = body["mac"] | "";
@@ -1843,18 +3440,32 @@ void ApiServer::registerRoutes() {
           sendError(req, 400, "mac field required", "MISSING_MAC");
           return;
         }
-        if (_portalSessions && _portalSessions->resume(mac))
+        if (!_portalSessions) {
+          sendError(req, 500, "Portal session manager not ready", "NOT_READY");
+          return;
+        }
+        String errorCode;
+        if (_portalSessions->resume(mac, &errorCode)) {
           sendOk(req, "Session resumed");
-        else
-          sendError(req, 404, "Session not found", "NOT_FOUND");
+        } else if (errorCode == "SESSION_NOT_FOUND") {
+          sendError(req, 404, "Session not found", "SESSION_NOT_FOUND");
+        } else if (errorCode == "ACTIVATION_QUEUE_FULL") {
+          sendError(req, 503, "Activation queue full — purchased time preserved",
+                    "ACTIVATION_QUEUE_FULL");
+        } else {
+          sendError(req, 409, "Session cannot be resumed right now",
+                    errorCode.isEmpty() ? "RESUME_NOT_ALLOWED" : errorCode.c_str());
+        }
       },
       nullptr, bodyCollect);
 
   _server->on(
       "/api/portal/cancel-modal", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
+    RENZFI_PORTAL_GATE(req);
         logRequest(req, "portal.cancel-modal");
-        DynamicJsonDocument body(256);
+        HeapJsonDocument bodyHeap(256);
+        DynamicJsonDocument &body = bodyHeap.doc();
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
         String mac = body["mac"] | "";
@@ -1862,9 +3473,10 @@ void ApiServer::registerRoutes() {
           sendError(req, 400, "mac field required", "MISSING_MAC");
           return;
         }
-        DynamicJsonDocument out(RenzFiConfig::JSON_DOC_MEDIUM);
-        if (_portalSessions && _portalSessions->cancelModal(mac, out))
-          sendOk(req, out, "Modal closed; credits preserved");
+        HeapJsonDocument outHeap(RenzFiConfig::JSON_DOC_SMALL);
+        if (_portalSessions &&
+            _portalSessions->cancelModal(mac, outHeap.doc()))
+          sendOk(req, outHeap.doc(), "Modal closed; credits preserved");
         else
           sendError(req, 500, "Cancel modal failed", "SESSION_ERROR");
       },
@@ -1873,8 +3485,10 @@ void ApiServer::registerRoutes() {
   _server->on(
       "/api/portal/reset", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
+    RENZFI_PORTAL_GATE(req);
         logRequest(req, "portal.reset");
-        DynamicJsonDocument body(256);
+        HeapJsonDocument bodyHeap(256);
+        DynamicJsonDocument &body = bodyHeap.doc();
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
         String mac = body["mac"] | "";
@@ -1889,10 +3503,54 @@ void ApiServer::registerRoutes() {
       },
       nullptr, bodyCollect);
 
+  // POST /api/portal/terminate — user-initiated session termination.
+  // Destroys active internet session and disconnects from RouterOS.
+  // Sales records are preserved.
+  _server->on(
+      "/api/portal/terminate", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+    RENZFI_PORTAL_GATE(req);
+        logRequest(req, "portal.terminate");
+        Serial.printf("[portal] heap before terminate free=%u min=%u\n",
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)ESP.getMinFreeHeap());
+        HeapJsonDocument bodyHeap(256);
+        DynamicJsonDocument &body = bodyHeap.doc();
+        String raw = getBody(req);
+        if (raw.length() > 0) deserializeJson(body, raw);
+        String mac = body["mac"] | "";
+        String ip  = body["ip"]  | "";
+        if (mac.isEmpty()) {
+          sendError(req, 400, "mac field required", "MISSING_MAC");
+          return;
+        }
+        if (!_portalSessions) {
+          sendError(req, 500, "Portal session manager not ready", "NOT_READY");
+          return;
+        }
+        if (_portalSessions->terminateSession(mac)) {
+          Serial.println("[portal] terminate before response json");
+          HeapJsonDocument heapOut(RenzFiConfig::JSON_DOC_SMALL);
+          _portalSessions->getSession(mac, ip, heapOut.doc());
+          Serial.println("[portal] terminate after response json");
+          Serial.println("[portal] terminate before send");
+          sendOk(req, heapOut.doc(), "Session terminated");
+          Serial.printf("[portal] heap after terminate free=%u min=%u\n",
+                        (unsigned)ESP.getFreeHeap(),
+                        (unsigned)ESP.getMinFreeHeap());
+          Serial.println("[portal] terminate after send");
+        } else {
+          sendError(req, 404, "No active session to terminate", "NO_SESSION");
+        }
+      },
+      nullptr, bodyCollect);
+
   _server->on(
       "/api/portal/heartbeat", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
-        DynamicJsonDocument body(256);
+    RENZFI_PORTAL_GATE(req);
+        HeapJsonDocument bodyHeap(256);
+        DynamicJsonDocument &body = bodyHeap.doc();
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
         String mac = body["mac"] | "";
@@ -1905,202 +3563,138 @@ void ApiServer::registerRoutes() {
 
   _server->on("/api/portal/rates", HTTP_GET,
               [this](AsyncWebServerRequest *req) {
-                Serial.println("[rates] entered handler");
+    RENZFI_PORTAL_GATE(req);
                 logRequest(req, "portal.rates");
-
-                Serial.printf("[rates] _portalSessions ptr: %s\n",
-                              _portalSessions ? "ok" : "NULL");
                 if (!_portalSessions) {
-                  Serial.println("[rates] FAILED: _portalSessions is NULL");
                   sendError(req, 500, "Failed to load rates", "PROMO_ERROR");
                   return;
                 }
-
-                Serial.println("[rates] allocating JSON document");
-                DynamicJsonDocument doc(RenzFiConfig::JSON_DOC_MEDIUM);
-                Serial.printf("[rates] JSON_DOC_MEDIUM = %u bytes\n",
-                              (unsigned)RenzFiConfig::JSON_DOC_MEDIUM);
-
-                Serial.println("[rates] calling getRates()");
-                bool ok = _portalSessions->getRates(doc);
-                Serial.printf("[rates] getRates() returned: %s\n",
-                              ok ? "true" : "false");
-
-                if (ok) {
-                  Serial.println("[rates] building response");
-                  sendOk(req, doc);
-                  Serial.println("[rates] response sent OK");
+                HeapJsonDocument docHeap(RenzFiConfig::JSON_DOC_MEDIUM);
+                if (_portalSessions->getRates(docHeap.doc())) {
+                  sendOk(req, docHeap.doc());
                 } else {
-                  Serial.println("[rates] FAILED: getRates() returned false");
                   sendError(req, 500, "Failed to load rates", "PROMO_ERROR");
                 }
               });
 
   Serial.println("[boot] Portal session API routes registered:");
+  Serial.println("[boot]   OPTIONS /api/portal/*");
   Serial.println("[boot]   GET  /api/portal/branding");
-  Serial.println("[boot]   GET  /api/portal/assets/banner");
-  Serial.println("[boot]   GET  /api/portal/assets/music");
   Serial.println("[boot]   GET  /api/portal/session");
   Serial.println("[boot]   POST /api/portal/start-coin-session");
   Serial.println("[boot]   POST /api/portal/done-paying");
+  Serial.println("[boot]   POST /api/portal/voucher/redeem");
+  Serial.println("[boot]   POST /api/portal/voucher/reconnect");
   Serial.println("[boot]   POST /api/portal/pause");
   Serial.println("[boot]   POST /api/portal/resume");
   Serial.println("[boot]   POST /api/portal/cancel-modal");
   Serial.println("[boot]   POST /api/portal/reset");
+  Serial.println("[boot]   POST /api/portal/terminate");
   Serial.println("[boot]   POST /api/portal/heartbeat");
   Serial.println("[boot]   GET  /api/portal/rates");
+}
 
-  // ── Customer portal (/ and /portal) ──────────────────────────────────────
-  _server->on("/", HTTP_GET,
-              [this](AsyncWebServerRequest *req) { sendStaticOrIndex(req); });
-  _server->on("/portal", HTTP_GET,
-              [this](AsyncWebServerRequest *req) { sendStaticOrIndex(req); });
+const char *ApiServer::providerName() const {
+  return "ApiServer";
+}
 
-  // ── Admin React SPA shell routes ──────────────────────────────────────────
-  _server->on("/admin",                HTTP_GET,
-              [this](AsyncWebServerRequest *req) { sendStaticOrIndex(req); });
-  _server->on("/login",                HTTP_GET,
-              [this](AsyncWebServerRequest *req) { sendStaticOrIndex(req); });
-  _server->on("/dashboard",            HTTP_GET,
-              [this](AsyncWebServerRequest *req) { sendStaticOrIndex(req); });
-  _server->on("/manifest.webmanifest", HTTP_GET,
-              [this](AsyncWebServerRequest *req) { sendStaticOrIndex(req); });
-  _server->on("/sw.js",                HTTP_GET,
-              [this](AsyncWebServerRequest *req) { sendStaticOrIndex(req); });
-  _server->on("/favicon.svg",          HTTP_GET,
-              [this](AsyncWebServerRequest *req) { sendStaticOrIndex(req); });
-  _server->on("/favicon.ico",          HTTP_GET,
-              [this](AsyncWebServerRequest *req) { sendStaticOrIndex(req); });
+int ApiServer::notFoundPriority() const {
+  return 20;
+}
 
-  Serial.println("[boot] Frontend routes registered:");
-  Serial.println("[boot]   GET /assets/*  -> SPIFFS /assets/ (immutable cache)");
-  Serial.println("[boot]   GET /, /portal -> SPIFFS /portal/index.html");
-  Serial.println("[boot]   GET /portal/*  -> SPIFFS /portal/* (portal assets)");
-  Serial.println("[boot]   GET /admin, /admin/* -> SPIFFS /index.html (admin React SPA)");
-  Serial.println("[boot]   GET /manifest.webmanifest, /sw.js, /favicon.*");
-  Serial.println("[boot]   onNotFound: parameterized API routes + SPA fallback");
+bool ApiServer::handleNotFound(AsyncWebServerRequest *req) {
+  if (!HttpPlaneGate::ensureProductionPlane(req)) return true;
+  const String path   = req->url();
+  const int    method = req->method();
 
-  registerRenzFiPortalRoutes(*_server, SPIFFS);
-
-  // ── Not-found handler ─────────────────────────────────────────────────────
-  // Handles:
-  //   • CORS preflight (OPTIONS) on any path
-  //   • /admin/* SPA fallback
-  //   • Parameterised API routes: /api/promos/{id}, /api/vouchers/{code},
-  //     /api/sales/chart/{period}
-  //   • /portal/*, /login/*, /dashboard/* SPA/static sub-paths
-  //   • /api/* catch-all 404
-  //   • Everything else → sendStaticOrIndex
-  _server->onNotFound([this](AsyncWebServerRequest *req) {
-    const String path   = req->url();
-    const int    method = req->method();
-
-    // CORS preflight for any path
-    if (method == HTTP_OPTIONS) {
-      AsyncWebServerResponse *res = req->beginResponse(204, "text/plain", "");
-      addCorsHeaders(res);
-      req->send(res);
-      return;
+  // /api/promos/{id}  PUT | DELETE
+  if (path.startsWith("/api/promos/")) {
+    if (!requireAuth(req)) return true;
+    int id = path.substring(12).toInt();
+    if (method == HTTP_PUT) {
+      DynamicJsonDocument body(RenzFiConfig::JSON_DOC_MEDIUM);
+      String raw = getBody(req);
+      if (raw.length() > 0) deserializeJson(body, raw);
+      if (_promos->update(id, body.as<JsonObjectConst>())) sendOk(req);
+      else sendError(req, 404, "Promo not found", "PROMO_NOT_FOUND");
+      return true;
     }
-
-    // /admin/* — serve React SPA index
-    if (serveRenzFiAdminSpaFallback(req, SPIFFS)) return;
-
-    // /api/promos/{id}  PUT | DELETE
-    if (path.startsWith("/api/promos/")) {
-      if (!requireAuth(req)) return;
-      int id = path.substring(12).toInt();
-      if (method == HTTP_PUT) {
-        DynamicJsonDocument body(RenzFiConfig::JSON_DOC_MEDIUM);
-        String raw = getBody(req);
-        if (raw.length() > 0) deserializeJson(body, raw);
-        if (_promos->update(id, body.as<JsonObjectConst>())) sendOk(req);
-        else sendError(req, 404, "Promo not found", "PROMO_NOT_FOUND");
-        return;
-      }
-      if (method == HTTP_DELETE) {
-        if (_promos->remove(id)) sendOk(req);
-        else sendError(req, 404, "Promo not found", "PROMO_NOT_FOUND");
-        return;
-      }
-      sendError(req, 405, "Method not allowed", "METHOD_NOT_ALLOWED");
-      return;
+    if (method == HTTP_DELETE) {
+      if (_promos->remove(id)) sendOk(req);
+      else sendError(req, 404, "Promo not found", "PROMO_NOT_FOUND");
+      return true;
     }
+    sendError(req, 405, "Method not allowed", "METHOD_NOT_ALLOWED");
+    return true;
+  }
 
-    // /api/vouchers/{code}  GET | DELETE
-    if (path.startsWith("/api/vouchers/")) {
-      if (!requireAuth(req)) return;
-      String code = urlDecode(path.substring(14));
-      if (method == HTTP_GET) {
-        DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+  // /api/vouchers/{code} and owner lifecycle actions.
+  // Rule #7 (Setup Simplification Pass): Vouchers is Administrator-only.
+  if (path.startsWith("/api/vouchers/")) {
+    if (path.startsWith("/api/vouchers/jobs/") ||
+        path == "/api/vouchers/bulk-delete") {
+      return false;
+    }
+    if (!requireOwnerAuth(req)) return true;
+    String voucherPath = path.substring(14);
+    String action;
+    const int slash = voucherPath.lastIndexOf('/');
+    if (slash > 0) {
+      action = voucherPath.substring(slash + 1);
+      voucherPath = voucherPath.substring(0, slash);
+    }
+    String code = urlDecode(voucherPath);
+    if (method == HTTP_POST && !action.isEmpty()) {
+      if (action != "terminate" && action != "expire" &&
+          action != "disable" && action != "archive") {
+        sendError(req, 404, "Voucher action not found", "NOT_FOUND");
+        return true;
+      }
+      HeapJsonDocument bodyHeap(256);
+      DynamicJsonDocument &body = bodyHeap.doc();
+      const String raw = getBody(req);
+      if (!raw.isEmpty()) deserializeJson(body, raw);
+      String reason = body["reason"] | "";
+      if (reason.isEmpty()) reason = String("owner_") + action;
+      String errorCode;
+      if (_portalSessions &&
+          _portalSessions->administerVoucher(code, action, reason,
+                                              errorCode)) {
+        HeapJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
         if (_vouchers->find(code, data)) sendOk(req, data);
-        else sendError(req, 404, "Voucher not found", "VOUCHER_NOT_FOUND");
-        return;
+        else sendOk(req, "Voucher updated");
+      } else {
+        sendError(req, errorCode == "VOUCHER_NOT_FOUND" ? 404 : 409,
+                  "Voucher action rejected",
+                  errorCode.isEmpty() ? "INVALID_VOUCHER_STATE" : errorCode);
       }
-      if (method == HTTP_DELETE) {
-        if (_vouchers->remove(code)) sendOk(req);
-        else sendError(req, 404, "Voucher not found", "VOUCHER_NOT_FOUND");
-        return;
-      }
-      sendError(req, 405, "Method not allowed", "METHOD_NOT_ALLOWED");
-      return;
+      return true;
     }
-
-    // /api/sales/chart/{daily|weekly|monthly}
-    if (path.startsWith("/api/sales/chart/")) {
-      if (!requireAuth(req)) return;
-      if (method == HTTP_GET) {
-        int days = 7;
-        if (path.endsWith("/weekly")) days = 28;
-        else if (path.endsWith("/monthly")) days = 180;
-        DynamicJsonDocument data(2048);
-        if (_sessions->salesChart(data, days)) sendOk(req, data);
-        else sendError(req, 500, "Unable to build sales chart", "SALES_CHART_ERROR");
-        return;
-      }
-      sendError(req, 405, "Method not allowed", "METHOD_NOT_ALLOWED");
-      return;
+    if (method == HTTP_GET) {
+      DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+      if (_vouchers->find(code, data)) sendOk(req, data);
+      else sendError(req, 404, "Voucher not found", "VOUCHER_NOT_FOUND");
+      return true;
     }
-
-    // Sub-paths for static-served SPA roots
-    if (path.startsWith("/portal/") || path.startsWith("/login/") ||
-        path.startsWith("/dashboard/")) {
-      sendStaticOrIndex(req);
-      return;
+    if (method == HTTP_DELETE) {
+      if (_vouchers->remove(code)) sendOk(req);
+      else sendError(req, 404, "Voucher not found", "VOUCHER_NOT_FOUND");
+      return true;
     }
+    sendError(req, 405, "Method not allowed", "METHOD_NOT_ALLOWED");
+    return true;
+  }
 
-    // /api/* — 404 JSON
-    if (path.startsWith("/api/")) {
-      IPAddress remoteIp = requestRemoteIp(req);
-      Serial.printf("[tcp] 404 %s %s from=%s local=%s\n",
-                    methodStr(req->method()), path.c_str(),
-                    remoteIp.toString().c_str(),
-                    W5500Config::IP.toString().c_str());
-      sendError(req, 404, "API endpoint not found", "NOT_FOUND");
-      return;
-    }
+  // /api/* — 404 JSON
+  if (path.startsWith("/api/")) {
+    WebRequestDiagnostics::logRequest(req, "api-404");
+    sendError(req, 404, "API endpoint not found", "NOT_FOUND");
+    return true;
+  }
 
-    // /assets/* missing from SPIFFS (serveStatic already matched found files)
-    if (path.startsWith("/assets/")) {
-      IPAddress remoteIp = requestRemoteIp(req);
-      Serial.printf("[tcp] 404 %s %s from=%s local=%s (missing asset)\n",
-                    methodStr(req->method()), path.c_str(),
-                    remoteIp.toString().c_str(),
-                    W5500Config::IP.toString().c_str());
-      AsyncWebServerResponse *res =
-          req->beginResponse(404, "text/plain", "Not Found");
-      addCorsHeaders(res);
-      res->addHeader("Cache-Control", "no-store");
-      req->send(res);
-      return;
-    }
+  return false;
+}
 
-    // Catch-all → SPA or static SPIFFS file
-    IPAddress remoteIp = requestRemoteIp(req);
-    Serial.printf("[tcp] %s %s from=%s local=%s -> SPA\n",
-                  methodStr(req->method()), path.c_str(),
-                  remoteIp.toString().c_str(),
-                  W5500Config::IP.toString().c_str());
-    sendStaticOrIndex(req);
-  });
+void ApiServer::registerRoutes(WebServerManager &web) {
+  registerProductionRoutes(web);
 }

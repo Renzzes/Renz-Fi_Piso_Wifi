@@ -1,0 +1,7 @@
+{
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/ESP32_S3_Firmware/compile_commands.json",
+  "C_Cpp.default.configurationProvider": "platformio.platformio-ide",
+  "files.associations": {
+    "*.ino": "cpp"
+  }
+}

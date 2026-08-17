@@ -1,5 +1,6 @@
 package com.renzfi.owner.ui.screens
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -8,14 +9,20 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -38,14 +45,17 @@ import com.renzfi.owner.model.VendoDevice
 import com.renzfi.owner.ui.components.DeleteConfirmDialog
 import com.renzfi.owner.ui.components.OnlineStatusBadge
 import com.renzfi.owner.ui.components.RenzFiTopBar
+import com.renzfi.owner.util.DateUtils
 import com.renzfi.owner.viewmodel.SettingsUiState
 
 @Composable
 fun SettingsScreen(
     uiState: SettingsUiState,
     onAddDevice: () -> Unit,
+    onOpenDevice: (VendoDevice) -> Unit,
     onEditDevice: (VendoDevice) -> Unit,
     onDeleteDevice: (VendoDevice) -> Unit,
+    onCheckForUpdates: () -> Unit,
     onAbout: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
@@ -109,6 +119,7 @@ fun SettingsScreen(
                 uiState.devices.forEach { device ->
                     SettingsDeviceItem(
                         device = device,
+                        onOpenDevice = { onOpenDevice(device) },
                         onEdit = { onEditDevice(device) },
                         onDelete = { deviceToDelete = device },
                     )
@@ -119,6 +130,18 @@ fun SettingsScreen(
             Spacer(modifier = Modifier.height(24.dp))
             HorizontalDivider()
             Spacer(modifier = Modifier.height(16.dp))
+
+            // ── App Updates summary ───────────────────────────────────────────
+            AppUpdatesSummary(
+                uiState = uiState,
+                onCheckForUpdates = onCheckForUpdates,
+                onManageInAbout = onAbout,
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(modifier = Modifier.height(16.dp))
+
             TextButton(
                 onClick = onAbout,
                 modifier = Modifier.fillMaxWidth(),
@@ -136,8 +159,106 @@ fun SettingsScreen(
 }
 
 @Composable
+private fun AppUpdatesSummary(
+    uiState: SettingsUiState,
+    onCheckForUpdates: () -> Unit,
+    onManageInAbout: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "App Updates",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            if (uiState.hasUpdateAvailable) {
+                Badge(containerColor = MaterialTheme.colorScheme.primary) {
+                    Text(
+                        text = "Update available",
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(horizontal = 4.dp),
+                    )
+                }
+            }
+        }
+
+        SettingsInfoRow(
+            label = "Current Version",
+            value = "${uiState.installedVersion} (Build ${uiState.versionCode})",
+        )
+        SettingsInfoRow(
+            label = "Channel",
+            value = uiState.updateChannel.replaceFirstChar { it.uppercase() },
+        )
+        SettingsInfoRow(
+            label = "Last Checked",
+            value = if (uiState.lastUpdateCheckAt == 0L) "Never"
+            else DateUtils.formatTimestamp(uiState.lastUpdateCheckAt),
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(
+                onClick = onCheckForUpdates,
+                modifier = Modifier.weight(1f),
+                enabled = !uiState.isCheckingForUpdates,
+            ) {
+                if (uiState.isCheckingForUpdates) {
+                    CircularProgressIndicator(
+                        modifier = Modifier
+                            .size(16.dp)
+                            .padding(end = 4.dp),
+                        strokeWidth = 2.dp,
+                    )
+                }
+                Text(if (uiState.isCheckingForUpdates) "Checking…" else "Check for Updates")
+            }
+            Button(
+                onClick = onManageInAbout,
+                modifier = Modifier.weight(1f),
+            ) {
+                Icon(
+                    imageVector = Icons.Default.SystemUpdate,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .size(16.dp)
+                        .padding(end = 4.dp),
+                )
+                Text("Manage")
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsInfoRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f),
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
+        )
+    }
+}
+
+@Composable
 private fun SettingsDeviceItem(
     device: VendoDevice,
+    onOpenDevice: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
 ) {
@@ -148,17 +269,23 @@ private fun SettingsDeviceItem(
         ),
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                text = device.name,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-            )
-            Text(
-                text = device.esp32LocalIp,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
-            )
-            OnlineStatusBadge(device = device)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onOpenDevice),
+            ) {
+                Text(
+                    text = device.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = device.esp32LocalIp,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+                )
+                OnlineStatusBadge(device = device)
+            }
             Spacer(modifier = Modifier.height(8.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),

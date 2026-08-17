@@ -12,12 +12,19 @@ import java.util.UUID
  */
 data class VendoDevice(
     @SerializedName("id") val id: String = UUID.randomUUID().toString(),
+    /** Permanent appliance identity from GET /api/health — registry key for fleet mode. */
+    @SerializedName("applianceDeviceId") val applianceDeviceId: String? = null,
     @SerializedName("name") val name: String,
     @SerializedName("mikrotikDisplayName") val mikrotikDisplayName: String = "",
     @SerializedName("mikrotikDdns") val mikrotikDdns: String = "",
     @SerializedName("mikrotikPublicIp") val mikrotikPublicIp: String = "",
     @SerializedName("mikrotikNotes") val mikrotikNotes: String = "",
     @SerializedName("esp32LocalIp") val esp32LocalIp: String = Constants.DEFAULT_ESP32_IP,
+    @SerializedName("firmwareVersion") val firmwareVersion: String = "",
+    @SerializedName("hardwareRevision") val hardwareRevision: String = "",
+    @SerializedName("macAddress") val macAddress: String = "",
+    @SerializedName("routerDriver") val routerDriver: String? = null,
+    @SerializedName("capabilities") val capabilities: DeviceCapabilities? = null,
     @SerializedName("lastSeen") val lastSeen: Long? = null,
     @SerializedName("isOnline") val isOnline: Boolean = false,
     @SerializedName("createdAt") val createdAt: Long = System.currentTimeMillis(),

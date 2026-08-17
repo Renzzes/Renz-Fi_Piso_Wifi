@@ -53,11 +53,51 @@ export type WanStatusDisplay = {
   latency: string;
 };
 
-/** WAN card/row — only when firmware reports a real probe (internet.known === true). */
+/** WAN card/row — prefer structured wan.* from Sync/Test; fall back to internet. */
 export function wanStatusDisplay(
   internet: SystemStatus["internet"] | undefined,
   loading: boolean,
+  wan?: SystemStatus["wan"],
 ): WanStatusDisplay {
+  if (loading) {
+    return { show: true, label: "Loading...", ok: false, variant: "unknown", latency: "—" };
+  }
+  if (wan?.known) {
+    const online = wan.internet === "online";
+    const routeOk = wan.defaultRoute === "available";
+    const routeUnknown = wan.defaultRoute === "unknown";
+    const inetUnknown = wan.internet === "unknown";
+    const dhcpBound = wan.dhcp === "bound";
+    let label = "Offline";
+    let variant: WanStatusDisplay["variant"] = "bad";
+    if (online) {
+      label = "Online";
+      variant = "ok";
+    } else if (inetUnknown && routeOk) {
+      // Route confirmed; ICMP probe skipped/failed — not Offline.
+      label = "Reachability Unverified";
+      variant = "unknown";
+    } else if (inetUnknown || routeUnknown) {
+      label = "Unable to verify";
+      variant = "unknown";
+    } else if (dhcpBound && wan.defaultRoute === "unavailable") {
+      label = "No default route";
+    } else if (wan.dhcp === "searching") {
+      label = "DHCP searching";
+      variant = "unknown";
+    } else if (wan.link === "down") {
+      label = "Link down";
+    } else if (routeOk && !online) {
+      label = "Route up, Internet offline";
+    }
+    return {
+      show: true,
+      label,
+      ok: online,
+      variant,
+      latency: wan.gateway ? `GW ${wan.gateway}` : "—",
+    };
+  }
   if (!isInternetStatusKnown(internet)) {
     return { show: false, label: "—", ok: false, variant: "unknown", latency: "—" };
   }

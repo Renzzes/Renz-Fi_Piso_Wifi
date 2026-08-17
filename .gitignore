@@ -12,11 +12,44 @@ dist
 dist-server
 dist-ssr
 data/
+ESP32_S3_Firmware/data/
+ESP32_S3_Firmware/.pio/
 *.local
+
+# Secrets and local credentials — never commit
+.env
+*.pem
+*.p12
+*.jks
+*.keystore
+keystore.properties
+
+# Incomplete editor scratch
+*.wip
+
+# Android Gradle outputs
+RenzFi-Owner-App/**/build/
+RenzFi-Owner-App/.gradle/
+
+# Generated MikroTik Hotspot portal bundle (run: npm run build:mikrotik-portal)
+# README.md and upload-hotspot-files.rsc in this directory are hand-written
+# and committed; only the generated portal files below are ignored.
+deployment/mikrotik-hotspot/login.html
+deployment/mikrotik-hotspot/admin.html
+deployment/mikrotik-hotspot/renzfi-app.js
+deployment/mikrotik-hotspot/renzfi-style.css
+deployment/mikrotik-hotspot/md5.js
+deployment/mikrotik-hotspot/favicon.ico
+deployment/mikrotik-hotspot/Default-Banner.png
+deployment/mikrotik-hotspot/bg_music.mp3
+deployment/mikrotik-hotspot/coin.mp3
+deployment/mikrotik-hotspot/success.mp3
 
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
+!.vscode/settings.json
+ESP32_S3_Firmware/compile_commands.json
 .idea
 .DS_Store
 *.suo

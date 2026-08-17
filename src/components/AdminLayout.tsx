@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import logo2Src from "../../public/logo2.png";
 import { Link, Outlet, useLocation } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
 import {
   LayoutDashboard,
   Tag,
@@ -16,29 +17,59 @@ import {
   Menu,
   X,
   LogOut,
+  Moon,
+  Sun,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useRealtime } from "@/contexts/RealtimeContext";
+import {
+  fetchInstallationState,
+  isProductionInstallationState,
+} from "@/lib/installationState";
+import { useThemeMode } from "@/lib/theme";
+import {
+  DEFAULT_OPERATOR_PERMISSIONS,
+  pathPermission,
+  type OperatorPermission,
+} from "@/lib/operatorPermissions";
 
-const nav = [
-  { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { to: "/promo-rates", label: "Promo Rates", icon: Tag },
-  { to: "/vouchers", label: "Vouchers", icon: Ticket },
-  { to: "/active-users", label: "Active Users", icon: Users },
-  { to: "/sales-reports", label: "Sales Reports", icon: BarChart3 },
-  { to: "/captive-portal", label: "Captive Portal", icon: MonitorSmartphone },
-  { to: "/coin-settings", label: "Coin Settings", icon: Coins },
-  { to: "/system-configuration", label: "System Configuration", icon: SlidersHorizontal },
-  { to: "/logs", label: "Logs", icon: ScrollText },
-  { to: "/firmware", label: "Firmware Update", icon: Download },
-  { to: "/system-settings", label: "System Settings", icon: Settings },
+const nav: {
+  to: string;
+  label: string;
+  icon: typeof LayoutDashboard;
+  permission?: OperatorPermission | null;
+  ownerOnly?: boolean;
+}[] = [
+  { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard, permission: "dashboard" },
+  { to: "/promo-rates", label: "Promo Rates", icon: Tag, permission: "promo-rates" },
+  { to: "/vouchers", label: "Vouchers", icon: Ticket, permission: "vouchers" },
+  { to: "/active-users", label: "Active Users", icon: Users, permission: "active-users" },
+  { to: "/sales-reports", label: "Sales Reports", icon: BarChart3, permission: "sales-reports" },
+  {
+    to: "/captive-portal",
+    label: "Captive Portal",
+    icon: MonitorSmartphone,
+    permission: "captive-portal",
+  },
+  { to: "/coin-settings", label: "Coin Settings", icon: Coins, permission: "coin-settings" },
+  {
+    to: "/system-configuration",
+    label: "System Configuration",
+    icon: SlidersHorizontal,
+    permission: "system-configuration",
+  },
+  { to: "/logs", label: "Logs", icon: ScrollText, permission: "logs" },
+  { to: "/firmware", label: "Firmware Update", icon: Download, permission: "firmware" },
+  { to: "/system-settings", label: "System Settings", icon: Settings, ownerOnly: true },
 ];
 
 type AdminLayoutProps = {
   adminIp: string;
   onDisconnect: () => void;
   connectionLost?: boolean;
+  isOwner: boolean;
+  permissions?: OperatorPermission[];
 };
 
 function LiveUpdatesBadge() {
@@ -70,9 +101,32 @@ function LiveUpdatesBadge() {
   );
 }
 
-export function AdminLayout({ adminIp, onDisconnect, connectionLost = false }: AdminLayoutProps) {
+export function AdminLayout({
+  adminIp,
+  onDisconnect,
+  connectionLost = false,
+  isOwner,
+  permissions = DEFAULT_OPERATOR_PERMISSIONS,
+}: AdminLayoutProps) {
   const [open, setOpen] = useState(false);
   const { pathname } = useLocation();
+  const displayHost = adminIp;
+  const { theme, toggle } = useThemeMode();
+  const { data: installationState } = useQuery({
+    queryKey: ["health", "installationState"],
+    queryFn: fetchInstallationState,
+    staleTime: 60_000,
+  });
+  const productionInstalled = isProductionInstallationState(installationState);
+  void productionInstalled;
+
+  const visibleNav = nav.filter((item) => {
+    if (item.ownerOnly) return isOwner;
+    if (isOwner) return true;
+    const key = item.permission ?? pathPermission(item.to);
+    if (!key) return false;
+    return permissions.includes(key);
+  });
 
   useEffect(() => setOpen(false), [pathname]);
 
@@ -90,7 +144,7 @@ export function AdminLayout({ adminIp, onDisconnect, connectionLost = false }: A
           open ? "translate-x-0" : "-translate-x-full",
         )}
       >
-        <div className="h-14 flex items-center px-4 border-b bg-white">
+        <div className="h-14 flex items-center px-4 border-b bg-white dark:bg-sidebar">
           <div className="relative h-10 w-40 overflow-hidden">
             <img
               src={logo2Src}
@@ -100,7 +154,7 @@ export function AdminLayout({ adminIp, onDisconnect, connectionLost = false }: A
           </div>
         </div>
         <nav className="flex-1 overflow-y-auto py-2">
-          {nav.map((item) => {
+          {visibleNav.map((item) => {
             const active = pathname === item.to;
             const Icon = item.icon;
             return (
@@ -113,48 +167,67 @@ export function AdminLayout({ adminIp, onDisconnect, connectionLost = false }: A
                     "bg-sidebar-accent text-sidebar-accent-foreground font-medium border-l-2 border-primary",
                 )}
               >
-                <Icon className="h-4 w-4" />
+                <Icon className="h-4 w-4 shrink-0" />
                 {item.label}
               </Link>
             );
           })}
         </nav>
-        <div className="px-4 py-2 text-[10px] text-muted-foreground border-t">
-          v1.0.0 · {adminIp}
+        <div className="border-t p-3 space-y-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="w-full justify-start gap-2"
+            onClick={toggle}
+          >
+            {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+            {theme === "dark" ? "Light mode" : "Dark mode"}
+          </Button>
+          <div className="text-[10px] text-muted-foreground truncate" title={displayHost}>
+            {displayHost}
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="w-full justify-start gap-2"
+            onClick={onDisconnect}
+          >
+            <LogOut className="h-4 w-4" />
+            Disconnect
+          </Button>
         </div>
       </aside>
 
-      {open && (
-        <div onClick={() => setOpen(false)} className="fixed inset-0 z-30 bg-black/40 md:hidden" />
-      )}
-
       <div className="flex-1 flex flex-col min-w-0">
-        <header className="h-12 border-b flex items-center justify-between px-3 sticky top-0 bg-background/95 backdrop-blur z-20">
-          <div className="flex items-center gap-2">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="md:hidden h-8 w-8"
-              onClick={() => setOpen(!open)}
-            >
-              {open ? <X className="h-4 w-4" /> : <Menu className="h-4 w-4" />}
-            </Button>
-            <h1 className="text-sm font-medium">
-              {nav.find((n) => n.to === pathname)?.label ?? "Admin"}
-            </h1>
-          </div>
-          <div className="flex items-center gap-1">
-            <LiveUpdatesBadge />
-            <div className="text-xs px-2 py-1 rounded-md bg-muted hidden sm:block">{adminIp}</div>
-            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={onDisconnect}>
-              <LogOut className="h-4 w-4" />
-            </Button>
-          </div>
+        <header className="h-14 border-b flex items-center gap-2 px-3 md:px-4 bg-background sticky top-0 z-30">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="md:hidden"
+            onClick={() => setOpen((v) => !v)}
+            aria-label={open ? "Close menu" : "Open menu"}
+          >
+            {open ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+          </Button>
+          <div className="flex-1" />
+          <LiveUpdatesBadge />
         </header>
-        <main className="flex-1 p-3 sm:p-4 overflow-x-hidden">
+        <main className="flex-1 p-3 md:p-4 overflow-auto">
           <Outlet />
         </main>
       </div>
+
+      {open ? (
+        <button
+          type="button"
+          className="fixed inset-0 z-30 bg-black/40 md:hidden"
+          aria-label="Close menu overlay"
+          onClick={() => setOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }

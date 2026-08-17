@@ -1,6 +1,9 @@
 #include "Logger.h"
 
 #include "Config.h"
+#include "SalesTime.h"
+
+#include <esp_system.h>
 
 static String logTimestamp() {
   return String("uptime-ms:") + millis();
@@ -9,18 +12,38 @@ static String logTimestamp() {
 void Logger::begin(StorageManager *storage, EventBus *events) {
   _storage = storage;
   _events = events;
+  const uint64_t chipId = ESP.getEfuseMac();
+  char bootId[33];
+  snprintf(bootId, sizeof(bootId), "%08lx%08lx%08lx",
+           static_cast<unsigned long>(chipId >> 32),
+           static_cast<unsigned long>(chipId),
+           static_cast<unsigned long>(esp_random()));
+  _bootInstance = bootId;
+  _historySequence = 0;
 }
 
 void Logger::info(const String &type, const String &message) {
-  write(LogLevel::Info, type, message);
+  write(LogLevel::Info, type, message, true);
+}
+
+void Logger::infoLocal(const String &type, const String &message) {
+  write(LogLevel::Info, type, message, false);
 }
 
 void Logger::warn(const String &type, const String &message) {
-  write(LogLevel::Warn, type, message);
+  write(LogLevel::Warn, type, message, true);
+}
+
+void Logger::warnLocal(const String &type, const String &message) {
+  write(LogLevel::Warn, type, message, false);
 }
 
 void Logger::error(const String &type, const String &message) {
-  write(LogLevel::Error, type, message);
+  write(LogLevel::Error, type, message, true);
+}
+
+void Logger::errorLocal(const String &type, const String &message) {
+  write(LogLevel::Error, type, message, false);
 }
 
 size_t Logger::ramCount() const { return _ramCount; }
@@ -113,7 +136,8 @@ bool Logger::clear() {
   return true;
 }
 
-void Logger::write(LogLevel level, const String &type, const String &message) {
+void Logger::write(LogLevel level, const String &type, const String &message,
+                   bool durableHistory) {
   const uint32_t id = millis();
   const String t = logTimestamp();
   const String lvl = levelName(level);
@@ -123,6 +147,9 @@ void Logger::write(LogLevel level, const String &type, const String &message) {
   pushRam(id, t, lvl, type, message);
   emitEntry(id, t, lvl, type, message);
 
+  // Durable NDJSON append + flush is storage I/O. Callers on async_tcp must
+  // pass durableHistory=false when this work would risk the task WDT.
+  if (!durableHistory) return;
   if (!_storage || !_storage->healthy()) return;
 
   DynamicJsonDocument item(512);
@@ -132,8 +159,11 @@ void Logger::write(LogLevel level, const String &type, const String &message) {
   item["type"] = type;
   item["msg"] = message;
 
-  _storage->appendJsonArrayItem(RenzFiConfig::LOGS_FILE, item.as<JsonObject>(),
-                                RenzFiConfig::JSON_DOC_LARGE);
+  const String eventId =
+      String("log:") + _bootInstance + ":" + (++_historySequence);
+  _storage->appendHistory(NdjsonLedger::Kind::Logs, eventId,
+                          salesRecordedAtNow(),
+                          item.as<JsonObjectConst>(), false);
 }
 
 const char *Logger::levelName(LogLevel level) const {

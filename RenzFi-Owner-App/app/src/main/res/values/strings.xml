@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools">
     <string name="app_name">Renz-Fi Manager</string>
-    <string name="app_version">1.0.0</string>
+    <!--
+        app_version is no longer used for version display.
+        About screen reads BuildConfig.VERSION_NAME at runtime.
+        Retained here only to avoid breaking any external reference until cleaned up.
+    -->
+    <string name="app_version" tools:ignore="UnusedResources">1.0.0</string>
     <string name="version_label">Version %1$s</string>
     <string name="checking_appliance">Checking appliance…</string>
     <string name="device_management">Device Management</string>
@@ -23,4 +28,26 @@
     <string name="unknown_status">Unknown</string>
     <string name="connection_help_title">Renz-Fi Appliance Not Found</string>
     <string name="notification_channel_name">Renz-Fi Manager</string>
+
+    <!-- Update system -->
+    <string name="update_available_title">Update Available</string>
+    <string name="update_current_version">Current Version</string>
+    <string name="update_latest_version">Latest Version</string>
+    <string name="update_now">Update Now</string>
+    <string name="update_later">Later</string>
+    <string name="update_checking">Checking for updates…</string>
+    <string name="update_up_to_date">Renz-Fi Manager is up to date.</string>
+    <string name="update_downloading">Downloading… %1$d%%</string>
+    <string name="update_verifying">Verifying SHA-256…</string>
+    <string name="update_ready">Download verified. Ready to install.</string>
+    <string name="update_install">Install Update</string>
+    <string name="update_check_for_updates">Check for Updates</string>
+    <string name="update_channel_stable">Stable</string>
+    <string name="update_channel_beta">Beta</string>
+    <string name="update_last_checked">Last checked</string>
+    <string name="update_never_checked">Never</string>
+    <string name="update_error_verification_failed">SHA-256 verification failed. The downloaded file may be corrupted.</string>
+    <string name="update_cancel">Cancel</string>
+    <string name="update_retry">Retry</string>
+    <string name="update_manage_in_about">Manage</string>
 </resources>

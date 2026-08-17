@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="0;url=http://10.10.10.2/admin">
+  <title>Renz-Fi Admin</title>
+  <script>
+    location.replace("http://10.10.10.2/admin");
+  </script>
+</head>
+<body>
+  <p>
+    Opening Renz-Fi Admin Dashboard&hellip;
+    <a href="http://10.10.10.2/admin">Continue</a>
+  </p>
+</body>
+</html>
