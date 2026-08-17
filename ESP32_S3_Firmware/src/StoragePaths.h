@@ -114,6 +114,7 @@ static constexpr const char *ExistingNetworkScanFile = "/config/existing-network
 static constexpr const char *SetupWizardFile          = "/config/setup-wizard.json";
 static constexpr const char *NetworkAdoptionWorkflowFile =
     "/config/network-adoption-workflow.json";
+static constexpr const char *AccessPointsFile = "/config/access-points.json";
 
 // ── CONTRACT: canonical asset paths (Phase 3 AssetManager) ─────────────────
 

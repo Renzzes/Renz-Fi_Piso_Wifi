@@ -204,11 +204,13 @@ void FirmwareApp::begin() {
   HttpPlaneGate::bindAuth(&_auth);
 
   CoinManager *coin = RenzFiConfig::ENABLE_COIN_MANAGER ? &_coin : nullptr;
+  _accessPoints.begin(&_storage, &_eth, &_logger);
+
   _api.begin(&_storage, &_auth, &_sessions, &_promos, &_vouchers,
              coin, &_router, &_logger, &_events, &_eth,
              &_portalSessions, &_portalConfig, &_assetManager, &_rgb, &_health,
              &_buildMetadata, &_installation, &_mgmtAp, &_mgmtApLifecycle,
-             &_networkSettings, &_routerWorker, &_factoryReset);
+             &_networkSettings, &_routerWorker, &_factoryReset, &_accessPoints);
 
   if (_mgmtAp.isRunning()) {
     startSetupServices();

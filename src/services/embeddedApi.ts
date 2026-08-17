@@ -45,6 +45,7 @@ export const embeddedApi = {
   logs: "/api/logs",
   coin: "/api/coin",
   router: "/api/router",
+  accessPoints: "/api/access-points",
   auth: "/api/auth",
   events: "/api/events",
 };

@@ -18,6 +18,7 @@ import CaptivePortalPage from "@/pages/CaptivePortalPage";
 import CoinSettingsPage from "@/pages/CoinSettingsPage";
 import RouterSettingsPage from "@/pages/RouterSettingsPage";
 import SystemConfigurationPage from "@/pages/SystemConfigurationPage";
+import AccessPointsPage from "@/pages/AccessPointsPage";
 import LogsPage from "@/pages/LogsPage";
 import FirmwarePage from "@/pages/FirmwarePage";
 import SystemSettingsPage from "@/pages/SystemSettingsPage";
@@ -504,6 +505,14 @@ export default function App() {
               >
                 <SystemConfigurationPage />
               </RequirePermission>
+            }
+          />
+          <Route
+            path="access-points"
+            element={
+              <RequireOwner isOwner={isOwner}>
+                <AccessPointsPage />
+              </RequireOwner>
             }
           />
           {/* Compatibility bookmark: former Router nav → System Configuration */}

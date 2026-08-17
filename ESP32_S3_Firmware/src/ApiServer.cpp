@@ -18,6 +18,7 @@
 #include "JsonHeap.h"
 #include "ManagementApConfig.h"
 #include "ManagementApManager.h"
+#include "ExternalAccessPointManager.h"
 #include "NetworkDiagnostics.h"
 #include "NetworkStatusModel.h"
 #include "PortalConfigManager.h"
@@ -42,6 +43,16 @@ String urlDecode(String value) {
   value.replace("%3A", ":");
   value.replace("%3a", ":");
   return value;
+}
+
+bool parseExternalAccessPointId(const String &path, String &idOut) {
+  const String prefix = "/api/access-points/";
+  if (!path.startsWith(prefix)) return false;
+  const String rest = path.substring(prefix.length());
+  if (rest.length() == 0) return false;
+  if (rest.indexOf('/') >= 0) return false;
+  idOut = urlDecode(rest);
+  return idOut.length() > 0;
 }
 
 // Body accumulation handler.  Pass as the ArBodyHandlerFunction (5th arg) to
@@ -233,7 +244,8 @@ void ApiServer::begin(StorageManager       *storage,
                       ManagementApLifecycle *mgmtApLifecycle,
                       NetworkSettingsManager *networkSettings,
                       RouterProvisioningWorker *routerWorker,
-                      FactoryResetWorker *factoryReset) {
+                      FactoryResetWorker *factoryReset,
+                      ExternalAccessPointManager *accessPoints) {
   _server         = nullptr;
   _storage        = storage;
   _auth           = auth;
@@ -257,6 +269,7 @@ void ApiServer::begin(StorageManager       *storage,
   _networkSettings = networkSettings;
   _routerWorker    = routerWorker;
   _factoryReset    = factoryReset;
+  _accessPoints    = accessPoints;
   _backup.begin(_storage, _logger, _auth, _portalConfig, _assets, _installation);
 }
 
@@ -294,6 +307,11 @@ void ApiServer::addCorsHeaders(AsyncWebServerResponse *res) {
 
 void ApiServer::sendOk(AsyncWebServerRequest *req, JsonDocument &data,
                        const String &message) {
+  sendOk(req, data, 200, message);
+}
+
+void ApiServer::sendOk(AsyncWebServerRequest *req, JsonDocument &data, int httpStatus,
+                       const String &message) {
   logRequest(req, "api-ok");
   String dataBody;
   serializeJson(data, dataBody);
@@ -303,7 +321,7 @@ void ApiServer::sendOk(AsyncWebServerRequest *req, JsonDocument &data,
   body += message;
   body += "\"}";
   AsyncWebServerResponse *res =
-      req->beginResponse(200, "application/json", body);
+      req->beginResponse(httpStatus, "application/json", body);
   addCorsHeaders(res);
   res->addHeader("Cache-Control", "no-store");
   req->send(res);
@@ -3193,6 +3211,125 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
   };
   _server->on("/api/system/wifi/config", HTTP_POST, wifiConfigWrite, nullptr, bodyCollect);
   _server->on("/api/system/wifi/config", HTTP_PUT,  wifiConfigWrite, nullptr, bodyCollect);
+
+  // External Access Point registry (Stage B: CRUD only, no probes).
+  // Exact collection match so POST /api/access-points/{id} cannot hit create.
+  _server->on(AsyncURIMatcher::exact("/api/access-points"), HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_accessPoints) {
+      sendError(req, 503, "Access point registry unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    PsramJsonDocument heap;
+    _accessPoints->fillList(heap.doc());
+    sendOk(req, heap.doc());
+  });
+
+  _server->on(
+      AsyncURIMatcher::exact("/api/access-points"), HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+        RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        if (!_accessPoints) {
+          sendError(req, 503, "Access point registry unavailable", "INTERNAL_ERROR");
+          return;
+        }
+        PsramJsonDocument bodyHeap;
+        const String raw = getBody(req);
+        if (raw.length() == 0) {
+          sendError(req, 400, "Request body required", "INVALID_REQUEST");
+          return;
+        }
+        if (deserializeJson(bodyHeap.doc(), raw)) {
+          sendError(req, 400, "Invalid JSON body", "INVALID_REQUEST");
+          return;
+        }
+        PsramJsonDocument outHeap;
+        const ExternalAccessPoint::CrudStatus status =
+            _accessPoints->create(bodyHeap.doc().as<JsonObjectConst>(),
+                                  outHeap.doc());
+        if (status != ExternalAccessPoint::CrudStatus::Ok) {
+          sendError(req, ExternalAccessPoint::crudHttpStatus(status),
+                    ExternalAccessPoint::crudMessage(status),
+                    ExternalAccessPoint::crudCode(status));
+          return;
+        }
+        sendOk(req, outHeap.doc(), 201, "Access point created");
+      },
+      nullptr, bodyCollect);
+
+  auto accessPointItem = [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_accessPoints) {
+      sendError(req, 503, "Access point registry unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    String id;
+    if (!parseExternalAccessPointId(req->url(), id)) {
+      sendError(req, 404, "Access point not found", "NOT_FOUND");
+      return;
+    }
+    const int method = req->method();
+    if (method == HTTP_GET) {
+      PsramJsonDocument outHeap;
+      const ExternalAccessPoint::CrudStatus status =
+          _accessPoints->getById(id, outHeap.doc());
+      if (status != ExternalAccessPoint::CrudStatus::Ok) {
+        sendError(req, ExternalAccessPoint::crudHttpStatus(status),
+                  ExternalAccessPoint::crudMessage(status),
+                  ExternalAccessPoint::crudCode(status));
+        return;
+      }
+      sendOk(req, outHeap.doc());
+      return;
+    }
+    if (method == HTTP_PUT) {
+      PsramJsonDocument bodyHeap;
+      const String raw = getBody(req);
+      if (raw.length() == 0) {
+        sendError(req, 400, "Request body required", "INVALID_REQUEST");
+        return;
+      }
+      if (deserializeJson(bodyHeap.doc(), raw)) {
+        sendError(req, 400, "Invalid JSON body", "INVALID_REQUEST");
+        return;
+      }
+      PsramJsonDocument outHeap;
+      const ExternalAccessPoint::CrudStatus status =
+          _accessPoints->update(id, bodyHeap.doc().as<JsonObjectConst>(),
+                                outHeap.doc());
+      if (status != ExternalAccessPoint::CrudStatus::Ok) {
+        sendError(req, ExternalAccessPoint::crudHttpStatus(status),
+                  ExternalAccessPoint::crudMessage(status),
+                  ExternalAccessPoint::crudCode(status));
+        return;
+      }
+      sendOk(req, outHeap.doc(), "Access point updated");
+      return;
+    }
+    if (method == HTTP_DELETE) {
+      const ExternalAccessPoint::CrudStatus status = _accessPoints->remove(id);
+      if (status != ExternalAccessPoint::CrudStatus::Ok) {
+        sendError(req, ExternalAccessPoint::crudHttpStatus(status),
+                  ExternalAccessPoint::crudMessage(status),
+                  ExternalAccessPoint::crudCode(status));
+        return;
+      }
+      PsramJsonDocument outHeap;
+      JsonObject data = outHeap.doc().to<JsonObject>();
+      data["ok"] = true;
+      data["id"] = id;
+      sendOk(req, outHeap.doc(), "Access point removed");
+      return;
+    }
+    sendError(req, 405, "Method not allowed", "METHOD_NOT_ALLOWED");
+  };
+  _server->on("/api/access-points/*", HTTP_GET, accessPointItem);
+  _server->on("/api/access-points/*", HTTP_PUT, accessPointItem, nullptr, bodyCollect);
+  _server->on("/api/access-points/*", HTTP_DELETE, accessPointItem);
 
   // ── Portal session API (/api/portal/*) ────────────────────────────────────
   // These endpoints are intentionally open (no requireAuth) — called by the

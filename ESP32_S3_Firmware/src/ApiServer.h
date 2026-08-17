@@ -10,6 +10,7 @@
 #include "BuildMetadata.h"
 #include "CoinManager.h"
 #include "EthernetManager.h"
+#include "ExternalAccessPointManager.h"
 #include "EventBus.h"
 #include "FactoryResetWorker.h"
 #include "InstallationStateManager.h"
@@ -56,7 +57,8 @@ class ApiServer : public IWebRouteProvider {
              ManagementApLifecycle *mgmtApLifecycle,
              NetworkSettingsManager *networkSettings = nullptr,
              RouterProvisioningWorker *routerWorker = nullptr,
-             FactoryResetWorker *factoryReset = nullptr);
+             FactoryResetWorker *factoryReset = nullptr,
+             ExternalAccessPointManager *accessPoints = nullptr);
 
   void registerSetupRoutes(WebServerManager &web,
                            SetupProvisioningManager *setupProvisioning = nullptr,
@@ -91,6 +93,7 @@ class ApiServer : public IWebRouteProvider {
   NetworkSettingsManager *_networkSettings = nullptr;
   RouterProvisioningWorker *_routerWorker  = nullptr;
   FactoryResetWorker       *_factoryReset  = nullptr;
+  ExternalAccessPointManager *_accessPoints = nullptr;
   WebServerManager         *_web                = nullptr;
   SetupProvisioningManager *_setupProvisioning  = nullptr;
   RouterProvisioningManager *_routerProvisioning = nullptr;
@@ -108,6 +111,8 @@ class ApiServer : public IWebRouteProvider {
   // Send JSON success envelope.
   void sendOk(AsyncWebServerRequest *req, JsonDocument &data,
                const String &message = "OK");
+  void sendOk(AsyncWebServerRequest *req, JsonDocument &data, int httpStatus,
+               const String &message);
   void sendOk(AsyncWebServerRequest *req, const String &message = "OK");
 
   // Send JSON error envelope.

@@ -480,6 +480,8 @@ Unless noted: **Admin** auth, **No Cache**, **`application/json`**.
 | POST | `/api/coin/test` | Test pulse |
 | POST | `/api/coin/reset` | Reset coin counters |
 | GET/POST/PUT | `/api/router/settings` | MikroTik settings |
+| GET/POST | `/api/access-points` | External AP registry list / create (owner-only, exact match) |
+| GET/PUT/DELETE | `/api/access-points/{id}` | External AP registry item (owner-only) |
 | GET | `/api/router/profiles` | Hotspot profiles |
 | POST | `/api/router/test` | Test router connection |
 

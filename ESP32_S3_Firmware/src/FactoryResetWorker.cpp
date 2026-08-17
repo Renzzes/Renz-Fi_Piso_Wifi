@@ -39,6 +39,7 @@ const char *kResetFiles[] = {
     StoragePaths::ExistingNetworkScanFile,
     StoragePaths::SetupWizardFile,
     StoragePaths::NetworkAdoptionWorkflowFile,
+    StoragePaths::AccessPointsFile,
     RenzFiConfig::PORTAL_BANNER_SD,
     RenzFiConfig::PORTAL_MUSIC_SD,
 };

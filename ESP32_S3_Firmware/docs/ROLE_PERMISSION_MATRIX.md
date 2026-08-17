@@ -14,6 +14,7 @@ Renz-Fi dashboard sessions carry an `owner` or `operator` role after login.
 Operator sessions receive HTTP 403 `OWNER_REQUIRED`:
 
 - `POST/PUT /api/system/wifi/config` — Ethernet/IP settings
+- `GET/POST /api/access-points`, `GET/PUT/DELETE /api/access-points/{id}` — External Access Point registry (owner-only; not the ESP32 Management AP)
 - `GET/POST/PUT /api/router/settings`, `POST /api/router/test`
 - `POST /api/system/reboot`, `POST /api/system/factory-reset`
 - `GET /api/settings/backup`, `POST /api/settings/restore`
