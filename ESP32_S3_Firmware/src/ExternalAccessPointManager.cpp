@@ -1,8 +1,10 @@
 #include "ExternalAccessPointManager.h"
 
+#include <string.h>
 #include <esp_system.h>
 
 #include "CredentialProtector.h"
+#include "DmaMemoryMonitor.h"
 #include "EthernetManager.h"
 #include "JsonHeap.h"
 #include "Logger.h"
@@ -28,6 +30,55 @@ bool jsonHasKey(JsonObjectConst input, const char *key) {
 
 }  // namespace
 
+class ExternalAccessPointManager::ScopedRegistryLock {
+ public:
+  explicit ScopedRegistryLock(const ExternalAccessPointManager *manager)
+      : _manager(manager) {
+    _manager->lockRegistry();
+  }
+  ~ScopedRegistryLock() { _manager->unlockRegistry(); }
+
+ private:
+  const ExternalAccessPointManager *_manager;
+};
+
+class ExternalAccessPointManager::ScopedJobLock {
+ public:
+  explicit ScopedJobLock(const ExternalAccessPointManager *manager)
+      : _manager(manager) {
+    _manager->lockJob();
+  }
+  ~ScopedJobLock() { _manager->unlockJob(); }
+
+ private:
+  const ExternalAccessPointManager *_manager;
+};
+
+void ExternalAccessPointManager::lockRegistry() const {
+  if (_registryMutex) xSemaphoreTake(_registryMutex, portMAX_DELAY);
+}
+
+void ExternalAccessPointManager::unlockRegistry() const {
+  if (_registryMutex) xSemaphoreGive(_registryMutex);
+}
+
+void ExternalAccessPointManager::lockJob() const {
+  if (_jobMutex) xSemaphoreTake(_jobMutex, portMAX_DELAY);
+}
+
+void ExternalAccessPointManager::unlockJob() const {
+  if (_jobMutex) xSemaphoreGive(_jobMutex);
+}
+
+void ExternalAccessPointManager::copyId(char *dest, size_t destSize,
+                                        const String &id) {
+  if (dest == nullptr || destSize == 0) return;
+  dest[0] = '\0';
+  if (id.length() == 0) return;
+  strncpy(dest, id.c_str(), destSize - 1);
+  dest[destSize - 1] = '\0';
+}
+
 void ExternalAccessPointManager::begin(StorageManager *storage,
                                        EthernetManager *eth, Logger *logger) {
   _storage = storage;
@@ -35,10 +86,29 @@ void ExternalAccessPointManager::begin(StorageManager *storage,
   _logger = logger;
   _count = 0;
   _registryError = "";
+  if (!_registryMutex) _registryMutex = xSemaphoreCreateMutex();
+  if (!_jobMutex) _jobMutex = xSemaphoreCreateMutex();
   loadFromStorage();
   Serial.printf("[access-points] loaded count=%u registry_error=%s\n",
                 static_cast<unsigned>(_count),
                 _registryError.length() > 0 ? _registryError.c_str() : "none");
+
+  if (_workerTask) return;
+  const BaseType_t ok = xTaskCreatePinnedToCore(
+      workerTaskEntry, "ap_check_worker", kWorkerStackWords, this,
+      kWorkerPriority, &_workerTask, kWorkerCore);
+  if (ok != pdPASS) {
+    _workerTask = nullptr;
+    Serial.println("[ap-check] worker create failed");
+    return;
+  }
+  Serial.printf("[ap-check] worker started stackWords=%u core=%d\n",
+                static_cast<unsigned>(kWorkerStackWords),
+                static_cast<int>(kWorkerCore));
+}
+
+void ExternalAccessPointManager::loop() {
+  if (checkBusy()) notifyWorker();
 }
 
 void ExternalAccessPointManager::loadFromStorage() {
@@ -146,9 +216,33 @@ void ExternalAccessPointManager::fillPublicRecord(JsonObject obj,
   obj["ssid"] = record.ssid;
   obj["location"] = record.location;
   obj["notes"] = record.notes;
+  obj["status"] = ExternalAccessPoint::reachabilityLabel(record.status);
+  if (record.latencyValid) {
+    obj["latencyMs"] = record.latencyMs;
+  } else {
+    obj["latencyMs"] = nullptr;
+  }
+  if (record.lastCheckMs > 0) {
+    obj["lastCheck"] = record.lastCheckMs;
+  } else {
+    obj["lastCheck"] = nullptr;
+  }
+  if (record.lastSuccessfulCheckMs > 0) {
+    obj["lastSuccessfulCheck"] = record.lastSuccessfulCheckMs;
+  } else {
+    obj["lastSuccessfulCheck"] = nullptr;
+  }
+  if (record.lastError != nullptr) {
+    obj["lastError"] = record.lastError;
+  }
+  JsonObject caps = obj["capabilities"].to<JsonObject>();
+  caps["icmp"] = record.capIcmp;
+  caps["http"] = record.capHttp;
+  caps["https"] = record.capHttps;
 }
 
 void ExternalAccessPointManager::fillList(JsonDocument &doc) const {
+  ScopedRegistryLock guard(this);
   doc.clear();
   doc["schemaVersion"] = ExternalAccessPoint::kSchemaVersion;
   JsonArray rows = doc["accessPoints"].to<JsonArray>();
@@ -162,6 +256,7 @@ void ExternalAccessPointManager::fillList(JsonDocument &doc) const {
 
 ExternalAccessPoint::CrudStatus ExternalAccessPointManager::getById(
     const String &id, JsonDocument &doc) const {
+  ScopedRegistryLock guard(this);
   const int index = findIndex(id);
   if (index < 0) return ExternalAccessPoint::CrudStatus::NotFound;
   doc.clear();
@@ -306,6 +401,7 @@ void ExternalAccessPointManager::logSafe(const char *action,
 
 ExternalAccessPoint::CrudStatus ExternalAccessPointManager::create(
     JsonObjectConst input, JsonDocument &out) {
+  ScopedRegistryLock guard(this);
   if (_count >= kMaxAccessPoints) {
     return ExternalAccessPoint::CrudStatus::LimitReached;
   }
@@ -342,6 +438,7 @@ ExternalAccessPoint::CrudStatus ExternalAccessPointManager::create(
 
 ExternalAccessPoint::CrudStatus ExternalAccessPointManager::update(
     const String &id, JsonObjectConst input, JsonDocument &out) {
+  ScopedRegistryLock guard(this);
   const int index = findIndex(id);
   if (index < 0) return ExternalAccessPoint::CrudStatus::NotFound;
 
@@ -362,6 +459,18 @@ ExternalAccessPoint::CrudStatus ExternalAccessPointManager::update(
     }
   }
 
+  if (next.managementIp != _records[index].managementIp) {
+    next.status = ExternalAccessPoint::ReachabilityStatus::Unknown;
+    next.latencyValid = false;
+    next.latencyMs = 0;
+    next.lastCheckMs = 0;
+    next.lastSuccessfulCheckMs = 0;
+    next.lastError = nullptr;
+    next.capIcmp = false;
+    next.capHttp = false;
+    next.capHttps = false;
+  }
+
   const Record previous = _records[index];
   _records[index] = next;
   status = persist();
@@ -377,6 +486,7 @@ ExternalAccessPoint::CrudStatus ExternalAccessPointManager::update(
 
 ExternalAccessPoint::CrudStatus ExternalAccessPointManager::remove(
     const String &id) {
+  ScopedRegistryLock guard(this);
   const int index = findIndex(id);
   if (index < 0) return ExternalAccessPoint::CrudStatus::NotFound;
   const Record removed = _records[index];
@@ -395,4 +505,259 @@ ExternalAccessPoint::CrudStatus ExternalAccessPointManager::remove(
   }
   logSafe("deleted", removed);
   return ExternalAccessPoint::CrudStatus::Ok;
+}
+
+void ExternalAccessPointManager::notifyWorker() {
+  if (_workerTask) xTaskNotifyGive(_workerTask);
+}
+
+void ExternalAccessPointManager::workerTaskEntry(void *param) {
+  auto *self = static_cast<ExternalAccessPointManager *>(param);
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    self->runQueuedJob();
+  }
+}
+
+ExternalAccessPoint::CheckEnqueueStatus ExternalAccessPointManager::enqueueCheck(
+    const String &id, uint32_t &jobIdOut) {
+  jobIdOut = 0;
+  if (_storage && _storage->sdRecoveryInProgress()) {
+    return ExternalAccessPoint::CheckEnqueueStatus::StorageRecovery;
+  }
+  if (!_workerTask) {
+    return ExternalAccessPoint::CheckEnqueueStatus::WorkerUnavailable;
+  }
+
+  char ip[16] = {};
+  {
+    ScopedRegistryLock guard(this);
+    const int index = findIndex(id);
+    if (index < 0) return ExternalAccessPoint::CheckEnqueueStatus::NotFound;
+    copyId(ip, sizeof(ip), _records[index].managementIp);
+  }
+
+  uint32_t jobId = 0;
+  {
+    ScopedJobLock guard(this);
+    if (_job.state == ExternalAccessPoint::CheckJobState::Queued ||
+        _job.state == ExternalAccessPoint::CheckJobState::Running) {
+      return ExternalAccessPoint::CheckEnqueueStatus::Busy;
+    }
+    _job = CheckJob{};
+    _job.jobId = _nextJobId++;
+    if (_nextJobId == 0) _nextJobId = 1;
+    copyId(_job.accessPointId, sizeof(_job.accessPointId), id);
+    _job.state = ExternalAccessPoint::CheckJobState::Queued;
+    _job.startedAt = millis();
+    jobId = _job.jobId;
+  }
+
+  jobIdOut = jobId;
+  DmaMemoryMonitor::logSnapshot("ap-check-enqueue");
+  Serial.printf("[ap-check] queued id=%u ap=%s ip=%s\n",
+                static_cast<unsigned>(jobId), id.c_str(), ip);
+  notifyWorker();
+  return ExternalAccessPoint::CheckEnqueueStatus::Ok;
+}
+
+bool ExternalAccessPointManager::pollCheckJob(uint32_t jobId,
+                                              CheckJobSnapshot &out) const {
+  ScopedJobLock guard(this);
+  if (jobId == 0 || jobId != _job.jobId) return false;
+  out.jobId = _job.jobId;
+  copyId(out.accessPointId, sizeof(out.accessPointId),
+         String(_job.accessPointId));
+  out.state = ExternalAccessPoint::jobStateLabel(_job.state);
+  out.ok = _job.ok;
+  out.status = ExternalAccessPoint::reachabilityLabel(_job.status);
+  out.latencyValid = _job.latencyValid;
+  out.latencyMs = _job.latencyMs;
+  out.startedAt = _job.startedAt;
+  out.completedAt = _job.completedAt;
+  out.errorCode = _job.errorCode;
+  strncpy(out.message, _job.message, sizeof(out.message) - 1);
+  out.message[sizeof(out.message) - 1] = '\0';
+  return true;
+}
+
+bool ExternalAccessPointManager::checkBusy() const {
+  ScopedJobLock guard(this);
+  return _job.state == ExternalAccessPoint::CheckJobState::Queued ||
+         _job.state == ExternalAccessPoint::CheckJobState::Running;
+}
+
+void ExternalAccessPointManager::applyRamStatus(
+    Record &record, ExternalAccessPoint::ReachabilityStatus status,
+    bool latencyValid, uint32_t latencyMs, const char *errorCode,
+    ExternalAccessPoint::ManagementTransport transport) {
+  record.status = status;
+  record.latencyValid = latencyValid;
+  record.latencyMs = latencyValid ? latencyMs : 0;
+  record.lastCheckMs = millis();
+  record.lastError = errorCode;
+  record.capIcmp = status == ExternalAccessPoint::ReachabilityStatus::Online ||
+                   status == ExternalAccessPoint::ReachabilityStatus::NetworkReachable;
+  record.capHttp = transport == ExternalAccessPoint::ManagementTransport::Http;
+  record.capHttps = transport == ExternalAccessPoint::ManagementTransport::Https;
+  if (ExternalAccessPoint::reachabilityIsSuccessful(status) ||
+      status == ExternalAccessPoint::ReachabilityStatus::Disabled) {
+    if (ExternalAccessPoint::reachabilityIsSuccessful(status)) {
+      record.lastSuccessfulCheckMs = record.lastCheckMs;
+    }
+  }
+}
+
+void ExternalAccessPointManager::finishJob(
+    uint32_t jobId, ExternalAccessPoint::CheckJobState state, bool ok,
+    ExternalAccessPoint::ReachabilityStatus status, bool latencyValid,
+    uint32_t latencyMs, const char *errorCode, const char *message) {
+  ScopedJobLock guard(this);
+  if (jobId != _job.jobId) return;
+  _job.ok = ok;
+  _job.status = status;
+  _job.latencyValid = latencyValid;
+  _job.latencyMs = latencyValid ? latencyMs : 0;
+  _job.completedAt = millis();
+  _job.errorCode = errorCode;
+  _job.message[0] = '\0';
+  if (message) {
+    strncpy(_job.message, message, sizeof(_job.message) - 1);
+    _job.message[sizeof(_job.message) - 1] = '\0';
+  }
+  _job.state = state;
+}
+
+void ExternalAccessPointManager::runQueuedJob() {
+  uint32_t jobId = 0;
+  uint32_t startedMs = millis();
+  char accessPointId[20] = {};
+  {
+    ScopedJobLock guard(this);
+    if (_job.state != ExternalAccessPoint::CheckJobState::Queued) return;
+    _job.state = ExternalAccessPoint::CheckJobState::Running;
+    _job.startedAt = millis();
+    startedMs = _job.startedAt;
+    jobId = _job.jobId;
+    copyId(accessPointId, sizeof(accessPointId), String(_job.accessPointId));
+  }
+
+  DmaMemoryMonitor::logSnapshot("ap-check-start");
+  Serial.printf("[ap-check] started id=%u ap=%s\n",
+                static_cast<unsigned>(jobId), accessPointId);
+
+  bool enabled = false;
+  bool found = false;
+  char ip[16] = {};
+  {
+    ScopedRegistryLock guard(this);
+    const int index = findIndex(String(accessPointId));
+    if (index >= 0) {
+      found = true;
+      enabled = _records[index].enabled;
+      copyId(ip, sizeof(ip), _records[index].managementIp);
+    }
+  }
+
+  if (!found) {
+    finishJob(jobId, ExternalAccessPoint::CheckJobState::Failed, false,
+              ExternalAccessPoint::ReachabilityStatus::Unknown, false, 0,
+              "ACCESS_POINT_NOT_FOUND", "Access point not found");
+    Serial.printf("[ap-check] completed id=%u status=unknown error=ACCESS_POINT_NOT_FOUND elapsed=%lu\n",
+                  static_cast<unsigned>(jobId),
+                  static_cast<unsigned long>(millis() - startedMs));
+    return;
+  }
+
+  const bool ethernetReady = _eth && _eth->hasIp();
+  if (!enabled) {
+    {
+      ScopedRegistryLock guard(this);
+      const int index = findIndex(String(accessPointId));
+      if (index >= 0) {
+        applyRamStatus(_records[index],
+                       ExternalAccessPoint::ReachabilityStatus::Disabled, false,
+                       0, "ACCESS_POINT_DISABLED",
+                       ExternalAccessPoint::ManagementTransport::None);
+      }
+    }
+    finishJob(jobId, ExternalAccessPoint::CheckJobState::Completed, true,
+              ExternalAccessPoint::ReachabilityStatus::Disabled, false, 0,
+              "ACCESS_POINT_DISABLED", "Access point is disabled");
+    Serial.printf("[ap-check] completed id=%u status=disabled elapsed=%lu\n",
+                  static_cast<unsigned>(jobId),
+                  static_cast<unsigned long>(millis() - startedMs));
+    return;
+  }
+
+  if (!ethernetReady) {
+    {
+      ScopedRegistryLock guard(this);
+      const int index = findIndex(String(accessPointId));
+      if (index >= 0) {
+        applyRamStatus(_records[index],
+                       ExternalAccessPoint::ReachabilityStatus::Unknown, false,
+                       0, "ETHERNET_NOT_READY",
+                       ExternalAccessPoint::ManagementTransport::None);
+      }
+    }
+    finishJob(jobId, ExternalAccessPoint::CheckJobState::Completed, false,
+              ExternalAccessPoint::ReachabilityStatus::Unknown, false, 0,
+              "ETHERNET_NOT_READY", "Ethernet does not have a usable IP");
+    Serial.printf("[ap-check] completed id=%u status=unknown error=ETHERNET_NOT_READY elapsed=%lu\n",
+                  static_cast<unsigned>(jobId),
+                  static_cast<unsigned long>(millis() - startedMs));
+    return;
+  }
+
+  DmaMemoryMonitor::logSnapshot("ap-check-before-icmp");
+  ExternalAccessPoint::ProbeTarget target;
+  target.managementIp = ip;
+  const ExternalAccessPoint::ProbeResult probe = _driver.probe(target);
+  vTaskDelay(pdMS_TO_TICKS(1));
+
+  const ExternalAccessPoint::ReachabilityStatus status =
+      ExternalAccessPoint::classifyReachability(false, true, probe.icmpOk,
+                                                probe.tcpOk);
+  bool latencyValid = false;
+  uint32_t latencyMs = 0;
+  if (probe.icmpOk && probe.icmpLatencyValid) {
+    latencyValid = true;
+    latencyMs = probe.icmpLatencyMs;
+  } else if (probe.tcpOk && probe.tcpLatencyValid) {
+    latencyValid = true;
+    latencyMs = probe.tcpLatencyMs;
+  }
+
+  {
+    ScopedRegistryLock guard(this);
+    const int index = findIndex(String(accessPointId));
+    if (index >= 0) {
+      applyRamStatus(_records[index], status, latencyValid, latencyMs,
+                     probe.errorCode, probe.transport);
+    }
+  }
+
+  const bool ok = ExternalAccessPoint::reachabilityIsSuccessful(status);
+  const char *message = "Check complete";
+  if (status == ExternalAccessPoint::ReachabilityStatus::Unreachable) {
+    message = "Access point is unreachable";
+  } else if (status == ExternalAccessPoint::ReachabilityStatus::NetworkReachable) {
+    message = "Host replies to ping; management port is closed";
+  } else if (status == ExternalAccessPoint::ReachabilityStatus::ManagementReachable) {
+    message = "Management port is open; ICMP is blocked or failed";
+  } else if (status == ExternalAccessPoint::ReachabilityStatus::Online) {
+    message = "Access point is reachable";
+  }
+  finishJob(jobId, ExternalAccessPoint::CheckJobState::Completed, ok, status,
+            latencyValid, latencyMs, probe.errorCode, message);
+
+  const UBaseType_t stackLeft = uxTaskGetStackHighWaterMark(nullptr);
+  DmaMemoryMonitor::logSnapshot("ap-check-complete");
+  Serial.printf(
+      "[ap-check] completed id=%u status=%s elapsed=%lu stackHighWater=%u\n",
+      static_cast<unsigned>(jobId),
+      ExternalAccessPoint::reachabilityLabel(status),
+      static_cast<unsigned long>(millis() - startedMs),
+      static_cast<unsigned>(stackLeft));
 }

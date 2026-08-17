@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Plus, Pencil, Trash2 } from "lucide-react";
+import { ExternalLink, Pencil, Plus, RadioTower, Trash2 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
@@ -27,6 +27,7 @@ import {
   ACCESS_POINT_VENDORS,
   accessPointsApi,
   type AccessPointRecord,
+  type AccessPointStatus,
   type AccessPointWritePayload,
 } from "@/services/accessPoints";
 
@@ -51,6 +52,32 @@ function vendorLabel(vendor: string): string {
   return "Generic";
 }
 
+function statusLabel(status?: AccessPointStatus | null): string {
+  switch (status) {
+    case "online":
+      return "Online";
+    case "network_reachable":
+      return "Network reachable";
+    case "management_reachable":
+      return "Management reachable";
+    case "unreachable":
+      return "Unreachable";
+    case "disabled":
+      return "Disabled";
+    case "auth_failed":
+      return "Auth failed";
+    case "unknown":
+    default:
+      return "Unknown";
+  }
+}
+
+function openManagement(ip: string) {
+  const trimmed = ip.trim();
+  if (!trimmed) return;
+  window.open(`http://${trimmed}`, "_blank", "noopener,noreferrer");
+}
+
 export default function AccessPointsPage() {
   const queryClient = useQueryClient();
   const { data, isLoading } = useQuery({
@@ -64,6 +91,7 @@ export default function AccessPointsPage() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<AccessPointRecord | null>(null);
   const [form, setForm] = useState<AccessPointWritePayload>(EMPTY_FORM);
+  const [checkingIds, setCheckingIds] = useState<Set<string>>(new Set());
 
   const title = useMemo(
     () => (editing ? "Edit access point" : "Add access point"),
@@ -139,6 +167,36 @@ export default function AccessPointsPage() {
     },
   });
 
+  const checkMutation = useMutation({
+    mutationFn: async (id: string) => accessPointsApi.checkAndWait(id),
+    onMutate: (id) => {
+      setCheckingIds((prev) => {
+        const next = new Set(prev);
+        next.add(id);
+        return next;
+      });
+    },
+    onSuccess: (job) => {
+      queryClient.invalidateQueries({ queryKey: ["access-points"] });
+      const label = statusLabel(job.status);
+      if (job.state === "failed") {
+        toast.error(job.message || job.errorCode || "Access point check failed");
+        return;
+      }
+      toast.success(job.message || `Check complete: ${label}`);
+    },
+    onError: (error) => {
+      toast.error(isApiError(error) ? error.message : "Unable to check access point");
+    },
+    onSettled: (_data, _error, id) => {
+      setCheckingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    },
+  });
+
   return (
     <div>
       <PageHeader
@@ -190,6 +248,7 @@ export default function AccessPointsPage() {
                 <th className="px-3 py-2 font-medium">Management IP</th>
                 <th className="px-3 py-2 font-medium">SSID</th>
                 <th className="px-3 py-2 font-medium">Enabled</th>
+                <th className="px-3 py-2 font-medium">Status</th>
                 <th className="px-3 py-2 font-medium">Credentials</th>
                 <th className="px-3 py-2 font-medium text-right">Actions</th>
               </tr>
@@ -204,10 +263,32 @@ export default function AccessPointsPage() {
                   <td className="px-3 py-2">{record.ssid || "—"}</td>
                   <td className="px-3 py-2">{record.enabled ? "Yes" : "No"}</td>
                   <td className="px-3 py-2">
+                    {statusLabel(record.status)}
+                    {record.latencyMs != null ? ` (${record.latencyMs} ms)` : ""}
+                  </td>
+                  <td className="px-3 py-2">
                     {record.hasCredentials ? "Saved" : "None"}
                   </td>
                   <td className="px-3 py-2">
                     <div className="flex justify-end gap-1">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={checkingIds.has(record.id)}
+                        onClick={() => checkMutation.mutate(record.id)}
+                      >
+                        <RadioTower className="h-3.5 w-3.5" />
+                        {checkingIds.has(record.id) ? "Checking" : "Check"}
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => openManagement(record.managementIp)}
+                      >
+                        <ExternalLink className="h-3.5 w-3.5" /> Open
+                      </Button>
                       <Button
                         type="button"
                         size="sm"

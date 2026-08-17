@@ -49,7 +49,7 @@ class FirmwareApp {
   // HTTP stack owned by WebServerManager (heap AsyncWebServer after ETH link-up).
   WebServerManager       _web;
   EthernetManager      _eth;      // W5500 wired backend (replaces WiFiBootstrap)
-  ExternalAccessPointManager _accessPoints;  // Optional LAN coverage AP registry
+  ExternalAccessPointManager _accessPoints;  // Optional LAN coverage AP registry + Stage C check worker
   ManagementApManager  _mgmtAp;   // Installer/owner Wi-Fi AP @ 192.168.4.1
   ManagementApLifecycle _mgmtApLifecycle;
   StorageManager       _storage;

@@ -23,6 +23,38 @@ enum class Vendor : uint8_t {
   Other,
 };
 
+enum class ReachabilityStatus : uint8_t {
+  Unknown = 0,
+  Disabled,
+  Online,
+  NetworkReachable,
+  ManagementReachable,
+  AuthFailed,  // Stage E only. Stage C must never produce this.
+  Unreachable,
+};
+
+enum class ManagementTransport : uint8_t {
+  None = 0,
+  Http,
+  Https,
+};
+
+enum class CheckEnqueueStatus : uint8_t {
+  Ok = 0,
+  NotFound,
+  Busy,
+  StorageRecovery,
+  WorkerUnavailable,
+};
+
+enum class CheckJobState : uint8_t {
+  Idle = 0,
+  Queued,
+  Running,
+  Completed,
+  Failed,
+};
+
 enum class CrudStatus : uint8_t {
   Ok = 0,
   InvalidRequest,
@@ -152,6 +184,108 @@ inline IpCheckResult validateManagementIp(const char *candidateIp,
 
   if (!ipv4OnSubnet(candidate, esp32Ip, mask)) return IpCheckResult::NotOnLan;
   return IpCheckResult::Ok;
+}
+
+inline const char *reachabilityLabel(ReachabilityStatus status) {
+  switch (status) {
+    case ReachabilityStatus::Disabled:
+      return "disabled";
+    case ReachabilityStatus::Online:
+      return "online";
+    case ReachabilityStatus::NetworkReachable:
+      return "network_reachable";
+    case ReachabilityStatus::ManagementReachable:
+      return "management_reachable";
+    case ReachabilityStatus::AuthFailed:
+      return "auth_failed";
+    case ReachabilityStatus::Unreachable:
+      return "unreachable";
+    case ReachabilityStatus::Unknown:
+    default:
+      return "unknown";
+  }
+}
+
+inline const char *jobStateLabel(CheckJobState state) {
+  switch (state) {
+    case CheckJobState::Queued:
+      return "queued";
+    case CheckJobState::Running:
+      return "running";
+    case CheckJobState::Completed:
+      return "completed";
+    case CheckJobState::Failed:
+      return "failed";
+    case CheckJobState::Idle:
+    default:
+      return "idle";
+  }
+}
+
+// Stage C classification. Never returns AuthFailed (no authentication).
+inline ReachabilityStatus classifyReachability(bool disabled, bool ethernetReady,
+                                               bool icmpOk, bool tcpOk) {
+  if (disabled) return ReachabilityStatus::Disabled;
+  if (!ethernetReady) return ReachabilityStatus::Unknown;
+  if (icmpOk && tcpOk) return ReachabilityStatus::Online;
+  if (icmpOk && !tcpOk) return ReachabilityStatus::NetworkReachable;
+  if (!icmpOk && tcpOk) return ReachabilityStatus::ManagementReachable;
+  return ReachabilityStatus::Unreachable;
+}
+
+inline bool reachabilityIsSuccessful(ReachabilityStatus status) {
+  return status == ReachabilityStatus::Online ||
+         status == ReachabilityStatus::NetworkReachable ||
+         status == ReachabilityStatus::ManagementReachable;
+}
+
+inline const char *checkEnqueueCode(CheckEnqueueStatus status) {
+  switch (status) {
+    case CheckEnqueueStatus::Ok:
+      return "OK";
+    case CheckEnqueueStatus::NotFound:
+      return "ACCESS_POINT_NOT_FOUND";
+    case CheckEnqueueStatus::Busy:
+      return "ACCESS_POINT_CHECK_BUSY";
+    case CheckEnqueueStatus::StorageRecovery:
+      return "STORAGE_RECOVERY_IN_PROGRESS";
+    case CheckEnqueueStatus::WorkerUnavailable:
+      return "CHECK_FAILED";
+    default:
+      return "CHECK_FAILED";
+  }
+}
+
+inline const char *checkEnqueueMessage(CheckEnqueueStatus status) {
+  switch (status) {
+    case CheckEnqueueStatus::Ok:
+      return "Check queued";
+    case CheckEnqueueStatus::NotFound:
+      return "Access point not found";
+    case CheckEnqueueStatus::Busy:
+      return "An access point check is already running";
+    case CheckEnqueueStatus::StorageRecovery:
+      return "Storage recovery in progress";
+    case CheckEnqueueStatus::WorkerUnavailable:
+      return "Access point check worker is unavailable";
+    default:
+      return "Unable to start access point check";
+  }
+}
+
+inline int checkEnqueueHttpStatus(CheckEnqueueStatus status) {
+  switch (status) {
+    case CheckEnqueueStatus::Ok:
+      return 202;
+    case CheckEnqueueStatus::NotFound:
+      return 404;
+    case CheckEnqueueStatus::Busy:
+    case CheckEnqueueStatus::StorageRecovery:
+    case CheckEnqueueStatus::WorkerUnavailable:
+      return 503;
+    default:
+      return 500;
+  }
 }
 
 inline const char *crudCode(CrudStatus status) {

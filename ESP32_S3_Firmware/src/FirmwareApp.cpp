@@ -273,6 +273,7 @@ void FirmwareApp::loop() {
   _setupProvisioning.loop();
   _factoryReset.loop();
   _vouchers.loop();
+  _accessPoints.loop();
   if (!_factoryReset.busy()) {
     // Every FirmwareApp::loop() iteration while reset is idle: complete the
     // TWDT-safe deferred commit (QUEUED → PERSISTING → persist() → PERSISTED).

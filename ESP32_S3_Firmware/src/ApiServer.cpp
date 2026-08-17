@@ -51,8 +51,32 @@ bool parseExternalAccessPointId(const String &path, String &idOut) {
   const String rest = path.substring(prefix.length());
   if (rest.length() == 0) return false;
   if (rest.indexOf('/') >= 0) return false;
+  if (rest == "jobs") return false;
   idOut = urlDecode(rest);
   return idOut.length() > 0;
+}
+
+bool parseExternalAccessPointCheckPath(const String &path, String &idOut) {
+  const String prefix = "/api/access-points/";
+  const String suffix = "/check";
+  if (!path.startsWith(prefix) || !path.endsWith(suffix)) return false;
+  if (path.length() <= prefix.length() + suffix.length()) return false;
+  const String rest =
+      path.substring(prefix.length(), path.length() - suffix.length());
+  if (rest.length() == 0 || rest.indexOf('/') >= 0) return false;
+  if (rest == "jobs") return false;
+  idOut = urlDecode(rest);
+  return idOut.length() > 0;
+}
+
+bool parseExternalAccessPointJobPath(const String &path, uint32_t &jobIdOut) {
+  const String prefix = "/api/access-points/jobs/";
+  if (!path.startsWith(prefix)) return false;
+  const String rest = path.substring(prefix.length());
+  if (rest.length() == 0 || rest.indexOf('/') >= 0) return false;
+  if (rest[0] < '0' || rest[0] > '9') return false;
+  jobIdOut = static_cast<uint32_t>(rest.toInt());
+  return jobIdOut > 0;
 }
 
 // Body accumulation handler.  Pass as the ArBodyHandlerFunction (5th arg) to
@@ -3212,8 +3236,9 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
   _server->on("/api/system/wifi/config", HTTP_POST, wifiConfigWrite, nullptr, bodyCollect);
   _server->on("/api/system/wifi/config", HTTP_PUT,  wifiConfigWrite, nullptr, bodyCollect);
 
-  // External Access Point registry (Stage B: CRUD only, no probes).
-  // Exact collection match so POST /api/access-points/{id} cannot hit create.
+  // External Access Point registry (Stage B CRUD) + Stage C check jobs.
+  // Exact collection match so POST /api/access-points/{id}/check cannot hit create.
+  // Job GET is registered before /api/access-points/* so jobs/{id} is not stolen.
   _server->on(AsyncURIMatcher::exact("/api/access-points"), HTTP_GET,
               [this](AsyncWebServerRequest *req) {
     RENZFI_PROD_GATE(req);
@@ -3259,6 +3284,73 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
         sendOk(req, outHeap.doc(), 201, "Access point created");
       },
       nullptr, bodyCollect);
+
+  _server->on("/api/access-points/jobs/*", HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_accessPoints) {
+      sendError(req, 503, "Access point registry unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    uint32_t jobId = 0;
+    if (!parseExternalAccessPointJobPath(req->url(), jobId)) {
+      sendError(req, 404, "Access point job not found", "NOT_FOUND");
+      return;
+    }
+    ExternalAccessPointManager::CheckJobSnapshot snap;
+    if (!_accessPoints->pollCheckJob(jobId, snap)) {
+      sendError(req, 404, "Access point job not found", "NOT_FOUND");
+      return;
+    }
+    PsramJsonDocument dataHeap;
+    JsonObject data = dataHeap.doc().to<JsonObject>();
+    data["jobId"] = snap.jobId;
+    data["accessPointId"] = snap.accessPointId;
+    data["state"] = snap.state;
+    data["ok"] = snap.ok;
+    data["status"] = snap.status;
+    if (snap.latencyValid) {
+      data["latencyMs"] = snap.latencyMs;
+    } else {
+      data["latencyMs"] = nullptr;
+    }
+    data["startedAt"] = snap.startedAt;
+    data["completedAt"] = snap.completedAt;
+    if (snap.errorCode) data["errorCode"] = snap.errorCode;
+    if (snap.message[0] != '\0') data["message"] = snap.message;
+    sendOk(req, dataHeap.doc(), "Access point job");
+  });
+
+  _server->on("/api/access-points/*", HTTP_POST,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_accessPoints) {
+      sendError(req, 503, "Access point registry unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    String id;
+    if (!parseExternalAccessPointCheckPath(req->url(), id)) {
+      sendError(req, 404, "Access point not found", "NOT_FOUND");
+      return;
+    }
+    uint32_t jobId = 0;
+    const ExternalAccessPoint::CheckEnqueueStatus status =
+        _accessPoints->enqueueCheck(id, jobId);
+    if (status != ExternalAccessPoint::CheckEnqueueStatus::Ok) {
+      sendError(req, ExternalAccessPoint::checkEnqueueHttpStatus(status),
+                ExternalAccessPoint::checkEnqueueMessage(status),
+                ExternalAccessPoint::checkEnqueueCode(status));
+      return;
+    }
+    PsramJsonDocument dataHeap;
+    JsonObject data = dataHeap.doc().to<JsonObject>();
+    data["jobId"] = jobId;
+    data["accessPointId"] = id;
+    data["state"] = "queued";
+    sendOk(req, dataHeap.doc(), 202, "Access point check queued");
+  });
 
   auto accessPointItem = [this](AsyncWebServerRequest *req) {
     RENZFI_PROD_GATE(req);

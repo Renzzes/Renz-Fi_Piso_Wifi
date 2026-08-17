@@ -1,12 +1,24 @@
 # External Access Point Architecture
 
-**Status:** Stage B persistence/CRUD implemented. Reachability (Stage C+) is not included.  
+**Status:** Stage C generic reachability implemented. Stage D/E/F/G are not implemented.  
 **Baseline:** Git tag `v0.5.0-fully-operational` (`55a33ac289896a20c8687a5da0b623699eef19a7`)  
 **Branch:** `feature/external-access-point`  
 **Firmware:** `0.5.0-w5500`  
 **Date:** 2026-08-17
 
-This document is the design contract for an **optional** External Access Point registry and reachability feature. It does **not** implement the feature.
+This document is the design contract for an **optional** External Access Point registry and reachability feature.
+
+**Implementation status**
+
+- Stage A: complete (this architecture)
+- Stage B: complete (`stage-b: external-ap persistence-crud`)
+- Stage C: complete — owner Check → HTTP 202 job → dedicated `ap_check_worker` → ICMP + TCP 80/443 → RAM status only
+- Stage D: not implemented
+- Stage E: not implemented (no vendor login/config)
+- Stage F: not implemented (no 45-second monitoring)
+- Stage G: not implemented (physical validation is separate)
+
+Stage B already shipped the owner Access Points page. Stage C adds the Check action and job polling only.
 
 ---
 
@@ -341,6 +353,8 @@ Generic probe (Stage C):
 2. Non-blocking-wait via `vTaskDelay` on the AP worker only
 3. TCP connect to port 80 (fallback 443), timeout ≤ 2000 ms
 4. Classify status; update RAM; complete job
+
+**Stage C actual behavior:** `POST /api/access-points/{id}/check` authenticates the owner, validates the id, rejects `STORAGE_RECOVERY_IN_PROGRESS` and `ACCESS_POINT_CHECK_BUSY` with HTTP 503, then returns HTTP 202 + `jobId`. `ap_check_worker` (core 0, single-flight) performs the probe. `GET /api/access-points/jobs/{jobId}` returns the RAM job snapshot with no network I/O. Checks never write `/config/access-points.json`, never take STORAGE_LOCK for the probe, and never call RouterOS / RouterWorker. Empty registry stays idle. Stage F 45-second monitoring is not implemented.
 
 No vendor login in Stage C. No large JSON. No STORAGE_LOCK during probes.
 
