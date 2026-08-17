@@ -201,7 +201,7 @@ export default function AccessPointsPage() {
     <div>
       <PageHeader
         title="Access Points"
-        description="Optional LAN coverage APs. MikroTik remains the gateway, Hotspot, and voucher authority."
+        description="External Access Points extend Wi-Fi coverage through your MikroTik LAN. Configure each access point in its own web interface first, then register its management IP here. Renz-Fi does not configure the access point."
         actions={
           <Button size="sm" onClick={openCreate}>
             <Plus className="h-3.5 w-3.5" /> Add Access Point
@@ -221,17 +221,19 @@ export default function AccessPointsPage() {
 
       {records.length === 0 && !isLoading && (
         <Alert className="mb-3 max-w-3xl">
-          <AlertTitle>No external access points configured</AlertTitle>
+          <AlertTitle>No external access points registered</AlertTitle>
           <AlertDescription className="space-y-2">
             <p>
-              External Access Points are optional coverage radios connected to the
-              MikroTik LAN. The main Renz-Fi system works without them.
+              External Access Points are optional coverage radios on the MikroTik
+              LAN. Configure each device in its own web interface first. Renz-Fi
+              does not configure the access point. The main system works without them.
             </p>
             <ul className="list-disc pl-5 text-sm">
-              <li>Configure the device in AP or Bridge mode</li>
-              <li>Disable DHCP and NAT on the AP</li>
-              <li>Connect LAN-to-LAN (MikroTik LAN or LAN switch)</li>
-              <li>MikroTik remains the gateway, Hotspot, voucher, and bandwidth authority</li>
+              <li>On the AP: set AP or Bridge mode</li>
+              <li>On the AP: disable DHCP and NAT</li>
+              <li>Connect the AP LAN port to the MikroTik LAN or switch</li>
+              <li>Confirm clients get DHCP and HotSpot from MikroTik</li>
+              <li>Then register the AP management IP here</li>
             </ul>
           </AlertDescription>
         </Alert>
@@ -243,7 +245,7 @@ export default function AccessPointsPage() {
             <thead className="bg-muted/50 text-left">
               <tr>
                 <th className="px-3 py-2 font-medium">Name</th>
-                <th className="px-3 py-2 font-medium">Vendor</th>
+                <th className="px-3 py-2 font-medium">Brand</th>
                 <th className="px-3 py-2 font-medium">Model</th>
                 <th className="px-3 py-2 font-medium">Management IP</th>
                 <th className="px-3 py-2 font-medium">SSID</th>
@@ -323,6 +325,10 @@ export default function AccessPointsPage() {
           <DialogHeader>
             <DialogTitle>{title}</DialogTitle>
           </DialogHeader>
+          <p className="text-xs text-muted-foreground">
+            Register an AP that is already configured in AP/Bridge mode. Renz-Fi
+            does not push SSID, DHCP, NAT, VLAN, or other settings to the device.
+          </p>
           <div className="grid gap-3">
             <div className="grid gap-1">
               <Label htmlFor="ap-name">Name</Label>
@@ -344,7 +350,7 @@ export default function AccessPointsPage() {
               />
             </div>
             <div className="grid gap-1">
-              <Label>Vendor</Label>
+              <Label>Brand (label only)</Label>
               <Select
                 value={form.vendor || "generic"}
                 onValueChange={(vendor) => setForm({ ...form, vendor })}
@@ -360,6 +366,9 @@ export default function AccessPointsPage() {
                   ))}
                 </SelectContent>
               </Select>
+              <p className="text-xs text-muted-foreground">
+                Informational. This does not select a driver or configure the AP.
+              </p>
             </div>
             <div className="grid gap-1">
               <Label htmlFor="ap-model">Model</Label>
@@ -377,7 +386,8 @@ export default function AccessPointsPage() {
                 onChange={(event) => setForm({ ...form, ssid: event.target.value })}
               />
               <p className="text-xs text-muted-foreground">
-                Informational. Renz-Fi does not change the AP SSID.
+                Informational metadata. Set the SSID on the AP itself. Renz-Fi does
+                not change it.
               </p>
             </div>
             <div className="grid gap-1">
@@ -422,8 +432,8 @@ export default function AccessPointsPage() {
               />
               <p className="text-xs text-muted-foreground">
                 {editing
-                  ? "Leave blank to keep the stored password."
-                  : "Optional. Stored encrypted on the appliance, never returned to the browser."}
+                  ? "Leave blank to keep the stored password. Renz-Fi does not use it to configure the AP."
+                  : "Optional. Stored encrypted on the appliance and never returned to the browser. Renz-Fi does not use it to configure the AP."}
               </p>
             </div>
             <label className="flex items-center gap-2 text-sm">

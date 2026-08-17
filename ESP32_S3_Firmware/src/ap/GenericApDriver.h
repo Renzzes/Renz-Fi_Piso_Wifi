@@ -3,7 +3,7 @@
 #include "ap/IExternalApDriver.h"
 
 // ICMP echo (count=1) plus TCP connect to port 80, then 443.
-// No HTTP request body, no authentication, no vendor API.
+// Reachability only: no HTTP body, no authentication, no configuration push.
 class GenericApDriver : public ExternalAccessPoint::IExternalApDriver {
  public:
   ExternalAccessPoint::ProbeResult probe(

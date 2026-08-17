@@ -29,7 +29,7 @@ enum class ReachabilityStatus : uint8_t {
   Online,
   NetworkReachable,
   ManagementReachable,
-  AuthFailed,  // Stage E only. Stage C must never produce this.
+  AuthFailed,  // Reserved. Not produced. No AP authentication/configuration feature.
   Unreachable,
 };
 

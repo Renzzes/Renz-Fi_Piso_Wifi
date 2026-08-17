@@ -4,8 +4,8 @@
 
 #include "ExternalAccessPointTypes.h"
 
-// Generic reachability contract. Stage C implementations must not authenticate,
-// send configuration, or download vendor UI.
+// Reachability probe contract only. Not a vendor configuration driver.
+// Implementations must not authenticate, send configuration, or download AP UI.
 namespace ExternalAccessPoint {
 
 struct ProbeTarget {

@@ -15,7 +15,8 @@ class StorageManager;
 
 // Optional registry of external LAN coverage APs.
 // Stage B: persist + CRUD + live IP validation.
-// Stage C: single-flight reachability worker (ICMP + TCP). No RouterOS. No SD on check.
+// Stage C: single-flight reachability worker (ICMP + TCP).
+// Does not configure APs, does not use RouterOS, does not write SD on check.
 class ExternalAccessPointManager {
  public:
   static constexpr uint8_t kMaxAccessPoints = ExternalAccessPoint::kMaxAccessPoints;

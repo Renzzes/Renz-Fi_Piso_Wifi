@@ -15,7 +15,7 @@ Operator sessions receive HTTP 403 `OWNER_REQUIRED`:
 
 - `POST/PUT /api/system/wifi/config` — Ethernet/IP settings
 - `GET/POST /api/access-points`, `GET/PUT/DELETE /api/access-points/{id}` — External Access Point registry (owner-only; not the ESP32 Management AP)
-- `POST /api/access-points/{id}/check`, `GET /api/access-points/jobs/{jobId}` — External Access Point reachability job (owner-only; no RouterOS)
+- `POST /api/access-points/{id}/check`, `GET /api/access-points/jobs/{jobId}` — External Access Point reachability job (owner-only; no RouterOS; does not configure the AP)
 - `GET/POST/PUT /api/router/settings`, `POST /api/router/test`
 - `POST /api/system/reboot`, `POST /api/system/factory-reset`
 - `GET /api/settings/backup`, `POST /api/settings/restore`

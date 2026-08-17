@@ -482,7 +482,7 @@ Unless noted: **Admin** auth, **No Cache**, **`application/json`**.
 | GET/POST/PUT | `/api/router/settings` | MikroTik settings |
 | GET/POST | `/api/access-points` | External AP registry list / create (owner-only, exact match) |
 | GET/PUT/DELETE | `/api/access-points/{id}` | External AP registry item (owner-only) |
-| POST | `/api/access-points/{id}/check` | Queue generic reachability job (owner-only, HTTP 202, single-flight) |
+| POST | `/api/access-points/{id}/check` | Queue generic reachability job (owner-only, HTTP 202, single-flight; does not configure the AP) |
 | GET | `/api/access-points/jobs/{jobId}` | RAM-only access-point check job snapshot (owner-only) |
 | GET | `/api/router/profiles` | Hotspot profiles |
 | POST | `/api/router/test` | Test router connection |
