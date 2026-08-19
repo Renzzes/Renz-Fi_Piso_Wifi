@@ -79,6 +79,16 @@ bool parseExternalAccessPointJobPath(const String &path, uint32_t &jobIdOut) {
   return jobIdOut > 0;
 }
 
+bool parseExternalAccessPointDetectJobPath(const String &path, uint32_t &jobIdOut) {
+  const String prefix = "/api/access-points/detect/jobs/";
+  if (!path.startsWith(prefix)) return false;
+  const String rest = path.substring(prefix.length());
+  if (rest.length() == 0 || rest.indexOf('/') >= 0) return false;
+  if (rest[0] < '0' || rest[0] > '9') return false;
+  jobIdOut = static_cast<uint32_t>(rest.toInt());
+  return jobIdOut > 0;
+}
+
 // Body accumulation handler.  Pass as the ArBodyHandlerFunction (5th arg) to
 // server.on() for every route that needs to read a POST/PUT body.
 // The body is stored as a null-terminated C-string in req->_tempObject, which
@@ -3320,6 +3330,77 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
     if (snap.errorCode) data["errorCode"] = snap.errorCode;
     if (snap.message[0] != '\0') data["message"] = snap.message;
     sendOk(req, dataHeap.doc(), "Access point job");
+  });
+
+  _server->on(AsyncURIMatcher::exact("/api/access-points/detect"), HTTP_POST,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_routerWorker || !_accessPoints) {
+      sendError(req, 503, "Access point detection unavailable", "INTERNAL_ERROR");
+      return;
+    }
+
+    PsramJsonDocument listHeap;
+    _accessPoints->fillList(listHeap.doc());
+    DynamicJsonDocument detectReq(RenzFiConfig::JSON_DOC_MEDIUM);
+    JsonArray registered = detectReq["registeredIps"].to<JsonArray>();
+    if (listHeap.doc()["accessPoints"].is<JsonArrayConst>()) {
+      for (JsonObjectConst row : listHeap.doc()["accessPoints"].as<JsonArrayConst>()) {
+        const String ip = row["managementIp"] | "";
+        if (ip.length() > 0) registered.add(ip);
+      }
+    }
+    String requestJson;
+    serializeJson(detectReq, requestJson);
+
+    const auto outcome = _routerWorker->enqueueAccessPointDetect(requestJson);
+    if (!outcome.accepted) {
+      const char *code = outcome.rejectCode ? outcome.rejectCode : "ROUTER_WORKER_BUSY";
+      const char *message = outcome.rejectMessage ? outcome.rejectMessage
+                                                  : "Router worker is busy";
+      sendError(req, 503, message, code);
+      return;
+    }
+
+    PsramJsonDocument dataHeap;
+    JsonObject data = dataHeap.doc().to<JsonObject>();
+    data["jobId"] = outcome.jobId;
+    data["state"] = "queued";
+    sendOk(req, dataHeap.doc(), 202, "Access point detect queued");
+  }, nullptr, bodyCollect);
+
+  _server->on("/api/access-points/detect/jobs/*", HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_routerWorker) {
+      sendError(req, 503, "Router worker unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    uint32_t jobId = 0;
+    if (!parseExternalAccessPointDetectJobPath(req->url(), jobId)) {
+      sendError(req, 404, "Access point detect job not found", "NOT_FOUND");
+      return;
+    }
+    RouterProvisioningWorker::JobRecord job;
+    if (!_routerWorker->pollJob(jobId, job)) {
+      sendError(req, 404, "Access point detect job not found", "NOT_FOUND");
+      return;
+    }
+    PsramJsonDocument dataHeap;
+    JsonObject data = dataHeap.doc().to<JsonObject>();
+    data["jobId"] = job.jobId;
+    data["state"] = RouterProvisioningWorker::jobStateLabel(job.state);
+    const bool terminal =
+        job.state == RouterProvisioningWorker::JobState::Completed ||
+        job.state == RouterProvisioningWorker::JobState::Failed;
+    if (terminal) {
+      data["ok"] = job.result.ok;
+      if (!job.result.body.isEmpty()) data["result"] = serialized(job.result.body);
+      data["httpStatus"] = job.result.httpStatus;
+    }
+    sendOk(req, dataHeap.doc(), "Access point detect job");
   });
 
   _server->on("/api/access-points/*", HTTP_POST,

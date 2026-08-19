@@ -2,6 +2,7 @@
 #include "RouterProvisioningWorker.h"
 
 #include <memory>
+#include <vector>
 
 #include "Config.h"
 #include "EthernetManager.h"
@@ -163,6 +164,21 @@ void fillWorkerSetupStatus(SetupProvisioningManager *provisioning,
       data, eth, buildSetupStatusContext(routerProvisioning, nullptr));
 }
 
+String attrFromReply(const RouterOsClient::CommandResult &result, uint8_t row,
+                     const char *keyName) {
+  if (row >= result.replyCount || !keyName || !keyName[0]) return String();
+  const auto &record = result.replyAt(row);
+  for (uint8_t i = 0; i < record.attrCount; ++i) {
+    String key;
+    String value;
+    if (RouterOsClient::parseAttr(record.attr(i), key, value) &&
+        key.equalsIgnoreCase(keyName)) {
+      return value;
+    }
+  }
+  return String();
+}
+
 }  // namespace
 
 const char *RouterProvisioningWorker::opTypeLabel(OpType type) {
@@ -207,6 +223,8 @@ const char *RouterProvisioningWorker::opTypeLabel(OpType type) {
       return "admin-refresh-cache";
     case OpType::AdminUserProfileOp:
       return "admin-user-profile";
+    case OpType::AccessPointDetect:
+      return "access-point-detect";
     default:
       return "unknown";
   }
@@ -904,6 +922,14 @@ RouterProvisioningWorker::enqueueAdminUserProfileOp(const String &requestJson) {
   prepared.type = OpType::AdminUserProfileOp;
   prepared.requestJson = requestJson;
   return enqueueAdminPrepared(prepared, "admin-user-profile");
+}
+
+RouterProvisioningWorker::EnqueueOutcome
+RouterProvisioningWorker::enqueueAccessPointDetect(const String &requestJson) {
+  WorkSlot prepared;
+  prepared.type = OpType::AccessPointDetect;
+  prepared.requestJson = requestJson;
+  return enqueueAdminPrepared(prepared, "access-point-detect");
 }
 
 void RouterProvisioningWorker::runOp(WorkSlot &slot) {
@@ -1642,6 +1668,135 @@ void RouterProvisioningWorker::runOp(WorkSlot &slot) {
       slot.result.body       = buildErrorBody(err, "ROUTER_PROFILE_OP_FAILED");
       slot.result.httpStatus = 400;
       slot.result.ok         = false;
+    }
+  } else if (slot.type == OpType::AccessPointDetect) {
+    std::vector<String> registeredIps;
+    if (!slot.requestJson.isEmpty()) {
+      HeapJsonDocument bodyDoc(RenzFiConfig::JSON_DOC_MEDIUM);
+      DynamicJsonDocument &body = bodyDoc.doc();
+      if (!deserializeJson(body, slot.requestJson) &&
+          body["registeredIps"].is<JsonArrayConst>()) {
+        for (JsonVariantConst v : body["registeredIps"].as<JsonArrayConst>()) {
+          const String ip = v.as<String>();
+          if (!ip.isEmpty()) registeredIps.push_back(ip);
+        }
+      }
+    }
+
+    std::unique_ptr<RouterOsClient> client;
+    String connectError, connectCode;
+    if (!openPersistedRouterClient(_eth, _routerConnection, client, connectError,
+                                   connectCode)) {
+      slot.result.httpStatus = 502;
+      slot.result.body =
+          buildErrorBody(connectError, connectCode.isEmpty() ? "ROUTER_CONNECT_FAILED"
+                                                             : connectCode);
+      slot.result.ok = false;
+    } else {
+      RouterOsClient::CommandResult arpResult;
+      RouterOsClient::CommandResult bridgeHostResult;
+      RouterOsClient::CommandResult leaseResult;
+      RouterOsClient::initializeCommandResult(arpResult);
+      RouterOsClient::initializeCommandResult(bridgeHostResult);
+      RouterOsClient::initializeCommandResult(leaseResult);
+
+      const String arpProps[] = {"=.proplist=address,mac-address,interface,status"};
+      const bool arpOk = client->executeCommand("/ip/arp/print", arpProps, 1, arpResult);
+      if (!arpOk) {
+        const String err = client->lastError();
+        slot.result.body = buildErrorBody(
+            err.isEmpty() ? String("Unable to read MikroTik ARP table") : err,
+            "AP_DETECT_FAILED");
+        slot.result.httpStatus = 502;
+        slot.result.ok = false;
+      } else {
+        const String bridgeProps[] = {"=.proplist=mac-address,on-interface,bridge"};
+        const bool bridgeOk = client->executeCommand("/interface/bridge/host/print",
+                                                     bridgeProps, 1, bridgeHostResult);
+        const String leaseProps[] = {"=.proplist=address,mac-address,host-name,status"};
+        const bool leaseOk = client->executeCommand("/ip/dhcp-server/lease/print",
+                                                    leaseProps, 1, leaseResult);
+
+        HeapJsonDocument outDoc(RenzFiConfig::JSON_DOC_LARGE);
+        DynamicJsonDocument &out = outDoc.doc();
+        out["success"] = true;
+        JsonObject data = out["data"].to<JsonObject>();
+        JsonArray devices = data["devices"].to<JsonArray>();
+        uint16_t filtered = 0;
+
+        for (uint8_t i = 0; i < arpResult.replyCount; ++i) {
+          const String ip = attrFromReply(arpResult, i, "address");
+          const String mac = attrFromReply(arpResult, i, "mac-address");
+          const String iface = attrFromReply(arpResult, i, "interface");
+          const String status = attrFromReply(arpResult, i, "status");
+          if (ip.isEmpty() || ip == "0.0.0.0" || mac.isEmpty()) {
+            filtered++;
+            continue;
+          }
+          bool duplicate = false;
+          for (JsonVariantConst existing : devices) {
+            if (String(existing["ip"] | "") == ip) {
+              duplicate = true;
+              break;
+            }
+          }
+          if (duplicate) {
+            filtered++;
+            continue;
+          }
+          bool alreadyRegistered = false;
+          for (const String &registered : registeredIps) {
+            if (registered == ip) {
+              alreadyRegistered = true;
+              break;
+            }
+          }
+          if (alreadyRegistered) {
+            filtered++;
+            continue;
+          }
+
+          String bridgePort;
+          for (uint8_t j = 0; j < bridgeHostResult.replyCount; ++j) {
+            if (attrFromReply(bridgeHostResult, j, "mac-address")
+                    .equalsIgnoreCase(mac)) {
+              bridgePort = attrFromReply(bridgeHostResult, j, "on-interface");
+              break;
+            }
+          }
+
+          String hostname;
+          for (uint8_t j = 0; j < leaseResult.replyCount; ++j) {
+            const String leaseIp = attrFromReply(leaseResult, j, "address");
+            const String leaseMac = attrFromReply(leaseResult, j, "mac-address");
+            if ((leaseIp == ip || leaseMac.equalsIgnoreCase(mac))) {
+              hostname = attrFromReply(leaseResult, j, "host-name");
+              break;
+            }
+          }
+
+          JsonObject row = devices.add<JsonObject>();
+          row["ip"] = ip;
+          row["mac"] = mac;
+          row["interface"] = iface;
+          row["bridgePort"] = bridgePort;
+          row["hostname"] = hostname;
+          row["status"] = status;
+        }
+
+        data["source"] = "mikrotik_arp";
+        data["oneTime"] = true;
+        data["arpRows"] = arpResult.replyCount;
+        data["returned"] = devices.size();
+        data["filteredOut"] = filtered;
+        if (!bridgeOk) data["bridgeHostWarning"] = "bridge_host_lookup_failed";
+        if (!leaseOk) data["leaseWarning"] = "dhcp_lease_lookup_failed";
+        out["message"] = "Detection complete";
+        serializeJson(out, slot.result.body);
+        slot.result.httpStatus = 200;
+        slot.result.ok = true;
+      }
+      client->disconnect("success");
     }
   }
 

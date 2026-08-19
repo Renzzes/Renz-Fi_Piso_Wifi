@@ -14,10 +14,40 @@ This document is the **source of truth** for External Access Point work. The fea
 - Stage A: complete (this architecture)
 - Stage B: complete — persist/CRUD registry (`stage-b: external-ap persistence-crud`)
 - Stage C: complete — generic reachability / management status (`stage-c: external-ap-generic-reachability`)
+- Detect: one-time optional MikroTik ARP lookup job (owner-triggered, non-continuous)
 - Automatic 45-second monitoring: not implemented
 - Vendor AP configuration/provisioning: **will not be implemented**
 - VLAN: **out of scope**
 - Physical validation: not yet performed
+
+---
+
+## Architectural Guardrails (frozen)
+
+These statements are mandatory. Future work must not weaken them.
+
+1. Renz-Fi does not configure external APs.
+2. AP credentials are metadata only and are not used for AP login/configuration.
+3. Vendor is informational metadata and is not a driver selector.
+4. GenericApDriver is a reachability probe, not a configuration driver.
+5. No VLAN is implemented.
+6. No AP-side bandwidth enforcement is implemented.
+7. MikroTik remains the network authority.
+8. Owner configures AP through the AP's own web interface.
+9. Open launches the AP's own management interface; ESP32 does not proxy it.
+10. Same SSID is allowed but seamless roaming is not guaranteed.
+11. Detect is a one-time owner action and must not run as background scanning.
+12. ARP reachable from Detect is evidence only; AP status `online` comes from Stage C check.
+
+Intended product model:
+
+> Configure the AP yourself. Plug it into MikroTik. MikroTik handles the network. Register the AP in Renz-Fi so the owner can see and check it.
+
+Not:
+
+> Configure the AP from Renz-Fi.
+
+`IExternalApDriver` / `GenericApDriver` are **reachability probes only**. They are not vendor configuration drivers and must not grow a `vendor → configuration driver` factory.
 
 ---
 
@@ -244,6 +274,13 @@ Status means reachability, not “the AP is correctly configured”:
 
 `auth_failed` is not produced. There is no AP authentication feature.
 
+One-time Detect is separate from Stage C check:
+
+- `POST /api/access-points/detect` queues one bounded RouterWorker job (HTTP 202)
+- `GET /api/access-points/detect/jobs/{jobId}` polls only that queued job
+- Detect may return ARP data (IP/MAC/interface/bridge-port/hostname/status)
+- Detect does not auto-create AP entries and does not replace Check status classification
+
 ---
 
 ## 8. Credentials
@@ -388,7 +425,48 @@ Historical Stage B/C checkpoints must not be rewritten. `v0.5.0-fully-operationa
 
 ---
 
-## 17. Files and frozen-contract notes
+## 17. RouterOS Worker Ownership Exception — External AP Detect
+
+External AP Detect needs RouterOS data (`/ip/arp/print` and optional
+read-only bridge/lease lookups), so it must run on the existing asynchronous
+RouterOS job owner.
+
+Approved exception:
+
+- `RouterProvisioningWorker` remains the sole asynchronous RouterOS job owner.
+- External AP Detect may reuse this existing job infrastructure for one-time,
+  bounded, read-only RouterOS detection.
+- This exception does not authorize AP configuration, RouterOS configuration
+  writes, periodic scanning, or creation of another RouterOS worker/client.
+
+Why this is required:
+
+1. Detect needs MikroTik-side evidence; AP Check does not.
+2. Reusing the existing worker avoids competing RouterOS clients/queues and
+   duplicated recovery/auth/session ownership.
+3. Detect remains asynchronous (`POST` enqueue -> `202` -> job poll), so no
+   blocking RouterOS work runs inside HTTP handlers.
+4. Detect remains one-time and owner-triggered only; no timers, daemons, or
+   continuous ARP monitoring.
+5. Detect is read-only and bounded.
+6. Detect cannot auto-create AP entries; owner confirmation is required via
+   "Use This Device."
+7. Detect cannot configure the AP, cannot alter MikroTik, and cannot control
+   AP power/interface state.
+8. AP Check remains completely independent on `ap_check_worker` with
+   `GenericApDriver` (ICMP + TCP), no RouterOS, no SD, no AP credentials.
+
+Allowed Detect read operations:
+
+- `/ip/arp/print`
+- optional `/interface/bridge/host/print`
+- optional `/ip/dhcp-server/lease/print`
+
+Detect is prohibited from RouterOS writes and network-control mutations.
+
+---
+
+## 18. Files and frozen-contract notes
 
 Implemented:
 
@@ -402,7 +480,17 @@ Implemented:
 | `src/pages/AccessPointsPage.tsx` | Owner Admin UI |
 | `src/services/accessPoints.ts` | Client API + job poll |
 
-Must not modify: RouterProvisioningWorker, RouterWorker, MikroTikDriver, RouterOsClient, VoucherManager, PortalSessionManager, CoinManager, ManagementApManager, EthernetManager, W5500 SPI, SD remount, STORAGE_LOCK, TWDT, partition table, sales chart, setup wizard, router credential recovery.
+Core freeze applies to: RouterWorker, MikroTikDriver, RouterOsClient,
+VoucherManager, PortalSessionManager, CoinManager, ManagementApManager,
+EthernetManager, W5500 SPI, SD remount, STORAGE_LOCK, TWDT, partition table,
+sales chart, setup wizard, router credential recovery.
+
+RouterProvisioningWorker exception:
+
+- Keep a single RouterOS async owner.
+- External AP Detect may add only one-time bounded read-only job handling.
+- No additional RouterOS worker/client is allowed.
+- No RouterOS/AP configuration writes are allowed through this exception.
 
 Setup wizard remains frozen at six steps. AP registration is Admin-only.
 
@@ -410,7 +498,7 @@ Setup wizard remains frozen at six steps. AP registration is Admin-only.
 
 ---
 
-## 18. Absolute rule
+## 19. Absolute rule
 
 ```
 OWNER CONFIGURES AP

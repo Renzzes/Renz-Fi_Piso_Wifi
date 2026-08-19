@@ -42,6 +42,15 @@ function parseJobPath(path) {
   return jobId > 0 ? jobId : null;
 }
 
+function parseDetectJobPath(path) {
+  const prefix = "/api/access-points/detect/jobs/";
+  if (!path.startsWith(prefix)) return null;
+  const rest = path.slice(prefix.length);
+  if (!rest || rest.includes("/") || rest[0] < "0" || rest[0] > "9") return null;
+  const jobId = Number.parseInt(rest, 10);
+  return jobId > 0 ? jobId : null;
+}
+
 function persistFields(record) {
   return {
     id: record.id,
@@ -326,6 +335,9 @@ assert("20 exact check", parseCheckPath("/api/access-points/ap_a1b2c3d4/check") 
 assert("20 jobs is not item", parseItemPath("/api/access-points/jobs/1") === null);
 assert("20 exact job", parseJobPath("/api/access-points/jobs/1") === 1);
 assert("20 check is not item", parseItemPath("/api/access-points/ap_a1b2c3d4/check") === null);
+assert("20 detect route does not parse as check", parseCheckPath("/api/access-points/detect") === null);
+assert("20 detect jobs parse", parseDetectJobPath("/api/access-points/detect/jobs/7") === 7);
+assert("20 detect jobs reject malformed", parseDetectJobPath("/api/access-points/detect/jobs/7/extra") === null);
 
 {
   const persisted = persistFields({

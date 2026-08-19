@@ -84,11 +84,45 @@ export type AccessPointJob = {
   message?: string;
 };
 
+export type AccessPointDetectQueued = {
+  jobId: number;
+  state?: string;
+};
+
+export type AccessPointDetectDevice = {
+  ip: string;
+  mac: string;
+  interface?: string;
+  bridgePort?: string;
+  hostname?: string;
+  status?: string;
+};
+
+export type AccessPointDetectResult = {
+  devices: AccessPointDetectDevice[];
+  source?: string;
+  oneTime?: boolean;
+  arpRows?: number;
+  returned?: number;
+  filteredOut?: number;
+  bridgeHostWarning?: string;
+  leaseWarning?: string;
+};
+
+export type AccessPointDetectJob = {
+  jobId: number;
+  state?: string;
+  ok?: boolean;
+  httpStatus?: number;
+  result?: string;
+};
+
 const POLL_MS = 450;
 const POLL_DEADLINE_MS = 30_000;
 const NETWORK_RETRY_LIMIT = 4;
 
 const activePollers = new Map<number, Promise<AccessPointJob>>();
+const activeDetectPollers = new Map<number, Promise<AccessPointDetectResult>>();
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -171,6 +205,10 @@ export const accessPointsApi = {
     ),
   getAccessPointJob: (jobId: number) =>
     api.get<AccessPointJob>(`${embeddedApi.accessPoints}/jobs/${jobId}`),
+  detectAccessPoints: () =>
+    api.post<AccessPointDetectQueued>(`${embeddedApi.accessPoints}/detect`, {}),
+  getDetectJob: (jobId: number) =>
+    api.get<AccessPointDetectJob>(`${embeddedApi.accessPoints}/detect/jobs/${jobId}`),
   checkAndWait: async (id: string): Promise<AccessPointJob> => {
     const queued = await accessPointsApi.checkAccessPoint(id);
     const jobId = queued.jobId;
@@ -183,6 +221,44 @@ export const accessPointsApi = {
       activePollers.delete(jobId);
     });
     activePollers.set(jobId, poller);
+    return poller;
+  },
+  detectAndWait: async (): Promise<AccessPointDetectResult> => {
+    const queued = await accessPointsApi.detectAccessPoints();
+    const jobId = queued.jobId;
+    if (!jobId) {
+      throw new ApiError("Detect did not return a job id", 500, "DETECT_FAILED");
+    }
+    const existing = activeDetectPollers.get(jobId);
+    if (existing) return existing;
+    const poller = (async () => {
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < POLL_DEADLINE_MS) {
+        const job = await accessPointsApi.getDetectJob(jobId);
+        const state = (job.state ?? "").trim().toLowerCase();
+        if (state === "queued" || state === "running") {
+          await sleep(POLL_MS);
+          continue;
+        }
+        if (state !== "completed") {
+          throw new Error("Detect job failed");
+        }
+        if (!job.result) return { devices: [] };
+        const parsed = JSON.parse(job.result) as {
+          success?: boolean;
+          data?: AccessPointDetectResult;
+          error?: string;
+        };
+        if (parsed.success === false) {
+          throw new Error(parsed.error || "Detect failed");
+        }
+        return parsed.data ?? { devices: [] };
+      }
+      throw new Error("Detect job timed out");
+    })().finally(() => {
+      activeDetectPollers.delete(jobId);
+    });
+    activeDetectPollers.set(jobId, poller);
     return poller;
   },
 };

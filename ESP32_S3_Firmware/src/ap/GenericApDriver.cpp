@@ -51,6 +51,12 @@ void onPingEnd(esp_ping_handle_t handle, void *args) {
   if (ctx->done) xSemaphoreGive(ctx->done);
 }
 
+uint32_t resolveEthernetPingInterface() {
+  esp_netif_t *ethNetif = esp_netif_get_handle_from_ifkey("ETH_DEF");
+  if (!ethNetif) return 0;
+  return esp_netif_get_netif_impl_index(ethNetif);
+}
+
 }  // namespace
 
 bool GenericApDriver::pingOnce(const char *ip, bool &ok, uint32_t &latencyMs,
@@ -79,6 +85,9 @@ bool GenericApDriver::pingOnce(const char *ip, bool &ok, uint32_t &latencyMs,
   config.interval_ms = 0;
   config.timeout_ms = kIcmpTimeoutMs;
   config.data_size = 32;
+  // Force ICMP over Ethernet; default netif may be the setup AP.
+  const uint32_t iface = resolveEthernetPingInterface();
+  if (iface > 0) config.interface = iface;
 
   esp_ping_callbacks_t callbacks{};
   callbacks.on_ping_success = onPingSuccess;
@@ -155,6 +164,8 @@ bool GenericApDriver::tcpConnect(const char *ip, uint16_t port,
   }
 
   if (errno != EINPROGRESS && errno != EALREADY) {
+    Serial.printf("[ap-check] tcp port=%u connect errno=%d\n",
+                  static_cast<unsigned>(port), errno);
     ::close(sock);
     return true;
   }

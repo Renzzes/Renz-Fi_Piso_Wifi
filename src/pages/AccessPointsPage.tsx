@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { ExternalLink, Pencil, Plus, RadioTower, Trash2 } from "lucide-react";
+import { ExternalLink, Pencil, Plus, RadioTower, Search, Trash2 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
@@ -26,6 +26,7 @@ import { isApiError } from "@/services/api";
 import {
   ACCESS_POINT_VENDORS,
   accessPointsApi,
+  type AccessPointDetectDevice,
   type AccessPointRecord,
   type AccessPointStatus,
   type AccessPointWritePayload,
@@ -72,6 +73,14 @@ function statusLabel(status?: AccessPointStatus | null): string {
   }
 }
 
+function detectLabel(status?: string): string {
+  if (!status) return "—";
+  if (status === "reachable") return "Reachable";
+  if (status === "stale") return "Stale";
+  if (status === "failed") return "Failed";
+  return status.replace(/_/g, " ");
+}
+
 function openManagement(ip: string) {
   const trimmed = ip.trim();
   if (!trimmed) return;
@@ -92,6 +101,10 @@ export default function AccessPointsPage() {
   const [editing, setEditing] = useState<AccessPointRecord | null>(null);
   const [form, setForm] = useState<AccessPointWritePayload>(EMPTY_FORM);
   const [checkingIds, setCheckingIds] = useState<Set<string>>(new Set());
+  const [detecting, setDetecting] = useState(false);
+  const [detectOpen, setDetectOpen] = useState(false);
+  const [detectedDevices, setDetectedDevices] = useState<AccessPointDetectDevice[]>([]);
+  const [detectedByIp, setDetectedByIp] = useState<Record<string, string>>({});
 
   const title = useMemo(
     () => (editing ? "Edit access point" : "Add access point"),
@@ -108,6 +121,20 @@ export default function AccessPointsPage() {
     setEditing(null);
     setForm(EMPTY_FORM);
     setOpen(true);
+  };
+
+  const applyDetectedDevice = (device: AccessPointDetectDevice) => {
+    setForm((prev) => ({
+      ...prev,
+      managementIp: device.ip ?? prev.managementIp,
+      name: prev.name || `AP ${device.ip ?? ""}`.trim(),
+      notes:
+        prev.notes ||
+        [device.interface, device.bridgePort, device.status]
+          .filter(Boolean)
+          .join(" / "),
+    }));
+    setDetectOpen(false);
   };
 
   const openEdit = (record: AccessPointRecord) => {
@@ -197,6 +224,36 @@ export default function AccessPointsPage() {
     },
   });
 
+  const detectMutation = useMutation({
+    mutationFn: async () => accessPointsApi.detectAndWait(),
+    onMutate: () => {
+      setDetecting(true);
+      setDetectOpen(true);
+      setDetectedDevices([]);
+    },
+    onSuccess: (result) => {
+      const devices = result.devices ?? [];
+      setDetectedDevices(devices);
+      const byIp: Record<string, string> = {};
+      for (const device of devices) {
+        const ip = (device.ip ?? "").trim();
+        if (!ip) continue;
+        byIp[ip] = (device.status ?? "unknown").trim().toLowerCase();
+      }
+      setDetectedByIp(byIp);
+      if (devices.length === 0) {
+        toast.message("Detect finished with no candidate devices.");
+      }
+    },
+    onError: (error) => {
+      toast.error(isApiError(error) ? error.message : "Unable to detect devices");
+      setDetectOpen(false);
+    },
+    onSettled: () => {
+      setDetecting(false);
+    },
+  });
+
   return (
     <div>
       <PageHeader
@@ -250,6 +307,7 @@ export default function AccessPointsPage() {
                 <th className="px-3 py-2 font-medium">Management IP</th>
                 <th className="px-3 py-2 font-medium">SSID</th>
                 <th className="px-3 py-2 font-medium">Enabled</th>
+                <th className="px-3 py-2 font-medium">Detect</th>
                 <th className="px-3 py-2 font-medium">Status</th>
                 <th className="px-3 py-2 font-medium">Credentials</th>
                 <th className="px-3 py-2 font-medium text-right">Actions</th>
@@ -264,6 +322,7 @@ export default function AccessPointsPage() {
                   <td className="px-3 py-2 font-mono text-xs">{record.managementIp}</td>
                   <td className="px-3 py-2">{record.ssid || "—"}</td>
                   <td className="px-3 py-2">{record.enabled ? "Yes" : "No"}</td>
+                  <td className="px-3 py-2">{detectLabel(detectedByIp[record.managementIp])}</td>
                   <td className="px-3 py-2">
                     {statusLabel(record.status)}
                     {record.latencyMs != null ? ` (${record.latencyMs} ms)` : ""}
@@ -321,14 +380,27 @@ export default function AccessPointsPage() {
       )}
 
       <Dialog open={open} onOpenChange={(next) => !next && closeDialog()}>
-        <DialogContent className="max-w-lg">
-          <DialogHeader>
+        <DialogContent className="max-w-2xl w-[96vw] sm:w-full max-h-[calc(100vh-2rem)] overflow-hidden p-0">
+          <DialogHeader className="px-6 pt-6 pb-2 border-b">
             <DialogTitle>{title}</DialogTitle>
           </DialogHeader>
+          <div className="overflow-y-auto px-6 py-4 space-y-3">
           <p className="text-xs text-muted-foreground">
             Register an AP that is already configured in AP/Bridge mode. Renz-Fi
             does not push SSID, DHCP, NAT, VLAN, or other settings to the device.
           </p>
+          {!editing && (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => detectMutation.mutate()}
+              disabled={detecting}
+              className="w-full sm:w-auto"
+            >
+              <Search className="h-3.5 w-3.5" />
+              {detecting ? "Detecting..." : "Detect"}
+            </Button>
+          )}
           <div className="grid gap-3">
             <div className="grid gap-1">
               <Label htmlFor="ap-name">Name</Label>
@@ -340,7 +412,7 @@ export default function AccessPointsPage() {
               />
             </div>
             <div className="grid gap-1">
-              <Label htmlFor="ap-ip">Management IP</Label>
+              <Label htmlFor="ap-ip">IP Address</Label>
               <Input
                 id="ap-ip"
                 value={form.managementIp}
@@ -409,7 +481,7 @@ export default function AccessPointsPage() {
               />
             </div>
             <div className="grid gap-1">
-              <Label htmlFor="ap-user">Management username</Label>
+              <Label htmlFor="ap-user">Access Point Web Interface Username</Label>
               <Input
                 id="ap-user"
                 autoComplete="off"
@@ -418,9 +490,12 @@ export default function AccessPointsPage() {
                   setForm({ ...form, username: event.target.value })
                 }
               />
+              <p className="text-xs text-muted-foreground">
+                Username used to access this Access Point&apos;s own web interface.
+              </p>
             </div>
             <div className="grid gap-1">
-              <Label htmlFor="ap-pass">Management password</Label>
+              <Label htmlFor="ap-pass">Access Point Web Interface Password</Label>
               <Input
                 id="ap-pass"
                 type="password"
@@ -432,8 +507,8 @@ export default function AccessPointsPage() {
               />
               <p className="text-xs text-muted-foreground">
                 {editing
-                  ? "Leave blank to keep the stored password. Renz-Fi does not use it to configure the AP."
-                  : "Optional. Stored encrypted on the appliance and never returned to the browser. Renz-Fi does not use it to configure the AP."}
+                  ? "Leave blank to keep the stored password. Password configured by the owner on the Access Point. This is NOT the MikroTik password."
+                  : "Optional. Stored encrypted on the appliance and never returned to the browser. Password configured by the owner on the Access Point. This is NOT the MikroTik password."}
               </p>
             </div>
             <label className="flex items-center gap-2 text-sm">
@@ -445,8 +520,12 @@ export default function AccessPointsPage() {
               />
               Enabled
             </label>
+            <p className="text-xs text-muted-foreground">
+              Controls whether Renz-Fi includes this registered AP in its own checks. It does not power off or configure the Access Point.
+            </p>
           </div>
-          <DialogFooter>
+          </div>
+          <DialogFooter className="px-6 py-4 border-t">
             <Button type="button" variant="outline" onClick={closeDialog}>
               Cancel
             </Button>
@@ -456,6 +535,43 @@ export default function AccessPointsPage() {
               onClick={() => saveMutation.mutate()}
             >
               Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={detectOpen} onOpenChange={setDetectOpen}>
+        <DialogContent className="max-w-xl w-[96vw] sm:w-full max-h-[calc(100vh-2rem)] overflow-hidden p-0">
+          <DialogHeader className="px-6 pt-6 pb-2 border-b">
+            <DialogTitle>Detect Network Devices</DialogTitle>
+          </DialogHeader>
+          <div className="overflow-y-auto px-6 py-4 space-y-3">
+            {detecting && <p className="text-sm text-muted-foreground">Searching MikroTik once...</p>}
+            {!detecting && detectedDevices.length === 0 && (
+              <p className="text-sm text-muted-foreground">No candidate devices found.</p>
+            )}
+            {detectedDevices.map((device) => (
+              <div key={`${device.ip}-${device.mac}`} className="rounded-md border p-3 space-y-1">
+                <div className="font-mono text-xs">{device.ip}</div>
+                <div className="font-mono text-xs">{device.mac}</div>
+                <div className="text-xs text-muted-foreground">
+                  {(device.interface || "—") + " / " + (device.bridgePort || "—")}
+                </div>
+                <div className="text-xs text-muted-foreground">{device.status || "unknown"}</div>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => applyDetectedDevice(device)}
+                >
+                  Use This Device
+                </Button>
+              </div>
+            ))}
+          </div>
+          <DialogFooter className="px-6 py-4 border-t">
+            <Button type="button" variant="outline" onClick={() => setDetectOpen(false)}>
+              Close
             </Button>
           </DialogFooter>
         </DialogContent>

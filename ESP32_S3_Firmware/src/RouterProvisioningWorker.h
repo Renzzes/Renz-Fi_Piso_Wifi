@@ -164,6 +164,7 @@ class RouterProvisioningWorker {
   EnqueueOutcome enqueueAdminSyncCache(const String &successMessage);
   EnqueueOutcome enqueueAdminRefreshCache(const String &successMessage);
   EnqueueOutcome enqueueAdminUserProfileOp(const String &requestJson);
+  EnqueueOutcome enqueueAccessPointDetect(const String &requestJson);
 
   // Mutex-protected snapshot read of the most recently enqueued job. Returns
   // false when jobId doesn't match the tracked job (never existed, or the
@@ -203,6 +204,7 @@ class RouterProvisioningWorker {
     AdminSyncCache,
     AdminRefreshCache,
     AdminUserProfileOp,
+    AccessPointDetect,
   };
 
   struct WorkSlot {
