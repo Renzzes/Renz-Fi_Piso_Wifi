@@ -90,15 +90,25 @@ check("7 Only one recovery can be active", () => {
 });
 
 check("8 SD_READY releases router recovery gate", () => {
-  mustContain("Ready not blocked", WORKER, String.raw`storageRecoveryBlocksAdmin[\s\S]{0,800}?default:\s*return false`);
+  mustContain(
+    "Ready not blocked",
+    WORKER,
+    String.raw`storageRecoveryBlocksAdmin[\s\S]{0,1200}?default:\s*\n\s*return false`,
+  );
   mustContain("gate log ready", WORKER, "reason=storage_ready");
 });
 
-check("9 Degraded/Remounting/Syncing block router jobs", () => {
+check("9 Mounting/Remounting/Syncing block Admin router jobs; Degraded does not", () => {
   mustContain("Mounting", WORKER, "SdLifecycle::Mounting");
   mustContain("Remounting", WORKER, "SdLifecycle::Remounting");
   mustContain("Syncing", WORKER, "SdLifecycle::Syncing");
-  mustContain("Degraded", WORKER, "SdLifecycle::Degraded");
+  // Steady SD_DEGRADED + SPIFFS fallback must keep Admin RouterOS usable
+  // (operational continuity). Active remount/sync still blocks above.
+  mustContain(
+    "Degraded does not block",
+    WORKER,
+    String.raw`SdLifecycle::Degraded:\s*\n\s*default:\s*\n\s*return false`,
+  );
   mustContain("deferred log", WORKER, "admin job deferred reason=storage_recovery");
 });
 

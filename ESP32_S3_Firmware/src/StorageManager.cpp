@@ -284,21 +284,34 @@ bool StorageManager::begin() {
       Serial.println("[storage] SD unavailable, using SPIFFS fallback");
       Serial.println("[storage] Sales storage = SPIFFS fallback");
       Serial.println("[storage] Waiting for SD reinsertion");
-      if (!SPIFFS.exists(RenzFiConfig::FB_PORTAL_SESSIONS)) {
-        if (spiffsWriteFile(RenzFiConfig::FB_PORTAL_SESSIONS,
-                            kDefaultPortalSessions)) {
-          Serial.println("[storage] SPIFFS fallback seeded portal sessions");
+      // Seed bounded setup/operational checkpoints so first-boot setup can
+      // progress without an SD card (N16R8 resilience contract).
+      auto seedFb = [&](const char *fbPath, const char *json) {
+        if (!fbPath || !json) return;
+        if (SPIFFS.exists(fbPath)) return;
+        if (spiffsWriteFile(fbPath, json)) {
+          Serial.printf("[storage] SPIFFS fallback seeded %s\n", fbPath);
         } else {
-          Serial.println("[ERROR] SPIFFS fallback portal sessions seed failed");
+          Serial.printf("[ERROR] SPIFFS fallback seed failed for %s\n", fbPath);
         }
-      }
-      if (!SPIFFS.exists(RenzFiConfig::FB_SALES)) {
-        if (spiffsWriteFile(RenzFiConfig::FB_SALES, kDefaultSales)) {
-          Serial.println("[storage] SPIFFS fallback seeded sales");
-        } else {
-          Serial.println("[ERROR] SPIFFS fallback sales seed failed");
-        }
-      }
+      };
+      seedFb(RenzFiConfig::FB_PORTAL_SESSIONS, kDefaultPortalSessions);
+      seedFb(RenzFiConfig::FB_SALES, kDefaultSales);
+      seedFb(RenzFiConfig::FB_INSTALLATION,
+             "{\"state\":\"factory\",\"updatedAt\":0,"
+             "\"completedSteps\":[],\"firmwareVersion\":\"0.5.0-w5500\","
+             "\"installationVersion\":2,"
+             "\"session\":{\"sessionId\":\"\",\"startedAt\":0,"
+             "\"lastActivity\":0,\"installerName\":\"\",\"deviceId\":\"\","
+             "\"isRecovery\":false,\"attempt\":0}}");
+      seedFb(RenzFiConfig::FB_PROVISIONING,
+             "{\"ownerCreated\":false,\"ownerUsername\":\"\","
+             "\"ownerDisplayName\":\"\",\"ownerPasswordHash\":\"\"}");
+      seedFb(RenzFiConfig::FB_SETTINGS, kDefaultSettings);
+      seedFb(RenzFiConfig::FB_PROMOS, kDefaultPromos);
+      seedFb(RenzFiConfig::FB_ROUTER, kDefaultRouter);
+      seedFb(RenzFiConfig::FB_PORTAL_CONFIG,
+             "{\"revision\":0,\"hasBanner\":false,\"hasMusic\":false}");
     } else {
       Serial.println("[ERROR] SPIFFS not available — no fallback storage");
     }

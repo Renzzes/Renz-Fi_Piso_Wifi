@@ -52,6 +52,10 @@ def main() -> int:
 
     if "SD unavailable, using SPIFFS fallback" not in storage:
         errors.append("StorageManager must log SPIFFS fallback when SD mount fails")
+    if "FB_INSTALLATION" not in storage or "SPIFFS fallback seeded" not in storage:
+        errors.append(
+            "Boot without SD must seed SPIFFS installation/operational checkpoints"
+        )
 
     eligible_body = storage[
         storage.find("isFallbackEligible") : storage.find("toFallbackPath")

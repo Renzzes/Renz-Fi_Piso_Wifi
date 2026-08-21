@@ -662,12 +662,18 @@ bool RouterProvisioningWorker::storageRecoveryBlocksAdmin() const {
   if (!_finishEngine) return false;
   StorageManager *storage = _finishEngine->storage();
   if (!storage) return false;
+  // N16R8 / Waveshare storage-resilience contract:
+  // Block Admin RouterOS enqueue only while SD bus ownership is active
+  // (mount / remount / sync). Steady SD_DEGRADED with SPIFFS/NVS operational
+  // fallback must NOT permanently disable Admin or production RouterOS jobs —
+  // that would interpret "SD unavailable" as "Renz-Fi unavailable."
+  // Hotspot activate/deauth already use fire-and-forget and are ungated here.
   switch (storage->sdLifecycle()) {
     case StorageManager::SdLifecycle::Mounting:
     case StorageManager::SdLifecycle::Remounting:
     case StorageManager::SdLifecycle::Syncing:
-    case StorageManager::SdLifecycle::Degraded:
       return true;
+    case StorageManager::SdLifecycle::Degraded:
     default:
       return false;
   }
