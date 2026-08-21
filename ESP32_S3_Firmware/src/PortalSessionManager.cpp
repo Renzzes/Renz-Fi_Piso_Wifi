@@ -2841,8 +2841,14 @@ bool PortalSessionManager::saveToSD(bool immediate) {
   if (!_storage) return false;
   DmaMemoryMonitor::ScopedProbe dmaProbe("portal-save");
 
-  HeapJsonDocument copyHeap(RenzFiConfig::JSON_DOC_LARGE);
-  DynamicJsonDocument &copy = copyHeap.doc();
+  // Phase 1A DMA experiment: temporary save copy uses PsramJsonDocument
+  // (PSRAM-first pool via existing PsramAllocator) instead of HeapJsonDocument
+  // JSON_DOC_LARGE (~24 KB) on the default heap, which competes with
+  // MALLOC_CAP_DMA|INTERNAL needed by W5500 SPI bounce buffers.
+  PsramJsonDocument copyHeap;
+  JsonDocument &copy = copyHeap.doc();
+  Serial.printf("[portal-save] json-storage=%s\n",
+                ESP.getPsramSize() > 0 ? "PSRAM" : "INTERNAL-FALLBACK");
   bool shouldWrite = false;
 
   lockState();
