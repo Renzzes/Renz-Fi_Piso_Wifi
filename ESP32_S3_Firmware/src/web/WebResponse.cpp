@@ -1,10 +1,13 @@
 #include "WebResponse.h"
 
 #include <FS.h>
+#include <cstring>
+#include <esp_heap_caps.h>
 #include <memory>
 
 #include "CacheManager.h"
 #include "DmaMemoryMonitor.h"
+#include "JsonHeap.h"
 #include "MimeResolver.h"
 
 namespace {
@@ -12,6 +15,56 @@ namespace {
 constexpr size_t kLargeAssetBytes = 32U * 1024U;
 
 int s_largeAssetInFlight = 0;
+
+// Setup status is polled every 250 ms during Step 4 Finish. serializeJson →
+// Arduino String copies that envelope into INTERNAL/DMA SRAM (N16R8
+// remaining-issues). W5500 setup_dma_priv_buffer needs a contiguous ~1394 B
+// block from the same pool.
+struct PsramJsonBody {
+  char *buf = nullptr;
+  size_t len = 0;
+  ~PsramJsonBody() {
+    if (buf) heap_caps_free(buf);
+  }
+};
+
+std::shared_ptr<PsramJsonBody> makePsramJsonBody(JsonDocument &doc) {
+  auto body = std::make_shared<PsramJsonBody>();
+  const size_t n = measureJson(doc);
+  body->buf = static_cast<char *>(
+      heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!body->buf) {
+    body->buf = static_cast<char *>(heap_caps_malloc(n + 1, MALLOC_CAP_8BIT));
+  }
+  if (!body->buf) return nullptr;
+  body->len = serializeJson(doc, body->buf, n + 1);
+  return body;
+}
+
+void sendPsramJson(AsyncWebServerRequest *req, int status, JsonDocument &doc,
+                   CachePolicy cache) {
+  auto body = makePsramJsonBody(doc);
+  if (!body) {
+    req->send(500, "application/json",
+              "{\"success\":false,\"error\":\"JSON alloc failed\","
+              "\"code\":\"JSON_ALLOC_FAILED\"}");
+    return;
+  }
+  AsyncWebServerResponse *res = req->beginResponse(
+      "application/json", body->len,
+      [body](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+        if (!buffer || !body->buf || index >= body->len) return 0;
+        const size_t remain = body->len - index;
+        const size_t n = remain < maxLen ? remain : maxLen;
+        memcpy(buffer, reinterpret_cast<const uint8_t *>(body->buf) + index, n);
+        return n;
+      });
+  if (!res) return;
+  res->setCode(status);
+  WebResponse::addCorsHeaders(res);
+  CacheManager::apply(res, cache);
+  req->send(res);
+}
 
 void sendEthDmaLow(AsyncWebServerRequest *req, const char *reason) {
   Serial.printf("[http] 503 reason=ETH_DMA_LOW detail=%s\n",
@@ -133,20 +186,17 @@ void WebResponse::serveJson(AsyncWebServerRequest *req, int status,
 
 void WebResponse::serveJsonEnvelope(AsyncWebServerRequest *req, int status,
                                     JsonDocument &doc, CachePolicy cache) {
-  String body;
-  serializeJson(doc, body);
-  serveJson(req, status, body, cache);
+  sendPsramJson(req, status, doc, cache);
 }
 
 void WebResponse::serveErrorJson(AsyncWebServerRequest *req, int status,
                                  const String &error, const String &code) {
-  DynamicJsonDocument doc(256);
+  PsramJsonDocument envHeap;
+  JsonDocument &doc = envHeap.doc();
   doc["success"] = false;
   doc["error"] = error;
   doc["code"] = code;
-  String body;
-  serializeJson(doc, body);
-  serveJson(req, status, body, CachePolicy::NoCache);
+  sendPsramJson(req, status, doc, CachePolicy::NoCache);
 }
 
 void WebResponse::serveNotFound(AsyncWebServerRequest *req, bool plainText) {

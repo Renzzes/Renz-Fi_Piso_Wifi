@@ -619,11 +619,13 @@ void SetupServer::registerRoutes(WebServerManager &web) {
     if (!HttpPlaneGate::ensureSetupPlane(req)) return;
     if (_provisioning) _provisioning->enforceActiveUnlockSession();
 
-    HeapJsonDocument heapDoc(RenzFiConfig::JSON_DOC_MEDIUM);
-    DynamicJsonDocument &envelope = heapDoc.doc();
-    envelope["success"]           = true;
-    envelope["message"]           = "Setup status";
-    JsonObject data               = envelope.createNestedObject("data");
+    // Polled every 250 ms after Step 4 Finish. JSON_DOC_MEDIUM (8192) on the
+    // default heap is INTERNAL/DMA SRAM (N16R8 remaining-issues class).
+    PsramJsonDocument heapDoc;
+    JsonDocument &envelope = heapDoc.doc();
+    envelope["success"]    = true;
+    envelope["message"]    = "Setup status";
+    JsonObject data        = envelope.createNestedObject("data");
     fillSetupStatusData(_provisioning, _eth, data, _wizardConfig, _networkSettings,
                         _routerProvisioning, _routerWorker);
     Serial.printf(
@@ -1276,9 +1278,9 @@ void SetupServer::registerRoutes(WebServerManager &web) {
         free(req->_tempObject);
         req->_tempObject = nullptr;
 
-        HeapJsonDocument responseDoc(RenzFiConfig::JSON_DOC_MEDIUM);
-        DynamicJsonDocument &envelope = responseDoc.doc();
-        JsonObject data               = envelope.createNestedObject("data");
+        PsramJsonDocument responseDoc;
+        JsonDocument &envelope = responseDoc.doc();
+        JsonObject data        = envelope.createNestedObject("data");
         const auto result =
             _routerProvisioning->saveWifiSelection(body.as<JsonObjectConst>(), data);
         if (!result.success) {
@@ -1299,12 +1301,9 @@ void SetupServer::registerRoutes(WebServerManager &web) {
         }
         envelope["success"] = true;
         envelope["message"] = result.errorMessage;
-        String responseBody;
-        serializeJson(envelope, responseBody);
         timer.finish();
         // 202 while durable commit is pending — do not claim SD write done.
-        WebResponse::serveJson(req, result.httpStatus, responseBody,
-                               CachePolicy::NoCache);
+        WebResponse::serveJsonEnvelope(req, result.httpStatus, envelope);
       },
       nullptr, bodyCollect);
 

@@ -3595,7 +3595,7 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
                   sendError(req, 400, "mac parameter required", "MISSING_MAC");
                   return;
                 }
-                HeapJsonDocument docHeap(RenzFiConfig::JSON_DOC_SMALL);
+                PsramJsonDocument docHeap;
                 if (_portalSessions &&
                     _portalSessions->getSession(mac, ip, docHeap.doc()))
                   sendOk(req, docHeap.doc());
@@ -3623,7 +3623,7 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
           return;
         }
         if (_portalSessions && _portalSessions->startCoinWindow(mac, ip)) {
-          HeapJsonDocument outHeap(RenzFiConfig::JSON_DOC_SMALL);
+          PsramJsonDocument outHeap;
           _portalSessions->getSession(mac, ip, outHeap.doc());
           sendOk(req, outHeap.doc(), "Coin window opened");
         } else {
@@ -3657,7 +3657,7 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
         String errorCode;
         if (_portalSessions->donePaying(mac, errorCode, ip)) {
           Serial.println("[portal] done-paying before response json");
-          HeapJsonDocument heapOut(RenzFiConfig::JSON_DOC_SMALL);
+          PsramJsonDocument heapOut;
           _portalSessions->getSession(mac, ip, heapOut.doc());
           Serial.println("[portal] done-paying after response json");
           Serial.println("[portal] done-paying before send");
