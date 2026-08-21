@@ -542,7 +542,9 @@ void ApiServer::registerSetupRoutes(WebServerManager &web,
       return;
     }
 
-    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
+    // Appliance health: PSRAM JSON pool (same DMA rationale as /api/status).
+    PsramJsonDocument dataHeap;
+    JsonDocument &data = dataHeap.doc();
     data["ok"]                            = true;
     data["httpPlane"]                     = HttpPlaneGate::planeLabel(req);
     data["storage"]["ok"]                 = _storage->healthy() || _storage->usingFallback();
@@ -550,7 +552,8 @@ void ApiServer::registerSetupRoutes(WebServerManager &web,
     data["storage"]["spiffsReady"]        = _storage->isSpiffsMounted();
 
     if (_installation) {
-      DynamicJsonDocument installDoc(RenzFiConfig::JSON_DOC_SMALL);
+      PsramJsonDocument installHeap;
+      JsonDocument &installDoc = installHeap.doc();
       _installation->fillStatus(installDoc);
       data["installation"].set(installDoc.as<JsonObjectConst>());
       data["installationState"] = data["installation"]["state"];
@@ -1041,10 +1044,16 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
     RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
     const uint32_t t0 = millis();
-    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
-    DynamicJsonDocument salesToday(256);
-    DynamicJsonDocument salesWeek(256);
-    DynamicJsonDocument salesMonth(256);
+    // PSRAM pool: INTERNAL DynamicJsonDocument(8192) fragments the DMA heap
+    // W5500 needs for SPI priv TX/RX (~1490 B). See ADMIN_DASHBOARD_DMA_GURU_FORENSIC.
+    PsramJsonDocument dataHeap;
+    PsramJsonDocument salesTodayHeap;
+    PsramJsonDocument salesWeekHeap;
+    PsramJsonDocument salesMonthHeap;
+    JsonDocument &data = dataHeap.doc();
+    JsonDocument &salesToday = salesTodayHeap.doc();
+    JsonDocument &salesWeek = salesWeekHeap.doc();
+    JsonDocument &salesMonth = salesMonthHeap.doc();
     _sessions->salesToday(salesToday);
     _sessions->salesWeek(salesWeek);
     _sessions->salesMonth(salesMonth);
@@ -1108,7 +1117,8 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
     data["wan"]["dns"]           = "unknown";
     data["wan"]["note"]          = "";
     if (_router) {
-      DynamicJsonDocument cacheStatus(1536);
+      PsramJsonDocument cacheStatusHeap;
+      JsonDocument &cacheStatus = cacheStatusHeap.doc();
       JsonObject statusObj = cacheStatus.to<JsonObject>();
       _router->fillRouterCacheStatus(statusObj);
       if (statusObj["observation"].is<JsonObjectConst>()) {
