@@ -3,7 +3,6 @@
 #include <SPIFFS.h>
 
 #include "CacheManager.h"
-#include "DmaMemoryMonitor.h"
 #include "MimeResolver.h"
 #include "HttpPlaneGate.h"
 #include "SpiffsHost.h"
@@ -111,34 +110,6 @@ void StaticFileServer::serveStaticOrIndex(AsyncWebServerRequest *req) {
                   path.c_str(), spiffsPath.c_str());
     sendFallbackPage(req);
     return;
-  }
-
-  // Large Admin SPA assets (~650 KB JS) stream many ~MTU ETH frames. When the
-  // DMA largest block is already below W5500 SPI priv-buffer needs, continuing
-  // the transfer risks setup_dma_priv_buffer fail → Guru Meditation. Soft-gate
-  // with 503 so the browser can retry instead of crashing the appliance.
-  {
-    File sizeProbe = SPIFFS.open(spiffsPath, "r");
-    const size_t fileBytes = sizeProbe ? sizeProbe.size() : 0;
-    if (sizeProbe) sizeProbe.close();
-    static constexpr size_t kLargeAssetSoftGateBytes = 32U * 1024U;
-    if (fileBytes >= kLargeAssetSoftGateBytes &&
-        !DmaMemoryMonitor::hasEthTransmitHeadroom()) {
-      DmaMemoryMonitor::logSnapshot("spa-serve-dma-low");
-      Serial.printf(
-          "[http] 503 path=%s spiffs=%s bytes=%u reason=ETH_DMA_LOW\n",
-          path.c_str(), spiffsPath.c_str(),
-          static_cast<unsigned>(fileBytes));
-      AsyncWebServerResponse *res = req->beginResponse(
-          503, "application/json",
-          "{\"success\":false,\"error\":\"Ethernet DMA temporarily "
-          "exhausted\",\"code\":\"ETH_DMA_LOW\"}");
-      WebResponse::addCorsHeaders(res);
-      res->addHeader("Retry-After", "2");
-      CacheManager::apply(res, CachePolicy::NoCache);
-      req->send(res);
-      return;
-    }
   }
 
   const CachePolicy cache = path.startsWith("/assets/")
