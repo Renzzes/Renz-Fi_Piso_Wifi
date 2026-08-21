@@ -4,8 +4,10 @@
 
 #include <Update.h>
 #include <MD5Builder.h>
+#include <cstring>
 #include <esp_heap_caps.h>
 #include <esp_ota_ops.h>
+#include <memory>
 #include <vector>
 
 #include <SD.h>
@@ -35,6 +37,55 @@
 // ── File-scope helpers ────────────────────────────────────────────────────────
 
 namespace {
+
+// CPU-side JSON HTTP bodies must not use Arduino String / default malloc.
+// Blocks below CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL land in INTERNAL/DMA SRAM
+// (N16R8 remaining-issues forensic). W5500 SPI priv buffers need that pool.
+struct PsramJsonBody {
+  char *buf = nullptr;
+  size_t len = 0;
+  ~PsramJsonBody() {
+    if (buf) heap_caps_free(buf);
+  }
+};
+
+std::shared_ptr<PsramJsonBody> makePsramJsonBody(JsonDocument &doc) {
+  auto body = std::make_shared<PsramJsonBody>();
+  const size_t n = measureJson(doc);
+  body->buf = static_cast<char *>(
+      heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!body->buf) {
+    body->buf = static_cast<char *>(heap_caps_malloc(n + 1, MALLOC_CAP_8BIT));
+  }
+  if (!body->buf) return nullptr;
+  body->len = serializeJson(doc, body->buf, n + 1);
+  return body;
+}
+
+void sendJsonResponse(AsyncWebServerRequest *req, int httpStatus,
+                      JsonDocument &doc) {
+  auto body = makePsramJsonBody(doc);
+  if (!body) {
+    req->send(500, "application/json",
+              "{\"success\":false,\"error\":\"JSON alloc failed\","
+              "\"code\":\"JSON_ALLOC_FAILED\"}");
+    return;
+  }
+  AsyncWebServerResponse *res = req->beginResponse(
+      "application/json", body->len,
+      [body](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+        if (!buffer || !body->buf || index >= body->len) return 0;
+        const size_t remain = body->len - index;
+        const size_t n = remain < maxLen ? remain : maxLen;
+        memcpy(buffer, reinterpret_cast<const uint8_t *>(body->buf) + index, n);
+        return n;
+      });
+  if (!res) return;
+  res->setCode(httpStatus);
+  WebResponse::addCorsHeaders(res);
+  res->addHeader("Cache-Control", "no-store");
+  req->send(res);
+}
 
 String urlDecode(String value) {
   value.replace("%20", " ");
@@ -347,49 +398,33 @@ void ApiServer::sendOk(AsyncWebServerRequest *req, JsonDocument &data,
 void ApiServer::sendOk(AsyncWebServerRequest *req, JsonDocument &data, int httpStatus,
                        const String &message) {
   logRequest(req, "api-ok");
-  String dataBody;
-  serializeJson(data, dataBody);
-  String body = "{\"success\":true,\"data\":";
-  body += dataBody;
-  body += ",\"message\":\"";
-  body += message;
-  body += "\"}";
-  AsyncWebServerResponse *res =
-      req->beginResponse(httpStatus, "application/json", body);
-  addCorsHeaders(res);
-  res->addHeader("Cache-Control", "no-store");
-  req->send(res);
+  PsramJsonDocument envHeap;
+  JsonDocument &env = envHeap.doc();
+  env["success"] = true;
+  env["data"] = data;
+  env["message"] = message;
+  sendJsonResponse(req, httpStatus, env);
 }
 
 void ApiServer::sendOk(AsyncWebServerRequest *req, const String &message) {
   logRequest(req, "api-ok");
-  DynamicJsonDocument envelope(256);
-  envelope["success"]    = true;
-  envelope["data"]["ok"] = true;
-  envelope["message"]    = message;
-  String body;
-  serializeJson(envelope, body);
-  AsyncWebServerResponse *res =
-      req->beginResponse(200, "application/json", body);
-  addCorsHeaders(res);
-  res->addHeader("Cache-Control", "no-store");
-  req->send(res);
+  PsramJsonDocument envHeap;
+  JsonDocument &env = envHeap.doc();
+  env["success"] = true;
+  env["data"]["ok"] = true;
+  env["message"] = message;
+  sendJsonResponse(req, 200, env);
 }
 
 void ApiServer::sendError(AsyncWebServerRequest *req, int status,
                           const String &error, const String &code) {
   logRequest(req, "api-error");
-  DynamicJsonDocument doc(256);
+  PsramJsonDocument envHeap;
+  JsonDocument &doc = envHeap.doc();
   doc["success"] = false;
-  doc["error"]   = error;
-  doc["code"]    = code;
-  String body;
-  serializeJson(doc, body);
-  AsyncWebServerResponse *res =
-      req->beginResponse(status, "application/json", body);
-  addCorsHeaders(res);
-  res->addHeader("Cache-Control", "no-store");
-  req->send(res);
+  doc["error"] = error;
+  doc["code"] = code;
+  sendJsonResponse(req, status, doc);
 }
 
 void ApiServer::sendWorkerResult(AsyncWebServerRequest *req,
@@ -1277,7 +1312,10 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
   _server->on("/api/system/health", HTTP_GET, [this](AsyncWebServerRequest *req) {
     RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
-    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
+    // N16R8 remaining-issues: JSON_DOC_MEDIUM (8192) on default heap is INTERNAL
+    // and shreds W5500 DMA. Dashboard polls this every fallbackPollMs.
+    PsramJsonDocument dataHeap;
+    JsonDocument &data = dataHeap.doc();
     if (_health) {
       _health->fillHealth(data.to<JsonObject>());
     }
@@ -1286,7 +1324,8 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
 
   _server->on("/api/system/build", HTTP_GET, [this](AsyncWebServerRequest *req) {
     RENZFI_PROD_GATE(req);
-    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+    PsramJsonDocument dataHeap;
+    JsonDocument &data = dataHeap.doc();
     data["runningFirmwareVersion"] = RenzFiConfig::FIRMWARE_VERSION;
     if (_build) {
       _build->fillJson(data["staged"].to<JsonObject>());
@@ -1297,7 +1336,8 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
   _server->on("/api/system/coin", HTTP_GET, [this](AsyncWebServerRequest *req) {
     RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
-    DynamicJsonDocument data(512);
+    PsramJsonDocument dataHeap;
+    JsonDocument &data = dataHeap.doc();
     if (_coin) {
       _coin->fillCoinStatus(data.to<JsonObject>());
     } else {
@@ -1309,7 +1349,8 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
   auto rgbSystemGet = [this](AsyncWebServerRequest *req) {
     RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
-    DynamicJsonDocument data(512);
+    PsramJsonDocument dataHeap;
+    JsonDocument &data = dataHeap.doc();
     if (_rgb) {
       // Return full status (mode, color, signal, brightness, enabled)
       _rgb->fillStatus(data.to<JsonObject>());
