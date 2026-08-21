@@ -234,6 +234,17 @@ bool StorageManager::begin() {
     } else if (_sdWritable) {
       setDiagnosticCause("OK");
     }
+    // Seed/repair layout BEFORE transaction recovery. recoverBootTransactions
+    // previously called readSdPayload on missing paths and the open-fail streak
+    // falsely classified that as MEDIA_MISSING (SD_READY → SD_DEGRADED).
+    const bool ok = _sdWritable ? ensureLayout() : validateLayout(false);
+    if (_sdWritable) {
+      _layoutValid = validateLayout(false);
+    } else {
+      Serial.println("[storage] SD mounted read-only; writes use bounded fallback");
+    }
+    Serial.println(ok ? "[boot] SD card layout ready"
+                      : "[storage] SD layout incomplete or read-only");
     recoverBootTransactions();
     String restoreRecoveryError;
     const bool restoreRecovered =
@@ -251,14 +262,6 @@ bool StorageManager::begin() {
       Serial.printf("[storage] DEGRADED: %s\n", _lastError.c_str());
       return false;
     }
-    const bool ok = _sdWritable ? ensureLayout() : validateLayout(false);
-    if (_sdWritable) {
-      _layoutValid = validateLayout(false);
-    } else {
-      Serial.println("[storage] SD mounted read-only; writes use bounded fallback");
-    }
-    Serial.println(ok ? "[boot] SD card layout ready"
-                      : "[storage] SD layout incomplete or read-only");
     if (_sdWritable && _spiffsMounted &&
         SPIFFS.exists(RenzFiConfig::FB_MANIFEST)) {
       Serial.println("[storage] SD restored, syncing fallback data");
@@ -509,6 +512,12 @@ bool StorageManager::attemptSdRecovery() {
   _sdReadable = false;
   _healthy = true;
   _sdWritable = probeSdWritable();
+  // Same ordering as begin(): layout before recoverBootTransactions so missing
+  // optional/seed paths are not counted as media-removal open failures.
+  if (_sdWritable && !ensureLayout()) {
+    Serial.println("[storage] SD remount layout repair failed");
+  }
+  _layoutValid = validateLayout(false);
   recoverBootTransactions();
   String restoreRecoveryError;
   const bool restoreRecovered =
@@ -526,10 +535,6 @@ bool StorageManager::attemptSdRecovery() {
     Serial.printf("[storage] DEGRADED: %s\n", _lastError.c_str());
     return false;
   }
-  if (_sdWritable && !ensureLayout()) {
-    Serial.println("[storage] SD remount layout repair failed");
-  }
-  _layoutValid = validateLayout(false);
   onSdRecoverySucceeded();
   Serial.println("[storage-recovery] remount verified");
   return true;
@@ -952,8 +957,25 @@ bool StorageManager::readSdPayload(const char *path, String &payload) const {
   File file = SD.open(path, FILE_READ);
   if (!file) {
     auto *self = const_cast<StorageManager *>(this);
-    if (SD.cardType() == CARD_NONE) {
+    const uint8_t cardType = SD.cardType();
+    // Distinguish missing path from media/I-O failure. Arduino SD has no
+    // errno; open-fail alone must not mean MEDIA_MISSING when the card is
+    // present and the path is simply absent (fresh/partial layout).
+    const bool pathPresent = (cardType != CARD_NONE) && SD.exists(path);
+    Serial.printf(
+        "[sd-forensic] operation=readSdPayload path=%s open=FAIL "
+        "sdReady=%d sdMounted=%d cardType=%u sdReadable=%d "
+        "lifecycle=%s pathPresent=%d streak=%u fallback=%d\n",
+        path, self->sdLifecycle() == SdLifecycle::Ready ? 1 : 0,
+        self->_sdMounted ? 1 : 0, static_cast<unsigned>(cardType),
+        self->_sdReadable ? 1 : 0, self->sdLifecycleName(),
+        pathPresent ? 1 : 0, static_cast<unsigned>(self->_sdIoFailStreak),
+        self->_usingFallback ? 1 : 0);
+    if (cardType == CARD_NONE) {
       self->tripSdMediaMissing("readSdPayload card absent");
+    } else if (!pathPresent) {
+      // Legitimate missing file / directory entry — not physical removal.
+      return false;
     } else {
       self->_sdIoFailStreak++;
       if (self->_sdIoFailStreak >= 2) {
@@ -1000,21 +1022,33 @@ bool StorageManager::recoverSdTransaction(const char *path) {
   if (!_sdMounted || !_sdReadable || !path) return false;
   const String stage = String(path) + StoragePaths::TransactionStageSuffix;
   const String backup = String(path) + StoragePaths::TransactionBackupSuffix;
-  String targetPayload;
-  const bool openedOk = readSdPayload(path, targetPayload);
-  if (openedOk && validateJsonPayload(targetPayload)) {
-    if (SD.exists(stage)) SD.remove(stage);
-    return true;
-  }
 
-  // readSdPayload already trips media-missing on open failure.
-  if (!_sdMounted || !_sdReadable) return false;
-  // A failed open incremented the fail streak. Do not probe .stage/.backup —
-  // each SD.exists/open can sdSelectCard for ~500 ms on a missing card.
-  if (_sdIoFailStreak > 0) return false;
-
+  // Existence first: a missing committed file with no .t/.b is normal on a
+  // fresh or partial SD — do not SD.open() it (that was the false MEDIA_MISSING
+  // streak during recoverBootTransactions).
   const bool targetExists = SD.exists(path);
   if (!_sdMounted || !_sdReadable) return false;
+  const bool stageExists = SD.exists(stage);
+  if (!_sdMounted || !_sdReadable) return false;
+  const bool backupExists = SD.exists(backup);
+  if (!_sdMounted || !_sdReadable) return false;
+  if (!targetExists && !stageExists && !backupExists) {
+    return false;
+  }
+
+  String targetPayload;
+  if (targetExists) {
+    const bool openedOk = readSdPayload(path, targetPayload);
+    if (openedOk && validateJsonPayload(targetPayload)) {
+      if (stageExists) SD.remove(stage);
+      return true;
+    }
+    // Target exists but unreadable/corrupt — fall through to .t/.b.
+    if (!_sdMounted || !_sdReadable) return false;
+    // Real I/O open failure already counted in readSdPayload. Do not probe
+    // further when media may be gone (each exists/open can block ~500 ms).
+    if (_sdIoFailStreak > 0) return false;
+  }
 
   String candidate;
   const String first = targetExists ? backup : stage;
@@ -1148,7 +1182,17 @@ bool StorageManager::readJsonFromSd(const char *path, JsonDocument &doc) {
 
   File file = SD.open(path, FILE_READ);
   if (!file) {
-    tripSdMediaMissing("readJson open failed");
+    // Missing path ≠ media removal (same classification contract as readSdPayload).
+    if (SD.cardType() == CARD_NONE) {
+      tripSdMediaMissing("readJson open failed");
+    } else if (SD.exists(path)) {
+      tripSdMediaMissing("readJson open failed");
+    } else {
+      Serial.printf(
+          "[sd-forensic] operation=readJsonFromSd path=%s open=FAIL "
+          "reason=path_absent\n",
+          path ? path : "(null)");
+    }
     setError(String("Unable to open ") + path);
     return false;
   }
