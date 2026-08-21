@@ -29,6 +29,7 @@
 | Data | SD primary | Internal fallback | Notes |
 |------|------------|-------------------|-------|
 | Owner/operator credentials | — | **NVS** | Not duplicated as plaintext SD secrets |
+| **Setup Unlock Key** | SD mirror in provisioning.json | **NVS `renz-auth` (`unlockHash` / `unlockBlob`)** | Appliance-bound; survives SD replace/erase; factory reset clears |
 | Network address mode | NVS + optional SD sync | **NVS** | Boot before SD |
 | installation.json | Yes | `/fb/installation.json` | Setup continuity |
 | provisioning.json | Yes | `/fb/provisioning.json` | Setup continuity |

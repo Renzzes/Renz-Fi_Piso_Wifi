@@ -288,19 +288,51 @@ bool SetupProvisioningManager::load() {
   applyDefaults();
   if (!_storage) return false;
 
+  // NVS is authoritative for Setup Unlock Key (survives SD replace/erase).
+  String nvsHash;
+  String nvsBlob;
+  const bool nvsHasUnlock = AuthCredentials::loadSetupUnlockHash(nvsHash);
+
   DynamicJsonDocument doc(kDocCapacity);
-  if (!_storage->readJson(StoragePaths::ProvisioningFile, doc)) {
+  const bool sdOk = _storage->readJson(StoragePaths::ProvisioningFile, doc);
+  if (!sdOk) {
     const uint32_t now = millis();
     _createdAt         = now;
     _updatedAt         = now;
-    ensureFactoryUnlockProtect();
+    if (nvsHasUnlock) {
+      _setupUnlockPasswordHash = nvsHash;
+      if (AuthCredentials::loadSetupUnlockProtected(nvsBlob)) {
+        _setupUnlockPasswordProtected = nvsBlob;
+      }
+      Serial.println(
+          "[setup] unlock key restored from NVS (provisioning.json missing)");
+    } else {
+      ensureFactoryUnlockProtect();
+    }
     return persist();
   }
 
   const bool migrated = migrateDocument(doc);
   applyDocument(doc.as<JsonObjectConst>());
+
+  if (nvsHasUnlock) {
+    // Internal primary: never let blank/stale SD overwrite a valid NVS unlock.
+    _setupUnlockPasswordHash = nvsHash;
+    if (AuthCredentials::loadSetupUnlockProtected(nvsBlob) &&
+        !nvsBlob.isEmpty()) {
+      _setupUnlockPasswordProtected = nvsBlob;
+    }
+  } else if (!_setupUnlockPasswordHash.isEmpty()) {
+    // One-time migration: SD/SPIFFS unlock → NVS.
+    AuthCredentials::saveSetupUnlockHash(_setupUnlockPasswordHash);
+    if (!_setupUnlockPasswordProtected.isEmpty()) {
+      AuthCredentials::saveSetupUnlockProtected(_setupUnlockPasswordProtected);
+    }
+    Serial.println("[setup] migrated Setup Unlock Key to NVS (appliance-bound)");
+  }
+
   const bool wrapped = ensureFactoryUnlockProtect();
-  if (migrated || wrapped) {
+  if (migrated || wrapped || !nvsHasUnlock) {
     persist();
   }
   return true;
@@ -309,6 +341,12 @@ bool SetupProvisioningManager::load() {
 bool SetupProvisioningManager::persist() {
   if (_factoryResetInProgress) return false;
   if (!_storage) return false;
+
+  // NVS first — Setup Unlock Key must survive SD absence/replacement.
+  if (!_setupUnlockPasswordHash.isEmpty()) {
+    AuthCredentials::saveSetupUnlockHash(_setupUnlockPasswordHash);
+    AuthCredentials::saveSetupUnlockProtected(_setupUnlockPasswordProtected);
+  }
 
   DynamicJsonDocument doc(kDocCapacity);
   buildDocument(doc);
@@ -327,6 +365,7 @@ void SetupProvisioningManager::beginFactoryResetQuiesce() {
   _ownerPasswordHash = "";
   _setupUnlockPasswordHash      = "";
   _setupUnlockPasswordProtected = "";
+  AuthCredentials::clearSetupUnlockCredentials();
 }
 
 bool SetupProvisioningManager::factoryResetCredentialsCleared() const {

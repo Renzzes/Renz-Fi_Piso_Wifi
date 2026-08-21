@@ -73,6 +73,53 @@ void applyRecoveryReset() {
   savePasswordHash(hashPassword(RenzFiConfig::DEFAULT_ADMIN_PASSWORD));
   saveMustChangePassword(true);
   saveFirstBootCompleted(false);
+  clearSetupUnlockCredentials();
+}
+
+bool loadSetupUnlockHash(String &outHash) {
+  Preferences prefs;
+  if (!prefs.begin(RenzFiConfig::NVS_AUTH_NS, true)) return false;
+  outHash = prefs.getString("unlockHash", "");
+  prefs.end();
+  return outHash.length() > 0;
+}
+
+void saveSetupUnlockHash(const String &hash) {
+  Preferences prefs;
+  if (!prefs.begin(RenzFiConfig::NVS_AUTH_NS, false)) return;
+  if (hash.isEmpty()) {
+    prefs.remove("unlockHash");
+  } else {
+    prefs.putString("unlockHash", hash);
+  }
+  prefs.end();
+}
+
+bool loadSetupUnlockProtected(String &outBlob) {
+  Preferences prefs;
+  if (!prefs.begin(RenzFiConfig::NVS_AUTH_NS, true)) return false;
+  outBlob = prefs.getString("unlockBlob", "");
+  prefs.end();
+  return outBlob.length() > 0;
+}
+
+void saveSetupUnlockProtected(const String &blob) {
+  Preferences prefs;
+  if (!prefs.begin(RenzFiConfig::NVS_AUTH_NS, false)) return;
+  if (blob.isEmpty()) {
+    prefs.remove("unlockBlob");
+  } else {
+    prefs.putString("unlockBlob", blob);
+  }
+  prefs.end();
+}
+
+void clearSetupUnlockCredentials() {
+  Preferences prefs;
+  if (!prefs.begin(RenzFiConfig::NVS_AUTH_NS, false)) return;
+  prefs.remove("unlockHash");
+  prefs.remove("unlockBlob");
+  prefs.end();
 }
 
 }  // namespace AuthCredentials
