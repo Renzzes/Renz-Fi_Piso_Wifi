@@ -116,11 +116,13 @@ void onEthArduinoEvent(arduino_event_id_t event, arduino_event_info_t info) {
       if (!g_loggedEthStop) {
         g_loggedEthStop = true;
         Serial.println("[ETH] event: STOP");
-        Serial.println(
+        Serial.printf(
             "[ETH] WARNING: esp_eth driver stopped after boot — check for "
-            "code that re-touches W5500 SPI3_HOST pins (CS10/RST14/SCK12/"
-            "MISO13/MOSI11) via pinMode()/digitalWrite()/SPI.end() after "
-            "ETH.begin(). See SdSpi.cpp comment for prior root cause.");
+            "code that re-touches W5500 SPI3_HOST pins (CS%d/RST%d/SCK%d/"
+            "MISO%d/MOSI%d) via pinMode()/digitalWrite()/SPI.end() after "
+            "ETH.begin(). See SdSpi.cpp comment for prior root cause.\n",
+            W5500Config::PIN_CS, W5500Config::PIN_RST, W5500Config::PIN_SCK,
+            W5500Config::PIN_MISO, W5500Config::PIN_MOSI);
       }
       resetEthEventLogFlags();
       break;

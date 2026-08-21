@@ -8,10 +8,14 @@
 namespace RenzFiConfig {
 
 static constexpr const char *FIRMWARE_VERSION = "0.5.0-w5500";
+#if defined(RENZFI_BOARD_WAVESHARE_ESP32_S3_ETH)
+static constexpr const char *HARDWARE_REVISION = "ESP32-S3-ETH-WAVESHARE";
+#else
 static constexpr const char *HARDWARE_REVISION = "ESP32-S3-W5500-N8R8";
+#endif
 
 // ── Optional hardware ───────────────────────────────────────────────────────
-// Set true when Universal Coin Slot is wired (GPIO4 pulse input + RGB LEDs).
+// Set true when Universal Coin Slot is wired (pulse input + RGB LEDs).
 static constexpr bool ENABLE_COIN_MANAGER = true;
 
 // ── Network backend ───────────────────────────────────────────────────────────
@@ -215,18 +219,26 @@ static constexpr uint8_t   ROUTER_TCP_DIAG_ITERATIONS  = 20;
 #endif
 
 // ── Hardware pins ─────────────────────────────────────────────────────────────
-//  W5500 uses a dedicated HSPI bus — see W5500Config.h.
+//  W5500 uses a dedicated SPI3_HOST bus — see W5500Config.h.
 //  SD card uses a separate FSPI bus (pins below).
-static constexpr int PIN_SD_CS   = 18;
+//  Board pin maps are selected by RENZFI_BOARD_WAVESHARE_ESP32_S3_ETH.
 static constexpr int PIN_SD_SCK  = 7;
 static constexpr int PIN_SD_MISO = 5;
 static constexpr int PIN_SD_MOSI = 6;
+#if defined(RENZFI_BOARD_WAVESHARE_ESP32_S3_ETH)
+// Waveshare: onboard TF CS is GPIO4 (coin must move off GPIO4).
+static constexpr int PIN_SD_CS   = 4;
+static constexpr int PIN_COIN    = 18;
+#else
+// Freenove: external SD CS GPIO18; coin pulse on GPIO4.
+static constexpr int PIN_SD_CS   = 18;
+static constexpr int PIN_COIN    = 4;
+#endif
 // SD library runtime SPI frequency (card init uses 400 kHz internally).
 static constexpr uint32_t SD_SPI_FREQ_HZ = 1000000;
 
-static constexpr int PIN_COIN          = 4;
-// GPIO 35–37 are OPI PSRAM data lines on N8R8 — do not use.
-// GPIO 38–40 are safe user GPIOs with no internal peripheral conflicts.
+// GPIO 35–37 are OPI PSRAM data lines — do not use.
+// Stage 1 RGB: keep discrete common-negative LEDs on 38/39/40 (WS2812 deferred).
 static constexpr int PIN_RGB_LED_RED   = 38;
 static constexpr int PIN_RGB_LED_GREEN = 39;
 static constexpr int PIN_RGB_LED_BLUE  = 40;
@@ -246,7 +258,7 @@ static constexpr const char *NVS_NETWORK_NS  = "renz-network";
 
 // ── Timing ───────────────────────────────────────────────────────────────────
 // TEMPORARY calibration defaults for hardware testing without the production
-// external 10k ohm pull-up on the coin signal line (GPIO4). These values only
+// external 10k ohm pull-up on the coin signal line (PIN_COIN). These values only
 // mitigate noisy/floating-input symptoms in software; they are not a
 // substitute for the external pull-up, which remains required for production
 // reliability. Revert toward the original values once the resistor is fitted.

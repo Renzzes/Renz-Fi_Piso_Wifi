@@ -17,6 +17,7 @@
 #include "SalesTime.h"
 #include "SpiffsHost.h"
 #include "SetupDnsPolicy.h"
+#include "W5500Config.h"
 #include "web/HttpPlaneGate.h"
 
 FirmwareApp::FirmwareApp() : _events("/api/events") {}
@@ -35,6 +36,19 @@ void FirmwareApp::begin() {
   Serial.println("========================================");
   Serial.println("RENZ-FI ESP32-S3 FIRMWARE STARTING");
   Serial.printf("Firmware version : %s\n", RenzFiConfig::FIRMWARE_VERSION);
+  Serial.printf("Hardware revision: %s\n", RenzFiConfig::HARDWARE_REVISION);
+  Serial.printf(
+      "[hardware] W5500 SPI3 MOSI=%d MISO=%d SCK=%d CS=%d INT=%d RST=%d @%uMHz\n",
+      W5500Config::PIN_MOSI, W5500Config::PIN_MISO, W5500Config::PIN_SCK,
+      W5500Config::PIN_CS, W5500Config::PIN_INT, W5500Config::PIN_RST,
+      static_cast<unsigned>(W5500Config::SPI_FREQ_MHZ));
+  Serial.printf("[hardware] SD FSPI MOSI=%d MISO=%d SCK=%d CS=%d\n",
+                RenzFiConfig::PIN_SD_MOSI, RenzFiConfig::PIN_SD_MISO,
+                RenzFiConfig::PIN_SD_SCK, RenzFiConfig::PIN_SD_CS);
+  Serial.printf("[hardware] coin GPIO=%d recovery GPIO=%d RGB=%d,%d,%d\n",
+                RenzFiConfig::PIN_COIN, RenzFiConfig::PIN_RECOVERY,
+                RenzFiConfig::PIN_RGB_LED_RED, RenzFiConfig::PIN_RGB_LED_GREEN,
+                RenzFiConfig::PIN_RGB_LED_BLUE);
   Serial.println("========================================");
 
   NetworkDiagnostics::install();

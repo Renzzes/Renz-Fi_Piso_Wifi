@@ -6,7 +6,7 @@
 //  Restored pre-SD / pre-probe sequence:
 //    1. hardwareReset() — pulse W5500 RST
 //    2. Network.onEvent  — register before ETH.begin()
-//    3. ETH.begin()      — SPI3_HOST, poll mode when PIN_INT = -1
+//    3. ETH.begin()      — SPI3_HOST; poll when PIN_INT < 0, IRQ when >= 0
 //    4. ETH.config()     — static VLAN40 IP (Static mode only)
 // ─────────────────────────────────────────────────────────────────────────────
 

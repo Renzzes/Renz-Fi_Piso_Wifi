@@ -11,9 +11,9 @@ static SPIClass g_sdSpi(FSPI);
 SPIClass &renzFiSdSpi() { return g_sdSpi; }
 
 // IMPORTANT: this function must ONLY touch the SD card's own FSPI/SPI2_HOST
-// pins (SCK=7, MISO=5, MOSI=6, CS=18). It must NEVER call pinMode()/
-// digitalWrite() on the W5500's pins (CS=10, RST=14, SCK=12, MISO=13,
-// MOSI=11) or on the global/default SPI object.
+// pins (from RenzFiConfig::PIN_SD_*). It must NEVER call pinMode()/
+// digitalWrite() on the W5500's pins (from W5500Config::PIN_*) or on the
+// global/default SPI object.
 //
 // Root-cause history: an earlier revision called
 // `pinMode(W5500Config::PIN_CS, OUTPUT); digitalWrite(...)` here "to keep
@@ -22,10 +22,10 @@ SPIClass &renzFiSdSpi() { return g_sdSpi; }
 // peripherals with separate, non-shared SCK/MISO/MOSI/CS lines, so there is
 // no bus contention to arbitrate. Worse, on arduino-esp32 3.x, `pinMode()`
 // calls `gpio_config()`, which force-resets the pin's IOMUX/GPIO-matrix
-// function back to plain GPIO (PIN_FUNC_GPIO). GPIO10 was already owned by
-// the SPI3_HOST driver as the W5500's hardware CS line (assigned inside
-// `ETH.begin()`), so re-running pinMode() on it silently detached CS from
-// the SPI peripheral. All subsequent W5500 SPI transactions then failed,
+// function back to plain GPIO (PIN_FUNC_GPIO). The W5500 CS GPIO was already
+// owned by the SPI3_HOST driver as the W5500's hardware CS line (assigned
+// inside `ETH.begin()`), so re-running pinMode() on it silently detached CS
+// from the SPI peripheral. All subsequent W5500 SPI transactions then failed,
 // esp_eth's internal watchdog gave up, and the driver posted
 // DISCONNECTED/STOP events (see EthernetManager.cpp onEthArduinoEvent) —
 // which is also why ETH.macAddress() started returning all zeros afterward.

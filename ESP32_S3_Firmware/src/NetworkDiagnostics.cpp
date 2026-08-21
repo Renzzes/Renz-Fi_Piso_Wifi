@@ -223,9 +223,10 @@ void printStartupReport(EthernetManager *eth, ManagementApManager *mgmtAp,
                 (eth && eth->linkUp()) ? "yes" : "no");
   Serial.printf("  PHY type                    : W5500 (ETH_PHY_W5500)\n");
   Serial.printf("  PHY address                 : 1\n");
-  Serial.printf("  Clock mode                  : SPI3_HOST @ %u MHz, INT=%d (poll)\n",
+  Serial.printf("  Clock mode                  : SPI3_HOST @ %u MHz, INT=%d%s\n",
                 static_cast<unsigned>(W5500Config::SPI_FREQ_MHZ),
-                W5500Config::PIN_INT);
+                W5500Config::PIN_INT,
+                W5500Config::PIN_INT < 0 ? " (poll)" : " (irq)");
   if (eth) {
     Serial.printf("  MAC address                 : %s\n",
                   eth->macAddress().c_str());

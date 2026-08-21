@@ -365,7 +365,7 @@ void CoinManager::applyEnableState(bool enabled) {
   }
 
   // Idle coin signal floats (~1.95-3.0V observed) with nothing driving it;
-  // ESP32 internal pull-up gives GPIO4 a stable idle HIGH so only an actual
+  // ESP32 internal pull-up on PIN_COIN holds the pin HIGH at rest. A valid
   // NO-contact closure to GND (a real coin pulse) is seen as a LOW edge.
   pinMode(RenzFiConfig::PIN_COIN, INPUT_PULLUP);
   if (attachCoinIsr()) {
