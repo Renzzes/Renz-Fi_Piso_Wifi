@@ -1789,6 +1789,10 @@ void RouterProvisioningWorker::runOp(WorkSlot &slot) {
         data["arpRows"] = arpResult.replyCount;
         data["returned"] = devices.size();
         data["filteredOut"] = filtered;
+        Serial.printf(
+            "[access-point-detect] jobId=%u state=completed candidateCount=%u\n",
+            static_cast<unsigned>(slot.jobId),
+            static_cast<unsigned>(devices.size()));
         if (!bridgeOk) data["bridgeHostWarning"] = "bridge_host_lookup_failed";
         if (!leaseOk) data["leaseWarning"] = "dhcp_lease_lookup_failed";
         out["message"] = "Detection complete";

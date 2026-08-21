@@ -1,0 +1,39 @@
+---
+description: External Access Point is registry + reachability only — never AP configuration or vendor provisioning
+globs: ESP32_S3_Firmware/src/ExternalAccessPoint*,ESP32_S3_Firmware/src/ap/**,src/pages/AccessPointsPage.tsx,src/services/accessPoints.ts,docs/EXTERNAL_ACCESS_POINT_ARCHITECTURE.md
+alwaysApply: true
+---
+
+# External Access Point Guardrail
+
+External Access Point is **not** an AP configuration/provisioning feature.
+
+Owner configures the AP in its own manufacturer web UI (AP/bridge, DHCP off, NAT off), plugs LAN into MikroTik, then registers the management IP in Renz-Fi. MikroTik remains DHCP/NAT/HotSpot/voucher/User Profile/rate-limit authority. The AP is Wi-Fi coverage + Layer-2 bridge only.
+
+## Renz-Fi may
+
+- Register metadata (name, management IP, optional credentials, SSID label, location, notes, brand label)
+- Validate management IP against **live** Ethernet LAN
+- Run generic reachability on `ap_check_worker` (ICMP + TCP 80/443, HTTP 202, single-flight)
+- Show RAM status
+- Open `http://{managementIp}` in the browser (no ESP32 proxy, no credential injection)
+
+## Renz-Fi must not
+
+- Log in to the AP or send stored username/password to the AP
+- HTTP GET-with-auth / POST / PUT / PATCH / DELETE against the AP
+- Change SSID, Wi-Fi password, DHCP, NAT, channel, TX power, VLAN, QoS, firmware, or reboot the AP
+- Add TP-Link / Ruijie / Tenda / COMFAST / ASUS / Ubiquiti / MikroTik-AP / OpenWrt AP configuration drivers
+- Treat `vendor` as a driver selector
+- Add AP-side bandwidth / promo / rate-limit
+- Add VLAN fields or AP VLAN provisioning
+- Claim seamless roaming (same SSID is allowed)
+- Put AP checks on RouterWorker / MikroTikDriver / RouterOsClient / async_tcp / loopTask
+- Read or write SD / take STORAGE_LOCK during a check
+- Run automatic high-frequency or LAN-scan monitoring
+- Merge this feature with `ManagementApManager` (ESP32 SoftAP at 192.168.4.1)
+
+`GenericApDriver` is a **reachability probe**, not a configuration driver. Credentials are metadata only.
+
+Source of truth: `docs/EXTERNAL_ACCESS_POINT_ARCHITECTURE.md`.
+Do not move `v0.5.0-fully-operational`. Do not rewrite Stage B/C checkpoints.

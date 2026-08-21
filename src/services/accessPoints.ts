@@ -114,7 +114,7 @@ export type AccessPointDetectJob = {
   state?: string;
   ok?: boolean;
   httpStatus?: number;
-  result?: string;
+  result?: string | unknown;
 };
 
 const POLL_MS = 450;
@@ -123,6 +123,21 @@ const NETWORK_RETRY_LIMIT = 4;
 
 const activePollers = new Map<number, Promise<AccessPointJob>>();
 const activeDetectPollers = new Map<number, Promise<AccessPointDetectResult>>();
+
+export class DetectJobError extends Error {
+  constructor(
+    message: string,
+    public code:
+      | "DETECT_FAILED"
+      | "DETECT_TIMEOUT"
+      | "DETECT_EMPTY"
+      | "DETECT_BAD_RESULT",
+    public details?: { jobId?: number; state?: string; candidateCount?: number },
+  ) {
+    super(message);
+    this.name = "DetectJobError";
+  }
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -138,6 +153,51 @@ function isTerminalState(state: string): boolean {
 
 function isRunningState(state: string): boolean {
   return state === "queued" || state === "running";
+}
+
+function toDetectResultObject(raw: unknown): Record<string, unknown> {
+  if (typeof raw === "string") {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      throw new DetectJobError("Detection result payload is invalid.", "DETECT_BAD_RESULT");
+    }
+    return parsed as Record<string, unknown>;
+  }
+  if (raw && typeof raw === "object") {
+    return raw as Record<string, unknown>;
+  }
+  throw new DetectJobError("Detection result payload is missing.", "DETECT_BAD_RESULT");
+}
+
+function parseDetectResult(job: AccessPointDetectJob): AccessPointDetectResult {
+  const root = toDetectResultObject(job.result);
+  const success = root.success;
+  if (success === false) {
+    throw new DetectJobError(
+      typeof root.error === "string" ? root.error : "Detection failed.",
+      "DETECT_FAILED",
+      { jobId: job.jobId, state: job.state },
+    );
+  }
+  const data =
+    root.data && typeof root.data === "object"
+      ? (root.data as Record<string, unknown>)
+      : root;
+  const devicesRaw = data.devices;
+  const devices = Array.isArray(devicesRaw)
+    ? (devicesRaw as AccessPointDetectDevice[])
+    : [];
+  return {
+    devices,
+    source: typeof data.source === "string" ? data.source : undefined,
+    oneTime: typeof data.oneTime === "boolean" ? data.oneTime : undefined,
+    arpRows: typeof data.arpRows === "number" ? data.arpRows : undefined,
+    returned: typeof data.returned === "number" ? data.returned : devices.length,
+    filteredOut: typeof data.filteredOut === "number" ? data.filteredOut : undefined,
+    bridgeHostWarning:
+      typeof data.bridgeHostWarning === "string" ? data.bridgeHostWarning : undefined,
+    leaseWarning: typeof data.leaseWarning === "string" ? data.leaseWarning : undefined,
+  };
 }
 
 async function pollAccessPointJobOnce(jobId: number): Promise<AccessPointJob> {
@@ -233,28 +293,61 @@ export const accessPointsApi = {
     if (existing) return existing;
     const poller = (async () => {
       const startedAt = Date.now();
+      let networkFailures = 0;
+      let lastState = "queued";
       while (Date.now() - startedAt < POLL_DEADLINE_MS) {
-        const job = await accessPointsApi.getDetectJob(jobId);
+        let job: AccessPointDetectJob;
+        try {
+          job = await accessPointsApi.getDetectJob(jobId);
+          networkFailures = 0;
+        } catch (err) {
+          if (isNetworkError(err) && networkFailures < NETWORK_RETRY_LIMIT) {
+            networkFailures += 1;
+            await sleep(POLL_MS);
+            continue;
+          }
+          if (isApiError(err) && err.status === 404) {
+            throw new DetectJobError("Detect job not found.", "DETECT_FAILED", { jobId });
+          }
+          throw err;
+        }
         const state = (job.state ?? "").trim().toLowerCase();
+        lastState = state || lastState;
         if (state === "queued" || state === "running") {
           await sleep(POLL_MS);
           continue;
         }
         if (state !== "completed") {
-          throw new Error("Detect job failed");
+          throw new DetectJobError("Detection failed.", "DETECT_FAILED", {
+            jobId,
+            state,
+          });
         }
-        if (!job.result) return { devices: [] };
-        const parsed = JSON.parse(job.result) as {
-          success?: boolean;
-          data?: AccessPointDetectResult;
-          error?: string;
-        };
-        if (parsed.success === false) {
-          throw new Error(parsed.error || "Detect failed");
+        if (!job.result) {
+          throw new DetectJobError(
+            "Detection completed with no result payload.",
+            "DETECT_BAD_RESULT",
+            { jobId, state },
+          );
         }
-        return parsed.data ?? { devices: [] };
+        const parsed = parseDetectResult(job);
+        const candidateCount = parsed.devices.length;
+        console.info(
+          `[access-point-detect-ui] jobId=${jobId} state=completed candidateCount=${candidateCount} rawResultShape=${typeof job.result}`,
+        );
+        if (candidateCount === 0) {
+          throw new DetectJobError(
+            "No unregistered access point was detected.",
+            "DETECT_EMPTY",
+            { jobId, state, candidateCount },
+          );
+        }
+        return parsed;
       }
-      throw new Error("Detect job timed out");
+      throw new DetectJobError("Detection timed out.", "DETECT_TIMEOUT", {
+        jobId,
+        state: lastState,
+      });
     })().finally(() => {
       activeDetectPollers.delete(jobId);
     });

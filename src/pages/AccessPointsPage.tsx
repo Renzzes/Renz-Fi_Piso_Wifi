@@ -27,6 +27,7 @@ import {
   ACCESS_POINT_VENDORS,
   accessPointsApi,
   type AccessPointDetectDevice,
+  DetectJobError,
   type AccessPointRecord,
   type AccessPointStatus,
   type AccessPointWritePayload,
@@ -105,6 +106,10 @@ export default function AccessPointsPage() {
   const [detectOpen, setDetectOpen] = useState(false);
   const [detectedDevices, setDetectedDevices] = useState<AccessPointDetectDevice[]>([]);
   const [detectedByIp, setDetectedByIp] = useState<Record<string, string>>({});
+  const [detectState, setDetectState] = useState<
+    "idle" | "detecting" | "found" | "empty" | "failed" | "timeout"
+  >("idle");
+  const [detectMessage, setDetectMessage] = useState("");
 
   const title = useMemo(
     () => (editing ? "Edit access point" : "Add access point"),
@@ -230,6 +235,8 @@ export default function AccessPointsPage() {
       setDetecting(true);
       setDetectOpen(true);
       setDetectedDevices([]);
+      setDetectState("detecting");
+      setDetectMessage("Detecting...");
     },
     onSuccess: (result) => {
       const devices = result.devices ?? [];
@@ -241,13 +248,32 @@ export default function AccessPointsPage() {
         byIp[ip] = (device.status ?? "unknown").trim().toLowerCase();
       }
       setDetectedByIp(byIp);
-      if (devices.length === 0) {
-        toast.message("Detect finished with no candidate devices.");
-      }
+      setDetectState("found");
+      setDetectMessage(`Detect completed - candidate(s) found: ${devices.length}.`);
+      toast.success(`Detect completed: ${devices.length} candidate(s) found.`);
     },
     onError: (error) => {
-      toast.error(isApiError(error) ? error.message : "Unable to detect devices");
-      setDetectOpen(false);
+      if (error instanceof DetectJobError) {
+        if (error.code === "DETECT_EMPTY") {
+          setDetectState("empty");
+          setDetectMessage("No unregistered access point was detected.");
+          toast.message("Detect completed with no matching access point.");
+          return;
+        }
+        if (error.code === "DETECT_TIMEOUT") {
+          setDetectState("timeout");
+          setDetectMessage("Detection timed out.");
+          toast.error("Detection timed out.");
+          return;
+        }
+        setDetectState("failed");
+        setDetectMessage("Detection failed.");
+        toast.error(error.message || "Detection failed.");
+        return;
+      }
+      setDetectState("failed");
+      setDetectMessage("Detection failed.");
+      toast.error(isApiError(error) ? error.message : "Detection failed.");
     },
     onSettled: () => {
       setDetecting(false);
@@ -380,11 +406,11 @@ export default function AccessPointsPage() {
       )}
 
       <Dialog open={open} onOpenChange={(next) => !next && closeDialog()}>
-        <DialogContent className="max-w-2xl w-[96vw] sm:w-full max-h-[calc(100vh-2rem)] overflow-hidden p-0">
-          <DialogHeader className="px-6 pt-6 pb-2 border-b">
+        <DialogContent className="max-w-2xl w-[96vw] sm:w-full max-h-[calc(100dvh-1.5rem)] overflow-hidden p-0 flex flex-col gap-0">
+          <DialogHeader className="px-6 pt-6 pb-2 border-b shrink-0">
             <DialogTitle>{title}</DialogTitle>
           </DialogHeader>
-          <div className="overflow-y-auto px-6 py-4 space-y-3">
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4 space-y-3 overscroll-contain">
           <p className="text-xs text-muted-foreground">
             Register an AP that is already configured in AP/Bridge mode. Renz-Fi
             does not push SSID, DHCP, NAT, VLAN, or other settings to the device.
@@ -481,7 +507,7 @@ export default function AccessPointsPage() {
               />
             </div>
             <div className="grid gap-1">
-              <Label htmlFor="ap-user">Access Point Web Interface Username</Label>
+              <Label htmlFor="ap-user">Management Username</Label>
               <Input
                 id="ap-user"
                 autoComplete="off"
@@ -491,11 +517,14 @@ export default function AccessPointsPage() {
                 }
               />
               <p className="text-xs text-muted-foreground">
-                Username used to access this Access Point&apos;s own web interface.
+                Username for this AP&apos;s own web interface (for example
+                http://10.10.10.20). Not MikroTik / RouterOS / Renz-Fi credentials.
+                Stored as protected metadata only; Renz-Fi does not log in to or
+                configure the AP.
               </p>
             </div>
             <div className="grid gap-1">
-              <Label htmlFor="ap-pass">Access Point Web Interface Password</Label>
+              <Label htmlFor="ap-pass">Management Password</Label>
               <Input
                 id="ap-pass"
                 type="password"
@@ -507,8 +536,8 @@ export default function AccessPointsPage() {
               />
               <p className="text-xs text-muted-foreground">
                 {editing
-                  ? "Leave blank to keep the stored password. Password configured by the owner on the Access Point. This is NOT the MikroTik password."
-                  : "Optional. Stored encrypted on the appliance and never returned to the browser. Password configured by the owner on the Access Point. This is NOT the MikroTik password."}
+                  ? "Leave blank to keep the stored password. Owner-configured AP password only — not the MikroTik password. Metadata only; not used for AP login or configuration."
+                  : "Optional. Owner-configured AP password only — not the MikroTik password. Stored encrypted as metadata; never returned to the browser and never used to configure the AP."}
               </p>
             </div>
             <label className="flex items-center gap-2 text-sm">
@@ -525,7 +554,7 @@ export default function AccessPointsPage() {
             </p>
           </div>
           </div>
-          <DialogFooter className="px-6 py-4 border-t">
+          <DialogFooter className="px-6 py-4 border-t shrink-0 bg-background pb-[max(1rem,env(safe-area-inset-bottom))]">
             <Button type="button" variant="outline" onClick={closeDialog}>
               Cancel
             </Button>
@@ -541,23 +570,41 @@ export default function AccessPointsPage() {
       </Dialog>
 
       <Dialog open={detectOpen} onOpenChange={setDetectOpen}>
-        <DialogContent className="max-w-xl w-[96vw] sm:w-full max-h-[calc(100vh-2rem)] overflow-hidden p-0">
-          <DialogHeader className="px-6 pt-6 pb-2 border-b">
+        <DialogContent className="max-w-xl w-[96vw] sm:w-full max-h-[calc(100dvh-1.5rem)] overflow-hidden p-0 flex flex-col gap-0">
+          <DialogHeader className="px-6 pt-6 pb-2 border-b shrink-0">
             <DialogTitle>Detect Network Devices</DialogTitle>
           </DialogHeader>
-          <div className="overflow-y-auto px-6 py-4 space-y-3">
-            {detecting && <p className="text-sm text-muted-foreground">Searching MikroTik once...</p>}
-            {!detecting && detectedDevices.length === 0 && (
-              <p className="text-sm text-muted-foreground">No candidate devices found.</p>
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4 space-y-3 overscroll-contain">
+            {detectState === "detecting" && (
+              <p className="text-sm text-muted-foreground">Detecting...</p>
+            )}
+            {detectState === "empty" && (
+              <p className="text-sm text-muted-foreground">
+                Detect completed - no matching AP found. No unregistered access point was
+                detected.
+              </p>
+            )}
+            {detectState === "timeout" && (
+              <p className="text-sm text-destructive">Detect timed out.</p>
+            )}
+            {detectState === "failed" && (
+              <p className="text-sm text-destructive">Detect failed.</p>
+            )}
+            {detectState === "found" && (
+              <p className="text-sm text-muted-foreground">{detectMessage}</p>
             )}
             {detectedDevices.map((device) => (
-              <div key={`${device.ip}-${device.mac}`} className="rounded-md border p-3 space-y-1">
-                <div className="font-mono text-xs">{device.ip}</div>
-                <div className="font-mono text-xs">{device.mac}</div>
-                <div className="text-xs text-muted-foreground">
-                  {(device.interface || "—") + " / " + (device.bridgePort || "—")}
+              <div key={`${device.ip}-${device.mac}`} className="rounded-md border p-3 space-y-1.5">
+                <div className="text-sm font-medium">Detected Access Point</div>
+                <div className="text-xs">
+                  IP Address: <span className="font-mono">{device.ip}</span>
                 </div>
-                <div className="text-xs text-muted-foreground">{device.status || "unknown"}</div>
+                <div className="text-xs">
+                  MAC Address: <span className="font-mono">{device.mac}</span>
+                </div>
+                <div className="text-xs">Interface: {device.interface || "—"}</div>
+                <div className="text-xs">Bridge Port: {device.bridgePort || "—"}</div>
+                <div className="text-xs">Status: {detectLabel(device.status)}</div>
                 <Button
                   type="button"
                   size="sm"
@@ -569,7 +616,7 @@ export default function AccessPointsPage() {
               </div>
             ))}
           </div>
-          <DialogFooter className="px-6 py-4 border-t">
+          <DialogFooter className="px-6 py-4 border-t shrink-0 bg-background pb-[max(1rem,env(safe-area-inset-bottom))]">
             <Button type="button" variant="outline" onClick={() => setDetectOpen(false)}>
               Close
             </Button>
