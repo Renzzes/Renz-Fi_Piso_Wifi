@@ -233,7 +233,19 @@ export type SystemHealth = {
     color: RgbColor;
     systemStatus?: string;
   };
-  memory: { heap: number; minimumHeap: number };
+  memory: {
+    heap: number;
+    minimumHeap: number;
+    psram?: number;
+    psramSize?: number;
+  };
+  esp32?: {
+    cpuFreqMHz?: number;
+    chipModel?: string;
+    chipRevision?: number;
+    chipTempC?: number;
+    chipTempAvailable?: boolean;
+  };
 };
 
 export type SystemStatus = {

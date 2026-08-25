@@ -48,6 +48,10 @@ import { useSessionIdleTimeout } from "@/hooks/useSessionIdleTimeout";
 import { RealtimeProvider, type RealtimeContextValue } from "@/contexts/RealtimeContext";
 import { DeviceRegistryProvider } from "@/contexts/DeviceRegistryContext";
 import type { RegisteredDevice } from "@/types/deviceProfile";
+import {
+  isFactoryResetQuiesced,
+  onFactoryResetQuiesce,
+} from "@/services/factoryResetQuiesce";
 
 function RequireOwner({ isOwner, children }: { isOwner: boolean; children: ReactNode }) {
   if (!isOwner) return <Navigate to="/dashboard" replace />;
@@ -158,9 +162,16 @@ export default function App() {
     }
   }, [navigate, queryClient]);
 
-  const dashboardEvents = useDashboardEvents(isLoggedIn && !passwordChangeRequired);
+  const [factoryResetQuiesced, setFactoryResetQuiescedState] = useState(
+    isFactoryResetQuiesced,
+  );
+  useEffect(() => onFactoryResetQuiesce(setFactoryResetQuiescedState), []);
+
+  const dashboardEvents = useDashboardEvents(
+    isLoggedIn && !passwordChangeRequired && !factoryResetQuiesced,
+  );
   const { connectionLost, adminApiReachable, retryConnection } = useAdminApiMonitor({
-    enabled: isLoggedIn && !passwordChangeRequired,
+    enabled: isLoggedIn && !passwordChangeRequired && !factoryResetQuiesced,
     sseConnected: dashboardEvents.sseConnected,
     onReconnectRequireLogin: handleReconnectRequireLogin,
   });
@@ -219,7 +230,20 @@ export default function App() {
     let cancelled = false;
     (async () => {
       try {
-        const json = await authApi.health();
+        let json = await authApi.health();
+        for (let attempt = 0; json.transientLoad && attempt < 3 && !cancelled; attempt++) {
+          await new Promise((resolve) => window.setTimeout(resolve, 2000));
+          json = await authApi.health();
+        }
+        if (json.transientLoad) {
+          if (!cancelled) {
+            setAuthenticated(false);
+            setRole("none");
+            setPermissions([...DEFAULT_OPERATOR_PERMISSIONS]);
+            setCoreSyncDone(true);
+          }
+          return;
+        }
         const serverAuthenticated = Boolean(json?.session?.authenticated);
         if (isReloginRequired() && serverAuthenticated) {
           void logoutBestEffort().then((cleared) => {

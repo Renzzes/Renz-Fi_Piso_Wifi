@@ -1,7 +1,7 @@
 import { type FormEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { PasswordField } from "@/components/PasswordField";
 import { authApi } from "@/services/auth";
 import { ApiError } from "@/services/api";
 import { toast } from "sonner";
@@ -56,22 +56,25 @@ export function ChangeAdminPasswordForm({
         <Label htmlFor="currentPassword" className="text-xs">
           Current Password
         </Label>
-        <Input
+        <PasswordField
           id="currentPassword"
-          type="password"
           value={oldPassword}
           onChange={(event) => setOldPassword(event.target.value)}
           autoComplete="current-password"
+          placeholder={defaultOldPassword || "Enter current password"}
           required
         />
+        <p className="text-[11px] text-muted-foreground">
+          The appliance stores a password hash only — your saved password cannot be
+          retrieved for display. Enter it here to confirm the change.
+        </p>
       </div>
       <div className="space-y-1">
         <Label htmlFor="newPassword" className="text-xs">
           New Password
         </Label>
-        <Input
+        <PasswordField
           id="newPassword"
-          type="password"
           value={newPassword}
           onChange={(event) => setNewPassword(event.target.value)}
           autoComplete="new-password"
@@ -83,9 +86,8 @@ export function ChangeAdminPasswordForm({
         <Label htmlFor="confirmPassword" className="text-xs">
           Confirm New Password
         </Label>
-        <Input
+        <PasswordField
           id="confirmPassword"
-          type="password"
           value={confirmPassword}
           onChange={(event) => setConfirmPassword(event.target.value)}
           autoComplete="new-password"

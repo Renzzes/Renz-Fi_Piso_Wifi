@@ -51,6 +51,21 @@ function transportMessage(): string {
   return "Network error. Check the appliance connection and retry.";
 }
 
+function isEthDmaLowResponse(status: number, code?: string): boolean {
+  return status === 503 && code === "ETH_DMA_LOW";
+}
+
+function retryAfterMs(res: Response): number {
+  const header = res.headers.get("Retry-After");
+  const seconds = header ? Number.parseInt(header, 10) : Number.NaN;
+  if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+  return 2000;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 export async function apiFetch<T>(path: string, init?: ApiFetchOptions): Promise<T> {
   const { timeoutMs = DEFAULT_API_TIMEOUT_MS, signal: userSignal, ...restInit } = init ?? {};
 
@@ -69,55 +84,64 @@ export async function apiFetch<T>(path: string, init?: ApiFetchOptions): Promise
       restInit.body != null &&
       ArrayBuffer.isView(restInit.body as ArrayBufferView));
 
+  let ethDmaRetried = false;
+
   try {
     if (typeof navigator !== "undefined" && navigator.onLine === false) {
       throw new NetworkError(offlineMessage());
     }
 
-    const res = await fetch(apiUrl(path), {
-      credentials: "include",
-      ...restInit,
-      signal: controller.signal,
-      headers: {
-        ...(isFormData || isBinaryBody ? {} : { "Content-Type": "application/json" }),
-        ...restInit.headers,
-      },
-    });
+    for (;;) {
+      const res = await fetch(apiUrl(path), {
+        credentials: "include",
+        ...restInit,
+        signal: controller.signal,
+        headers: {
+          ...(isFormData || isBinaryBody ? {} : { "Content-Type": "application/json" }),
+          ...restInit.headers,
+        },
+      });
 
-    if (!res.ok) {
-      let message = res.statusText;
-      let code: string | undefined;
-      try {
-        const json = (await res.json()) as { error?: string; code?: string };
-        message = String(json.error ?? message);
-        code = json.code;
-      } catch {
-        const text = await res.text().catch(() => "");
-        if (text) message = text;
+      if (!res.ok) {
+        let message = res.statusText;
+        let code: string | undefined;
+        try {
+          const json = (await res.json()) as { error?: string; code?: string };
+          message = String(json.error ?? message);
+          code = json.code;
+        } catch {
+          const text = await res.text().catch(() => "");
+          if (text) message = text;
+        }
+        if (!ethDmaRetried && isEthDmaLowResponse(res.status, code)) {
+          ethDmaRetried = true;
+          await sleep(retryAfterMs(res));
+          continue;
+        }
+        if (res.status === 401) {
+          handleUnauthorizedResponse(path);
+        }
+        throw new ApiError(message || `Request failed (${res.status})`, res.status, code);
       }
-      if (res.status === 401) {
-        handleUnauthorizedResponse(path);
-      }
-      throw new ApiError(message || `Request failed (${res.status})`, res.status, code);
-    }
 
-    if (res.status === 204) return undefined as T;
-    const contentType = res.headers.get("content-type") ?? "";
-    if (contentType.includes("application/json")) {
-      const json = (await res.json()) as unknown;
-      if (
-        json &&
-        typeof json === "object" &&
-        "success" in json &&
-        typeof (json as { success?: unknown }).success === "boolean"
-      ) {
-        const envelope = json as { success: boolean; data?: T; error?: unknown; code?: string };
-        if (envelope.success) return envelope.data ?? (undefined as T);
-        throw new ApiError(String(envelope.error ?? "Request failed"), res.status, envelope.code);
+      if (res.status === 204) return undefined as T;
+      const contentType = res.headers.get("content-type") ?? "";
+      if (contentType.includes("application/json")) {
+        const json = (await res.json()) as unknown;
+        if (
+          json &&
+          typeof json === "object" &&
+          "success" in json &&
+          typeof (json as { success?: unknown }).success === "boolean"
+        ) {
+          const envelope = json as { success: boolean; data?: T; error?: unknown; code?: string };
+          if (envelope.success) return envelope.data ?? (undefined as T);
+          throw new ApiError(String(envelope.error ?? "Request failed"), res.status, envelope.code);
+        }
+        return json as T;
       }
-      return json as T;
+      return (await res.text()) as unknown as T;
     }
-    return (await res.text()) as unknown as T;
   } catch (error) {
     if (error instanceof ApiError || error instanceof NetworkError) {
       throw error;

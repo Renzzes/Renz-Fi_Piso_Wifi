@@ -1,6 +1,5 @@
-import { useMemo, useState } from "react";
-import { Pause, Play, WifiOff } from "lucide-react";
-import { PageHeader } from "@/components/PageHeader";
+import { useEffect, useMemo, useState } from "react";
+import { Pause, Play, WifiOff, Wifi, Ban } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -29,20 +28,26 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Badge } from "@/components/ui/badge";
 import {
   useActiveUsers,
   useDisconnectUser,
   usePauseUser,
+  useReconnectUser,
   useResumeUser,
+  useTerminateUser,
 } from "@/hooks/api/useActiveUsers";
 import { useQuery } from "@tanstack/react-query";
 import { salesApi } from "@/services/sales";
 import type { ActiveUser, SessionState } from "@/types/api";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
+import { AdminTableCard } from "@/components/admin/AdminTableCard";
+import { DataPagination } from "@/components/admin/DataPagination";
+import { EmptyState } from "@/components/admin/EmptyState";
+import { Skeleton } from "@/components/ui/skeleton";
+import { clampPage, PAGE_SIZE_DEFAULT, pageSlice } from "@/lib/pagination";
 
-type ConfirmAction = "pause" | "resume" | "disconnect";
+type ConfirmAction = "pause" | "resume" | "disconnect" | "reconnect" | "terminate";
 
 function formatRemainingMinutes(minutes: number) {
   if (minutes <= 0) return "—";
@@ -55,57 +60,52 @@ function formatRemainingMinutes(minutes: number) {
 }
 
 function sessionTypeBadge(user: ActiveUser) {
+  const coin = user.sessionType === "coin";
   return (
-    <Badge variant={user.sessionType === "coin" ? "default" : "secondary"}>
-      {user.sessionType === "coin" ? "Coin" : "Voucher"}
-    </Badge>
+    <span
+      className={cn(
+        "inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium",
+        coin
+          ? "border-blue-500/25 bg-blue-500/15 text-blue-700 dark:text-blue-300"
+          : "border-violet-500/25 bg-violet-500/15 text-violet-700 dark:text-violet-300",
+      )}
+    >
+      {coin ? "Coin" : "Voucher"}
+    </span>
   );
 }
 
 function SessionStateBadge({ state }: { state: SessionState }) {
-  if (state === "paused") {
-    return (
-      <Badge className="border-amber-500/50 bg-amber-500/15 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20">
-        Paused
-      </Badge>
-    );
-  }
-  if (state === "waiting_coin") {
-    return (
-      <Badge className="border-sky-500/50 bg-sky-500/15 text-sky-700 dark:text-sky-300 hover:bg-sky-500/20">
-        Waiting Coin
-      </Badge>
-    );
-  }
-  if (state === "activating") {
-    return (
-      <Badge className="border-sky-500/50 bg-sky-500/15 text-sky-700 dark:text-sky-300 hover:bg-sky-500/20">
-        Activating
-      </Badge>
-    );
-  }
-  if (state === "activation_error") {
-    return (
-      <Badge className="border-red-500/50 bg-red-500/15 text-red-700 dark:text-red-300 hover:bg-red-500/20">
-        Activation Error
-      </Badge>
-    );
-  }
-  if (state === "expiring") {
-    return (
-      <Badge className="border-orange-500/50 bg-orange-500/15 text-orange-700 dark:text-orange-300 hover:bg-orange-500/20">
-        Expiring
-      </Badge>
-    );
-  }
-  if (state === "active") {
-    return (
-      <Badge className="border-transparent bg-emerald-600 text-white hover:bg-emerald-600/90">
-        Active
-      </Badge>
-    );
-  }
-  return <Badge variant="outline">{state || "—"}</Badge>;
+  const styles: Record<string, string> = {
+    paused: "border-amber-500/25 bg-amber-500/15 text-amber-800 dark:text-amber-300",
+    waiting_coin: "border-sky-500/25 bg-sky-500/15 text-sky-700 dark:text-sky-300",
+    activating: "border-sky-500/25 bg-sky-500/15 text-sky-700 dark:text-sky-300",
+    activation_error: "border-red-500/25 bg-red-500/15 text-red-700 dark:text-red-400",
+    expiring: "border-orange-500/25 bg-orange-500/15 text-orange-800 dark:text-orange-300",
+    active: "border-emerald-500/25 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
+    expired: "border-red-500/25 bg-red-500/15 text-red-700 dark:text-red-400",
+    idle: "border-border bg-muted text-muted-foreground",
+  };
+  const labels: Record<string, string> = {
+    paused: "Paused",
+    waiting_coin: "Waiting Coin",
+    activating: "Activating",
+    activation_error: "Activation Error",
+    expiring: "Expiring",
+    active: "Active",
+    expired: "Expired",
+    idle: "Idle",
+  };
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium",
+        styles[state] ?? "border-border bg-muted text-muted-foreground",
+      )}
+    >
+      {labels[state] ?? state ?? "—"}
+    </span>
+  );
 }
 
 function UserActions({
@@ -120,16 +120,20 @@ function UserActions({
   const isVoucher = user.sessionType === "voucher" || user.source === "voucher";
   const canPause = !isVoucher && user.state === "active";
   const canResume = !isVoucher && user.state === "paused";
+  const canReconnect =
+    user.state === "paused" ||
+    user.state === "activation_error" ||
+    (isVoucher && user.state === "active" && user.remainingMinutes > 0);
   const controlsDisabled = user.state === "waiting_coin" || busy;
 
   return (
-    <div className="flex justify-end gap-1">
+    <div className="flex flex-nowrap justify-end gap-1">
       {!isVoucher && (
         <>
           <Button
             size="sm"
             variant="outline"
-            className="h-7"
+            className="h-7 px-2 text-[11px]"
             disabled={!canPause || controlsDisabled}
             onClick={() => onConfirm("pause", user.mac)}
           >
@@ -138,7 +142,7 @@ function UserActions({
           <Button
             size="sm"
             variant="outline"
-            className="h-7"
+            className="h-7 px-2 text-[11px]"
             disabled={!canResume || controlsDisabled}
             onClick={() => onConfirm("resume", user.mac)}
           >
@@ -146,29 +150,70 @@ function UserActions({
           </Button>
         </>
       )}
+      {canReconnect ? (
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 px-2 text-[11px]"
+          disabled={busy}
+          onClick={() => onConfirm("reconnect", user.mac)}
+        >
+          <Wifi className="h-3.5 w-3.5" /> Connect
+        </Button>
+      ) : null}
       <Button
         size="sm"
-        variant="destructive"
-        className="h-7"
+        variant="outline"
+        className="h-7 px-2 text-[11px]"
         disabled={busy}
         onClick={() => onConfirm("disconnect", user.mac)}
       >
         <WifiOff className="h-3.5 w-3.5" /> Disconnect
+      </Button>
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-7 px-2 text-[11px] border-red-500/40 bg-red-500/10 text-red-600 hover:bg-red-500/20 dark:text-red-400"
+        disabled={busy}
+        onClick={() => onConfirm("terminate", user.mac)}
+      >
+        <Ban className="h-3.5 w-3.5" /> Terminate
       </Button>
     </div>
   );
 }
 
 export default function ActiveUsersPage() {
-  const { data: users, isLoading } = useActiveUsers();
+  const { data: users, isLoading, isError, refetch } = useActiveUsers();
   const pauseUser = usePauseUser();
   const resumeUser = useResumeUser();
   const disconnect = useDisconnectUser();
+  const reconnect = useReconnectUser();
+  const terminate = useTerminateUser();
   const [confirm, setConfirm] = useState<{ action: ConfirmAction; mac: string } | null>(null);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(PAGE_SIZE_DEFAULT);
 
-  const count = users?.length ?? 0;
-  const pausedCount = (users ?? []).filter((u) => u.state === "paused").length;
-  const busy = pauseUser.isPending || resumeUser.isPending || disconnect.isPending;
+  const list = users ?? [];
+  const count = list.length;
+  const pausedCount = list.filter((u) => u.state === "paused").length;
+  const busy =
+    pauseUser.isPending ||
+    resumeUser.isPending ||
+    disconnect.isPending ||
+    reconnect.isPending ||
+    terminate.isPending;
+
+  const safePage = clampPage(page, count, pageSize);
+  const pageRows = pageSlice(list, safePage, pageSize);
+
+  useEffect(() => {
+    if (page !== safePage) setPage(safePage);
+  }, [page, safePage]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [pageSize]);
 
   const runConfirmedAction = async () => {
     if (!confirm) return;
@@ -181,9 +226,15 @@ export default function ActiveUsersPage() {
       } else if (action === "resume") {
         await resumeUser.mutateAsync(mac);
         toast.success("Session resumed");
+      } else if (action === "reconnect") {
+        await reconnect.mutateAsync(mac);
+        toast.success("Reconnect queued — remaining time preserved");
+      } else if (action === "terminate") {
+        await terminate.mutateAsync(mac);
+        toast.success("Session terminated by owner");
       } else {
         await disconnect.mutateAsync(mac);
-        toast.success("User disconnected");
+        toast.success("Internet disconnected — time paused");
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Action failed");
@@ -204,95 +255,150 @@ export default function ActiveUsersPage() {
             description: "The customer session will resume and the countdown will continue.",
             action: "Resume session",
           }
-        : {
-            title: "Disconnect User?",
-            description: "This ends the session and removes the user from the active list.",
-            action: "Disconnect",
-          };
+        : confirm?.action === "reconnect"
+          ? {
+              title: "Reconnect Customer?",
+              description:
+                "Restore internet access without adding time. The countdown continues from the remaining balance.",
+              action: "Connect",
+            }
+          : confirm?.action === "terminate"
+            ? {
+                title: "Terminate Session?",
+                description:
+                  "This ends the session, resets remaining time to zero, removes internet access, and shows an owner notice on the captive portal.",
+                action: "Terminate session",
+              }
+            : {
+                title: "Disconnect Internet?",
+                description:
+                  "Removes internet access and pauses the countdown. Use Connect to restore without adding time.",
+                action: "Disconnect",
+              };
 
   return (
-    <div>
-      <PageHeader
-        title="Active Users"
-        description={
-          isLoading
+    <div className="space-y-3">
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h2 className="text-2xl font-semibold leading-tight">Active Users</h2>
+          <p className="mt-0.5 text-[13px] text-muted-foreground">
+            Monitor currently connected WiFi users and sessions
+          </p>
+        </div>
+        <p className="text-[13px] text-muted-foreground">
+          {isLoading
             ? "Loading active sessions..."
-            : `${count} active session${count === 1 ? "" : "s"}${pausedCount > 0 ? ` · ${pausedCount} paused` : ""}`
-        }
-      />
-      <div className="rounded-md border bg-card overflow-x-auto">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>MAC</TableHead>
-              <TableHead>IP</TableHead>
-              <TableHead>Session Type</TableHead>
-              <TableHead>Session State</TableHead>
-              <TableHead>Remaining Time</TableHead>
-              <TableHead>Credits</TableHead>
-              <TableHead>Portal</TableHead>
-              <TableHead className="text-right">Actions</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {isLoading ? (
-              <TableRow>
-                <TableCell colSpan={8} className="text-center text-muted-foreground py-6 text-sm">
-                  Loading...
-                </TableCell>
-              </TableRow>
-            ) : (
-              (users ?? []).map((u) => (
-                <TableRow
-                  key={u.mac}
-                  className={cn(
-                    u.state === "paused" &&
-                      "bg-amber-500/10 hover:bg-amber-500/15 border-l-2 border-l-amber-500",
-                  )}
-                >
-                  <TableCell className="font-mono text-xs">{u.mac || "—"}</TableCell>
-                  <TableCell className="font-mono text-xs">{u.ip || "—"}</TableCell>
-                  <TableCell>{sessionTypeBadge(u)}</TableCell>
-                  <TableCell>
-                    <SessionStateBadge state={u.state} />
-                  </TableCell>
-                  <TableCell className="tabular-nums">
-                    {formatRemainingMinutes(u.remainingMinutes)}
-                  </TableCell>
-                  <TableCell className="tabular-nums">{u.credits}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
-                    {u.portalHeartbeatFresh === true
-                      ? "Open"
-                      : u.portalHeartbeatFresh === false
-                        ? "Closed"
-                        : "—"}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <UserActions
-                      user={u}
-                      onConfirm={(action, mac) => setConfirm({ action, mac })}
-                      busy={busy}
-                    />
-                  </TableCell>
-                </TableRow>
-              ))
-            )}
-            {!isLoading && (users ?? []).length === 0 && (
-              <TableRow>
-                <TableCell colSpan={8} className="text-center text-muted-foreground py-6 text-sm">
-                  No Active Users
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
-        </Table>
+            : `${count} active session${count === 1 ? "" : "s"}${
+                pausedCount > 0 ? ` · ${pausedCount} paused` : ""
+              }`}
+        </p>
       </div>
 
-      <div className="mt-6">
-        <h2 className="text-sm font-semibold mb-2">User History</h2>
-        <p className="text-xs text-muted-foreground mb-2">
-          Recent completed sessions from sales persistence (same ledger as Sales Reports).
-        </p>
+      {isError ? (
+        <div className="rounded-[14px] border bg-card p-4">
+          <p className="text-sm font-medium">Unable to load active users</p>
+          <p className="mt-1 text-[13px] text-muted-foreground">
+            Something went wrong while retrieving session data.
+          </p>
+          <Button type="button" size="sm" className="mt-3" onClick={() => void refetch()}>
+            Retry
+          </Button>
+        </div>
+      ) : (
+        <AdminTableCard
+          footer={
+            !isLoading && count > 0 ? (
+              <DataPagination
+                page={safePage}
+                pageSize={pageSize}
+                total={count}
+                onPageChange={setPage}
+                onPageSizeChange={setPageSize}
+                itemLabel="sessions"
+              />
+            ) : null
+          }
+        >
+          <Table>
+            <TableHeader>
+              <TableRow className="hover:bg-transparent">
+                <TableHead className="h-10 bg-muted/40 text-[12px]">MAC</TableHead>
+                <TableHead className="h-10 bg-muted/40 text-[12px]">IP</TableHead>
+                <TableHead className="h-10 bg-muted/40 text-[12px]">Session Type</TableHead>
+                <TableHead className="h-10 bg-muted/40 text-[12px]">Session State</TableHead>
+                <TableHead className="h-10 bg-muted/40 text-[12px]">Remaining Time</TableHead>
+                <TableHead className="h-10 bg-muted/40 text-[12px]">Credits</TableHead>
+                <TableHead className="h-10 bg-muted/40 text-[12px]">Portal</TableHead>
+                <TableHead className="h-10 bg-muted/40 text-right text-[12px]">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {isLoading
+                ? Array.from({ length: 6 }).map((_, i) => (
+                    <TableRow key={`sk-${i}`} className="h-12">
+                      {Array.from({ length: 8 }).map((__, cell) => (
+                        <TableCell key={cell}>
+                          <Skeleton className="h-3.5 w-full max-w-[7rem]" />
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  ))
+                : pageRows.map((u) => (
+                    <TableRow
+                      key={u.mac}
+                      className={cn(
+                        "h-12",
+                        u.state === "paused" &&
+                          "bg-amber-500/10 hover:bg-amber-500/15 border-l-2 border-l-amber-500",
+                      )}
+                    >
+                      <TableCell className="font-mono text-[12px]">{u.mac || "—"}</TableCell>
+                      <TableCell className="font-mono text-[12px]">{u.ip || "—"}</TableCell>
+                      <TableCell>{sessionTypeBadge(u)}</TableCell>
+                      <TableCell>
+                        <SessionStateBadge state={u.state} />
+                      </TableCell>
+                      <TableCell className="tabular-nums text-[13px]">
+                        {formatRemainingMinutes(u.remainingMinutes)}
+                      </TableCell>
+                      <TableCell className="tabular-nums text-[13px]">{u.credits}</TableCell>
+                      <TableCell className="text-[12px] text-muted-foreground">
+                        {u.portalHeartbeatFresh === true
+                          ? "Open"
+                          : u.portalHeartbeatFresh === false
+                            ? "Closed"
+                            : "—"}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <UserActions
+                          user={u}
+                          onConfirm={(action, mac) => setConfirm({ action, mac })}
+                          busy={busy}
+                        />
+                      </TableCell>
+                    </TableRow>
+                  ))}
+            </TableBody>
+          </Table>
+          {!isLoading && count === 0 ? (
+            <EmptyState
+              title="No Active Users"
+              description="There are currently no connected WiFi sessions."
+            />
+          ) : null}
+        </AdminTableCard>
+      )}
+
+      <div className="space-y-2">
+        <div>
+          <h3 className="text-sm font-semibold">User History</h3>
+          <p className="text-[12px] text-muted-foreground">
+            Profile is the MikroTik HotSpot user profile applied when the customer paid. Speed is
+            the promo bandwidth availed (for example 10/10 Mbps). Coin sessions record speed from
+            the matched promo at Done Paying. Recent completed sessions from sales persistence (same
+            ledger as Sales Reports).
+          </p>
+        </div>
         <UserHistoryTable />
       </div>
 
@@ -319,6 +425,8 @@ function UserHistoryTable() {
   const [period, setPeriod] = useState<Period>("day");
   const [rangeFrom, setRangeFrom] = useState("");
   const [rangeTo, setRangeTo] = useState("");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(PAGE_SIZE_DEFAULT);
 
   const { data: records = [], isLoading } = useQuery({
     queryKey: ["sales", "records", "history-table"],
@@ -343,21 +451,25 @@ function UserHistoryTable() {
     return records.filter((r) => {
       const stamp = r.connectedAt || r.recordedAt || r.recorded_at || "";
       const t = Date.parse(stamp);
-      if (!Number.isFinite(t)) return period === "day"; // keep undated in Day view
+      if (!Number.isFinite(t)) return period === "day";
       return t >= fromMs && t <= toMs;
     });
   }, [records, period, rangeFrom, rangeTo]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [period, rangeFrom, rangeTo, pageSize]);
+
+  const safePage = clampPage(page, filtered.length, pageSize);
+  const pageRows = pageSlice(filtered, safePage, pageSize);
 
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-end gap-2">
         <div className="space-y-1">
           <Label className="text-xs">History period</Label>
-          <Select
-            value={period}
-            onValueChange={(v) => setPeriod(v as Period)}
-          >
-            <SelectTrigger className="w-[160px] h-8">
+          <Select value={period} onValueChange={(v) => setPeriod(v as Period)}>
+            <SelectTrigger className="h-8 w-[160px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -391,58 +503,82 @@ function UserHistoryTable() {
           </>
         ) : null}
       </div>
-      <div className="rounded-md border bg-card overflow-x-auto">
+      <AdminTableCard
+        footer={
+          !isLoading && filtered.length > 0 ? (
+            <DataPagination
+              page={safePage}
+              pageSize={pageSize}
+              total={filtered.length}
+              onPageChange={setPage}
+              onPageSizeChange={setPageSize}
+              itemLabel="sessions"
+            />
+          ) : null
+        }
+      >
         <Table>
           <TableHeader>
-            <TableRow>
-              <TableHead>Username / Voucher</TableHead>
-              <TableHead>MAC</TableHead>
-              <TableHead>Start</TableHead>
-              <TableHead>End</TableHead>
-              <TableHead>Duration</TableHead>
-              <TableHead>Amount</TableHead>
-              <TableHead>Profile</TableHead>
-              <TableHead>Speed</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>Source</TableHead>
+            <TableRow className="hover:bg-transparent">
+              <TableHead className="h-10 bg-muted/40 text-[12px]">Username / Voucher</TableHead>
+              <TableHead className="h-10 bg-muted/40 text-[12px]">MAC</TableHead>
+              <TableHead className="h-10 bg-muted/40 text-[12px]">Start</TableHead>
+              <TableHead className="h-10 bg-muted/40 text-[12px]">End</TableHead>
+              <TableHead className="h-10 bg-muted/40 text-[12px]">Duration</TableHead>
+              <TableHead className="h-10 bg-muted/40 text-[12px]">Amount</TableHead>
+              <TableHead
+                className="h-10 bg-muted/40 text-[12px]"
+                title="MikroTik HotSpot user profile at payment"
+              >
+                Profile
+              </TableHead>
+              <TableHead
+                className="h-10 bg-muted/40 text-[12px]"
+                title="Promo bandwidth availed (Mbps)"
+              >
+                Speed
+              </TableHead>
+              <TableHead className="h-10 bg-muted/40 text-[12px]">Status</TableHead>
+              <TableHead className="h-10 bg-muted/40 text-[12px]">Source</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {isLoading ? (
-              <TableRow>
-                <TableCell colSpan={10} className="text-center text-muted-foreground py-4 text-sm">
-                  Loading history…
-                </TableCell>
-              </TableRow>
-            ) : filtered.length === 0 ? (
-              <TableRow>
-                <TableCell colSpan={10} className="text-center text-muted-foreground py-4 text-sm">
-                  No session history for this period
-                </TableCell>
-              </TableRow>
-            ) : (
-              filtered.map((r) => (
-                <TableRow key={r.id || r.sessionId}>
-                  <TableCell className="font-mono text-xs">
-                    {r.voucherCode || r.sessionId || "—"}
-                  </TableCell>
-                  <TableCell className="font-mono text-xs">{r.macAddress || "—"}</TableCell>
-                  <TableCell className="text-xs">{r.connectedAt || r.recordedAt || r.recorded_at || "—"}</TableCell>
-                  <TableCell className="text-xs">{r.endedAt || r.expiresAt || "—"}</TableCell>
-                  <TableCell className="tabular-nums text-xs">
-                    {r.durationMinutes != null ? `${r.durationMinutes}m` : "—"}
-                  </TableCell>
-                  <TableCell className="tabular-nums text-xs">₱{r.amount ?? 0}</TableCell>
-                  <TableCell className="text-xs">{r.profile || "—"}</TableCell>
-                  <TableCell className="text-xs">{r.speed || "—"}</TableCell>
-                  <TableCell className="text-xs">{r.status || "—"}</TableCell>
-                  <TableCell className="text-xs">{r.paymentType || "—"}</TableCell>
-                </TableRow>
-              ))
-            )}
+            {isLoading
+              ? Array.from({ length: 4 }).map((_, i) => (
+                  <TableRow key={`hsk-${i}`} className="h-12">
+                    {Array.from({ length: 10 }).map((__, cell) => (
+                      <TableCell key={cell}>
+                        <Skeleton className="h-3.5 w-full max-w-[6rem]" />
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                ))
+              : pageRows.map((r) => (
+                  <TableRow key={r.id || r.sessionId} className="h-12">
+                    <TableCell className="font-mono text-[12px]">
+                      {r.voucherCode || r.sessionId || "—"}
+                    </TableCell>
+                    <TableCell className="font-mono text-[12px]">{r.macAddress || "—"}</TableCell>
+                    <TableCell className="text-[12px]">
+                      {r.connectedAt || r.recordedAt || r.recorded_at || "—"}
+                    </TableCell>
+                    <TableCell className="text-[12px]">{r.endedAt || r.expiresAt || "—"}</TableCell>
+                    <TableCell className="tabular-nums text-[12px]">
+                      {r.durationMinutes != null ? `${r.durationMinutes}m` : "—"}
+                    </TableCell>
+                    <TableCell className="tabular-nums text-[12px]">₱{r.amount ?? 0}</TableCell>
+                    <TableCell className="text-[12px]">{r.profile || "—"}</TableCell>
+                    <TableCell className="text-[12px]">{r.speed || "—"}</TableCell>
+                    <TableCell className="text-[12px]">{r.status || "—"}</TableCell>
+                    <TableCell className="text-[12px]">{r.paymentType || "—"}</TableCell>
+                  </TableRow>
+                ))}
           </TableBody>
         </Table>
-      </div>
+        {!isLoading && filtered.length === 0 ? (
+          <EmptyState title="No session history for this period" />
+        ) : null}
+      </AdminTableCard>
     </div>
   );
 }

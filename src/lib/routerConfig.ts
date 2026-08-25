@@ -58,9 +58,9 @@ export function routerConfigNeedsMigration(raw: RawRouterConfig | null | undefin
 /** Payload sent to PUT /api/router/settings — omit empty secrets to preserve stored values. */
 export function toRouterSavePayload(config: RouterConfig): Partial<RouterConfig> {
   const payload: Partial<RouterConfig> = {
-    host: config.host,
-    username: config.username,
-    profile: config.profile,
+    host: config.host.trim(),
+    username: config.username.trim(),
+    profile: config.profile.trim(),
   };
 
   if (config.password.trim().length > 0) {

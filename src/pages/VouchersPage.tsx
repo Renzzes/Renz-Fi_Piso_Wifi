@@ -1,18 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Eye, Plus, Printer, Search } from "lucide-react";
-import { PageHeader } from "@/components/PageHeader";
+import { Eye, Plus, Printer, Search, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { NumericInput } from "@/components/NumericInput";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import { Badge } from "@/components/ui/badge";
 import {
   Dialog,
   DialogContent,
@@ -21,6 +11,16 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -42,16 +42,23 @@ import { refreshProductionRouterViews } from "@/lib/refreshProductionRouterViews
 import { toast } from "sonner";
 import type { Voucher } from "@/types/api";
 import type { VoucherGeneratePayload } from "@/services/vouchers";
-import {
-  formatDeletedToast,
-  formatGeneratedToast,
-} from "@/services/vouchers";
+import { formatDeletedToast, formatGeneratedToast } from "@/services/vouchers";
 import { ApiError } from "@/services/api";
+import { VoucherPagination } from "@/components/vouchers/VoucherPagination";
+import { VoucherTable } from "@/components/vouchers/VoucherTable";
+import { EmptyState } from "@/components/admin/EmptyState";
+import {
+  VOUCHER_PAGE_SIZE_DEFAULT,
+  VOUCHER_STATUSES,
+  filterVouchers,
+  isDeletableStatus,
+  voucherSpeedLabel,
+  voucherStatus,
+} from "@/lib/voucherDisplay";
 
 const ROUTER_DEFAULT_PROFILE = "__router_default__";
 const SPEED_DEFAULT = "__speed_default__";
 const SPEED_CUSTOM = "__speed_custom__";
-/** One Generate job creates this many vouchers (inclusive). Default 3. */
 const VOUCHER_COUNT_MIN = 1;
 const VOUCHER_COUNT_MAX = 20;
 const VOUCHER_COUNT_DEFAULT = 3;
@@ -59,23 +66,6 @@ const VOUCHER_COUNT_DEFAULT = 3;
 function formatRateLimit(rateLimit?: string): string {
   const trimmed = rateLimit?.trim() ?? "";
   return trimmed.length > 0 ? trimmed : "rate-limit not set";
-}
-
-function voucherStatus(v: Voucher): string {
-  return (v.status ?? "").trim().toLowerCase();
-}
-
-function isDeletableStatus(status: string): boolean {
-  return (
-    status === "unused" ||
-    status === "expired" ||
-    status === "disabled" ||
-    status === "archived"
-  );
-}
-
-function voucherSpeedLabel(v: Voucher): string {
-  return v.speed || v.profileName || "Default";
 }
 
 /** Same-page iframe print — never uses window.open / pop-ups. */
@@ -145,12 +135,10 @@ function VoucherPreviewDialog({
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-md max-h-[85vh] overflow-y-auto">
+      <DialogContent className="max-h-[85vh] max-w-md overflow-y-auto">
         <DialogHeader>
           <DialogTitle>
-            {vouchers.length === 1
-              ? "Voucher details"
-              : `Preview (${vouchers.length})`}
+            {vouchers.length === 1 ? "Voucher details" : `Preview (${vouchers.length})`}
           </DialogTitle>
         </DialogHeader>
         <div className="space-y-3">
@@ -189,7 +177,7 @@ function VoucherPreviewDialog({
 }
 
 export default function VouchersPage() {
-  const { data: vouchers = [] } = useVouchers();
+  const { data: vouchers = [], isLoading, isError, refetch } = useVouchers();
   const generateMutation = useGenerateVouchers();
   const actionMutation = useVoucherAction();
   const deleteMutation = useDeleteVoucher();
@@ -199,17 +187,27 @@ export default function VouchersPage() {
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [preview, setPreview] = useState<Voucher[]>([]);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(VOUCHER_PAGE_SIZE_DEFAULT);
+  const [deleteTarget, setDeleteTarget] = useState<Voucher | null>(null);
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
 
-  const filtered = vouchers.filter(
-    (v) =>
-      (filter === "all" || voucherStatus(v) === filter) &&
-      v.code.toLowerCase().includes(q.toLowerCase()),
-  );
+  const filtered = useMemo(() => filterVouchers(vouchers, q, filter), [vouchers, q, filter]);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize) || 1);
+  const safePage = Math.min(page, totalPages);
+  const pageRows = filtered.slice((safePage - 1) * pageSize, safePage * pageSize);
+
+  useEffect(() => {
+    setPage(1);
+  }, [q, filter, pageSize]);
+
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
 
   const selectedList = filtered.filter((v) => selected[v.code]);
-  const deletableSelected = selectedList.filter((v) =>
-    isDeletableStatus(voucherStatus(v)),
-  );
+  const deletableSelected = selectedList.filter((v) => isDeletableStatus(voucherStatus(v)));
 
   const generate = async (payload: VoucherGeneratePayload) => {
     try {
@@ -227,6 +225,7 @@ export default function VouchersPage() {
         console.debug(`[voucher-ui] refreshed vouchers after generate count=${n}`);
       }
       setOpen(false);
+      setPage(1);
     } catch (err) {
       const msg =
         err instanceof ApiError
@@ -238,95 +237,110 @@ export default function VouchersPage() {
     }
   };
 
-  const toggleAll = (on: boolean) => {
-    const next: Record<string, boolean> = {};
-    if (on) filtered.forEach((v) => (next[v.code] = true));
-    setSelected(next);
+  const togglePage = (on: boolean) => {
+    setSelected((prev) => {
+      const next = { ...prev };
+      for (const v of pageRows) {
+        if (on) next[v.code] = true;
+        else delete next[v.code];
+      }
+      return next;
+    });
   };
 
+  const confirmBulkDelete = () => {
+    if (deletableSelected.length === 0) {
+      toast.error("Select at least 1 voucher to delete.");
+      return;
+    }
+    if (deletableSelected.length > 20) {
+      toast.error("You can delete a maximum of 20 vouchers at a time.");
+      return;
+    }
+    setBulkDeleteOpen(true);
+  };
+
+  const runBulkDelete = () => {
+    bulkDeleteMutation.mutate(
+      deletableSelected.map((v) => v.code),
+      {
+        onSuccess: (result) => {
+          const n = result.count ?? result.deleted?.length ?? deletableSelected.length;
+          toast.success(formatDeletedToast(n));
+          setSelected({});
+          setBulkDeleteOpen(false);
+        },
+        onError: (err) => toast.error(err instanceof Error ? err.message : "Bulk delete failed"),
+      },
+    );
+  };
+
+  const runSingleDelete = () => {
+    if (!deleteTarget) return;
+    const code = deleteTarget.code;
+    deleteMutation.mutate(code, {
+      onSuccess: (result) => {
+        const n = result.count ?? result.deleted?.length ?? 1;
+        toast.success(formatDeletedToast(n));
+        setSelected((prev) => {
+          const next = { ...prev };
+          delete next[code];
+          return next;
+        });
+        setDeleteTarget(null);
+      },
+      onError: (err) => toast.error(err instanceof Error ? err.message : "Delete failed"),
+    });
+  };
+
+  const emptySearch = !isLoading && vouchers.length > 0 && filtered.length === 0;
+  const emptyAll = !isLoading && vouchers.length === 0;
+
   return (
-    <div>
-      <PageHeader
-        title="Vouchers"
-        description="Generate and manage WiFi vouchers"
-        actions={
-          <div className="flex gap-2 flex-wrap">
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={selectedList.length === 0}
-              onClick={() => setPreview(selectedList)}
-            >
-              <Eye className="h-4 w-4" /> View selected
-            </Button>
-            <Button
-              size="sm"
-              variant="destructive"
-              disabled={
-                deletableSelected.length === 0 || bulkDeleteMutation.isPending
-              }
-              onClick={() => {
-                if (deletableSelected.length === 0) {
-                  toast.error("Select at least 1 voucher to delete.");
-                  return;
-                }
-                if (deletableSelected.length > 20) {
-                  toast.error(
-                    "You can delete a maximum of 20 vouchers at a time.",
-                  );
-                  return;
-                }
-                if (
-                  !window.confirm(
-                    `Delete ${deletableSelected.length} selected voucher(s)? This cannot be undone.`,
-                  )
-                ) {
-                  return;
-                }
-                bulkDeleteMutation.mutate(
-                  deletableSelected.map((v) => v.code),
-                  {
-                    onSuccess: (result) => {
-                      const n =
-                        result.count ??
-                        result.deleted?.length ??
-                        deletableSelected.length;
-                      toast.success(formatDeletedToast(n));
-                      setSelected({});
-                    },
-                    onError: (err) =>
-                      toast.error(
-                        err instanceof Error
-                          ? err.message
-                          : "Bulk delete failed",
-                      ),
-                  },
-                );
-              }}
-            >
-              {bulkDeleteMutation.isPending ? "Deleting…" : "Delete selected"}
-            </Button>
-            <p className="w-full text-[11px] text-muted-foreground">
-              Select 1–20 vouchers to delete.
-            </p>
-            <Dialog
-              open={open}
-              onOpenChange={(v) => !generateMutation.isPending && setOpen(v)}
-            >
-              <DialogTrigger asChild>
-                <Button size="sm" disabled={generateMutation.isPending}>
-                  <Plus className="h-4 w-4" />
-                  {generateMutation.isPending ? "Generating..." : "Generate"}
-                </Button>
-              </DialogTrigger>
-              <GenerateDialog
-                onGenerate={generate}
-                generating={generateMutation.isPending}
-              />
-            </Dialog>
+    <div className="space-y-3">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <h2 className="text-2xl font-semibold leading-tight">Vouchers</h2>
+          <p className="mt-0.5 text-[13px] text-muted-foreground">
+            Generate and manage WiFi vouchers
+          </p>
+        </div>
+        <div className="flex flex-nowrap items-center gap-2.5 overflow-x-auto">
+          <Dialog open={open} onOpenChange={(v) => !generateMutation.isPending && setOpen(v)}>
+            <DialogTrigger asChild>
+              <Button size="sm" className="h-9 shrink-0 px-4" disabled={generateMutation.isPending}>
+                <Plus className="h-4 w-4" />
+                {generateMutation.isPending ? "Generating..." : "Generate"}
+              </Button>
+            </DialogTrigger>
+            <GenerateDialog onGenerate={generate} generating={generateMutation.isPending} />
+          </Dialog>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-9 shrink-0 px-4"
+            disabled={selectedList.length === 0}
+            onClick={() => setPreview(selectedList)}
+          >
+            <Eye className="h-4 w-4" />
+            View Selected
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-9 shrink-0 px-4 border-red-500/40 bg-red-500/10 text-red-600 hover:bg-red-500/20 dark:text-red-400"
+            disabled={deletableSelected.length === 0 || bulkDeleteMutation.isPending}
+            onClick={confirmBulkDelete}
+          >
+            <Trash2 className="h-4 w-4" />
+            {bulkDeleteMutation.isPending ? "Deleting…" : "Delete Selected"}
+          </Button>
+          <div className="shrink-0 pl-1 text-[12px] text-muted-foreground whitespace-nowrap">
+            Total vouchers: {vouchers.length} codes
+            {selectedList.length > 0 ? ` · ${selectedList.length} selected` : ""}
           </div>
-        }
-      />
+        </div>
+      </div>
 
       <VoucherPreviewDialog
         vouchers={preview}
@@ -336,197 +350,138 @@ export default function VouchersPage() {
         }}
       />
 
-      <div className="flex flex-wrap gap-2 mb-3">
-        <div className="relative flex-1 min-w-[200px]">
-          <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+      <div className="flex items-center gap-2">
+        <div className="relative min-w-0 flex-1">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
-            className="pl-8 h-8"
-            placeholder="Search code"
+            className="h-9 pl-8"
+            placeholder="Search code, amount, or status..."
             value={q}
             onChange={(e) => setQ(e.target.value)}
+            aria-label="Search vouchers"
           />
         </div>
         <Select value={filter} onValueChange={setFilter}>
-          <SelectTrigger className="w-[140px] h-8">
-            <SelectValue />
+          <SelectTrigger className="h-9 w-[168px]" aria-label="Filter by status">
+            <SelectValue placeholder="All Status" />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">All</SelectItem>
-            <SelectItem value="unused">Unused</SelectItem>
-            <SelectItem value="redeeming">Redeeming</SelectItem>
-            <SelectItem value="active">Active</SelectItem>
-            <SelectItem value="expired">Expired</SelectItem>
-            <SelectItem value="disabled">Disabled</SelectItem>
-            <SelectItem value="archived">Archived</SelectItem>
+            <SelectItem value="all">All Status</SelectItem>
+            {VOUCHER_STATUSES.map((status) => (
+              <SelectItem key={status} value={status}>
+                {status.charAt(0).toUpperCase() + status.slice(1)}
+              </SelectItem>
+            ))}
           </SelectContent>
         </Select>
       </div>
 
-      <div className="rounded-md border bg-card overflow-x-auto">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-10">
-                <input
-                  type="checkbox"
-                  aria-label="Select all"
-                  checked={
-                    filtered.length > 0 &&
-                    selectedList.length === filtered.length
-                  }
-                  onChange={(e) => toggleAll(e.target.checked)}
-                />
-              </TableHead>
-              <TableHead>Code</TableHead>
-              <TableHead>Amount</TableHead>
-              <TableHead>Time</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>Expires</TableHead>
-              <TableHead>Bound Device</TableHead>
-              <TableHead>Speed</TableHead>
-              <TableHead className="text-right min-w-[220px]">Action</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {filtered.map((v) => {
-              const status = voucherStatus(v);
-              const deletable = isDeletableStatus(status);
-              return (
-                <TableRow key={v.code}>
-                  <TableCell>
-                    <input
-                      type="checkbox"
-                      checked={!!selected[v.code]}
-                      onChange={(e) =>
-                        setSelected((prev) => ({
-                          ...prev,
-                          [v.code]: e.target.checked,
-                        }))
-                      }
-                    />
-                  </TableCell>
-                  <TableCell className="font-mono text-xs">{v.code}</TableCell>
-                  <TableCell>₱{v.amount}</TableCell>
-                  <TableCell>{v.minutes}m</TableCell>
-                  <TableCell>
-                    <Badge
-                      variant={
-                        status === "active"
-                          ? "default"
-                          : status === "expired"
-                            ? "destructive"
-                            : "secondary"
-                      }
-                    >
-                      {v.status}
-                    </Badge>
-                  </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
-                    {v.expires}
-                  </TableCell>
-                  <TableCell className="font-mono text-xs">
-                    {v.boundMac || "—"}
-                  </TableCell>
-                  <TableCell className="text-xs">
-                    {voucherSpeedLabel(v)}
-                  </TableCell>
-                  <TableCell className="text-right whitespace-nowrap">
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-7"
-                      onClick={() => setPreview([v])}
-                    >
-                      <Eye className="h-3.5 w-3.5" /> View
-                    </Button>
-                    {(status === "active" || status === "redeeming") && (
-                      <Button
-                        size="sm"
-                        variant="destructive"
-                        className="h-7 ml-1"
-                        disabled={actionMutation.isPending}
-                        onClick={() =>
-                          actionMutation.mutate({
-                            code: v.code,
-                            action: "terminate",
-                          })
-                        }
-                      >
-                        Terminate
-                      </Button>
-                    )}
-                    {status === "unused" && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-7 ml-1"
-                        disabled={actionMutation.isPending}
-                        onClick={() =>
-                          actionMutation.mutate({
-                            code: v.code,
-                            action: "disable",
-                          })
-                        }
-                      >
-                        Disable
-                      </Button>
-                    )}
-                    {(status === "unused" ||
-                      status === "expired" ||
-                      status === "disabled") && (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-7 ml-1"
-                        disabled={actionMutation.isPending}
-                        onClick={() =>
-                          actionMutation.mutate({
-                            code: v.code,
-                            action: "archive",
-                          })
-                        }
-                      >
-                        Archive
-                      </Button>
-                    )}
-                    {deletable && (
-                      <Button
-                        size="sm"
-                        variant="destructive"
-                        className="h-7 ml-1"
-                        disabled={deleteMutation.isPending}
-                        onClick={() => {
-                          if (
-                            !window.confirm(
-                              `Delete voucher ${v.code}? This cannot be undone.`,
-                            )
-                          ) {
-                            return;
-                          }
-                          deleteMutation.mutate(v.code, {
-                            onSuccess: (result) => {
-                              const n = result.count ?? result.deleted?.length ?? 1;
-                              toast.success(formatDeletedToast(n));
-                            },
-                            onError: (err) =>
-                              toast.error(
-                                err instanceof Error
-                                  ? err.message
-                                  : "Delete failed",
-                              ),
-                          });
-                        }}
-                      >
-                        Delete
-                      </Button>
-                    )}
-                  </TableCell>
-                </TableRow>
-              );
-            })}
-          </TableBody>
-        </Table>
-      </div>
+      {isError ? (
+        <div className="rounded-[14px] border bg-card p-4">
+          <p className="text-sm font-medium">Unable to load vouchers</p>
+          <p className="mt-1 text-[13px] text-muted-foreground">
+            Something went wrong while retrieving voucher data.
+          </p>
+          <Button type="button" size="sm" className="mt-3" onClick={() => void refetch()}>
+            Retry
+          </Button>
+        </div>
+      ) : (
+        <div className="overflow-hidden rounded-[14px] border bg-card">
+          <div className="overflow-x-auto">
+            <VoucherTable
+              rows={isLoading ? [] : pageRows}
+              loading={isLoading}
+              selected={selected}
+              onToggle={(code, checked) => setSelected((prev) => ({ ...prev, [code]: checked }))}
+              onTogglePage={togglePage}
+              onView={(v) => setPreview([v])}
+              onDelete={setDeleteTarget}
+              onAction={(code, action) => actionMutation.mutate({ code, action })}
+              actionPending={actionMutation.isPending}
+              deletePending={deleteMutation.isPending}
+            />
+          </div>
+          {!isLoading && emptyAll ? (
+            <EmptyState
+              title="No vouchers have been generated yet."
+              action={
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={() => setOpen(true)}
+                  disabled={generateMutation.isPending}
+                >
+                  <Plus className="h-4 w-4" />
+                  Generate Voucher
+                </Button>
+              }
+            />
+          ) : null}
+          {!isLoading && emptySearch ? (
+            <EmptyState
+              title="No vouchers match your search."
+              description="Try a different code, amount, or status."
+            />
+          ) : null}
+          {!isLoading && filtered.length > 0 ? (
+            <div className="border-t">
+              <VoucherPagination
+                page={safePage}
+                pageSize={pageSize}
+                total={filtered.length}
+                onPageChange={setPage}
+                onPageSizeChange={setPageSize}
+              />
+            </div>
+          ) : null}
+        </div>
+      )}
+
+      <AlertDialog
+        open={Boolean(deleteTarget)}
+        onOpenChange={(next) => !next && setDeleteTarget(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete voucher?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to delete {deleteTarget?.code}? This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={runSingleDelete}
+            >
+              Delete Voucher
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={bulkDeleteOpen} onOpenChange={setBulkDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete selected vouchers?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Delete {deletableSelected.length} selected voucher
+              {deletableSelected.length === 1 ? "" : "s"}? This action cannot be undone. Select 1–20
+              vouchers to delete.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={runBulkDelete}
+            >
+              Delete Vouchers
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -563,10 +518,7 @@ function GenerateDialog({
   );
 
   const profileDetails = useMemo(() => {
-    if (
-      Array.isArray(profilesData?.profileDetails) &&
-      profilesData.profileDetails.length > 0
-    ) {
+    if (Array.isArray(profilesData?.profileDetails) && profilesData.profileDetails.length > 0) {
       return profilesData.profileDetails;
     }
     return profileOptions.map((name) => ({ name, rateLimit: "" }));
@@ -575,11 +527,7 @@ function GenerateDialog({
   useEffect(() => {
     if (profilesLoading || profileRefreshAttempted.current) return;
     if (profileOptions.length > 0) return;
-    if (
-      profilesData?.error &&
-      !String(profilesData.error).includes("unavailable")
-    )
-      return;
+    if (profilesData?.error && !String(profilesData.error).includes("unavailable")) return;
     profileRefreshAttempted.current = true;
     void (async () => {
       try {
@@ -617,23 +565,14 @@ function GenerateDialog({
         </div>
         <div className="space-y-1">
           <Label className="text-xs">Validity (minutes after redeem)</Label>
-          <NumericInput
-            value={minutes}
-            min={1}
-            max={525600}
-            onValueChange={setMinutes}
-          />
+          <NumericInput value={minutes} min={1} max={525600} onValueChange={setMinutes} />
           <p className="text-[11px] text-muted-foreground">
             Service clock starts at redeem. Example: 3 days = 4320 minutes.
           </p>
         </div>
         <div className="space-y-1">
           <Label className="text-xs">Redeem Before</Label>
-          <Input
-            type="date"
-            value={expires}
-            onChange={(e) => setExpires(e.target.value)}
-          />
+          <Input type="date" value={expires} onChange={(e) => setExpires(e.target.value)} />
         </div>
         <div className="space-y-1">
           <Label className="text-xs">Speed Limit</Label>
@@ -660,14 +599,10 @@ function GenerateDialog({
             }}
           >
             <SelectTrigger>
-              <SelectValue
-                placeholder={profilesLoading ? "Loading…" : "Select speed"}
-              />
+              <SelectValue placeholder={profilesLoading ? "Loading…" : "Select speed"} />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value={SPEED_DEFAULT}>
-                Use Promo/Profile Default
-              </SelectItem>
+              <SelectItem value={SPEED_DEFAULT}>Use Promo/Profile Default</SelectItem>
               <SelectItem value={SPEED_CUSTOM}>Custom</SelectItem>
               {profileDetails.map((p) => (
                 <SelectItem key={p.name} value={p.name}>
@@ -680,21 +615,11 @@ function GenerateDialog({
             <div className="grid grid-cols-2 gap-2 pt-1">
               <div>
                 <Label className="text-[10px]">Download Mbps</Label>
-                <NumericInput
-                  value={customDown}
-                  min={1}
-                  max={1000}
-                  onValueChange={setCustomDown}
-                />
+                <NumericInput value={customDown} min={1} max={1000} onValueChange={setCustomDown} />
               </div>
               <div>
                 <Label className="text-[10px]">Upload Mbps</Label>
-                <NumericInput
-                  value={customUp}
-                  min={1}
-                  max={1000}
-                  onValueChange={setCustomUp}
-                />
+                <NumericInput value={customUp} min={1} max={1000} onValueChange={setCustomUp} />
               </div>
             </div>
           ) : selectedDetail && speedMode !== SPEED_DEFAULT ? (
@@ -707,7 +632,7 @@ function GenerateDialog({
             </p>
           )}
         </div>
-        <div className="space-y-1 col-span-2">
+        <div className="col-span-2 space-y-1">
           <Label className="text-xs">Display Speed (optional)</Label>
           <Input
             value={displaySpeed}
@@ -715,13 +640,13 @@ function GenerateDialog({
             placeholder="e.g. 5 Mbps"
           />
           <p className="text-[11px] text-muted-foreground">
-            Presentation only (printed label / UI). Does not change RouterOS
-            enforcement — use Speed Limit above for actual rate-limit.
+            Presentation only (printed label / UI). Does not change RouterOS enforcement — use Speed
+            Limit above for actual rate-limit.
           </p>
         </div>
       </div>
       {generating ? (
-        <p className="text-sm text-muted-foreground pt-1">
+        <p className="pt-1 text-sm text-muted-foreground">
           Generating {count ?? VOUCHER_COUNT_DEFAULT} voucher
           {(count ?? VOUCHER_COUNT_DEFAULT) === 1 ? "" : "s"}…
           <br />
@@ -741,9 +666,7 @@ function GenerateDialog({
               c < VOUCHER_COUNT_MIN ||
               c > VOUCHER_COUNT_MAX
             ) {
-              toast.error(
-                `Count must be ${VOUCHER_COUNT_MIN}–${VOUCHER_COUNT_MAX}`,
-              );
+              toast.error(`Count must be ${VOUCHER_COUNT_MIN}–${VOUCHER_COUNT_MAX}`);
               return;
             }
             if (a === undefined || !Number.isFinite(a) || a < 0) {
@@ -772,10 +695,7 @@ function GenerateDialog({
               payload.uploadMbps = up;
               payload.profileName = `renzfi-speed-${down}m-${up}m`;
               if (!payload.speed) payload.speed = `${down}/${up} Mbps`;
-            } else if (
-              speedMode !== SPEED_DEFAULT &&
-              profileName !== ROUTER_DEFAULT_PROFILE
-            ) {
+            } else if (speedMode !== SPEED_DEFAULT && profileName !== ROUTER_DEFAULT_PROFILE) {
               payload.profileName = profileName;
             }
             if (import.meta.env.DEV) {
@@ -784,9 +704,7 @@ function GenerateDialog({
             onGenerate(payload);
           }}
         >
-          {generating
-            ? `Generating ${count ?? VOUCHER_COUNT_DEFAULT}…`
-            : "Generate"}
+          {generating ? `Generating ${count ?? VOUCHER_COUNT_DEFAULT}…` : "Generate"}
         </Button>
       </DialogFooter>
     </DialogContent>

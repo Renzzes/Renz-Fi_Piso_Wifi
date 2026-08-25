@@ -4,6 +4,9 @@ import { Eye, EyeOff } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Checkbox } from "@/components/ui/checkbox";
+import { ConfigCard } from "@/components/system-config/ConfigCard";
+import { ConfigStatusBadge } from "@/components/system-config/ConfigStatusBadge";
 import { settingsApi } from "@/services/settings";
 import { ApiError } from "@/services/api";
 import { toast } from "sonner";
@@ -15,6 +18,7 @@ import {
   normalizeOperatorPermissions,
   type OperatorPermission,
 } from "@/lib/operatorPermissions";
+import { isFactoryResetQuiesced, onFactoryResetQuiesce } from "@/services/factoryResetQuiesce";
 
 /** Client-side mask toggle. Never submits or persists the value. */
 function PasswordRevealField({
@@ -56,6 +60,7 @@ function PasswordRevealField({
           readOnly={readOnly}
           spellCheck={false}
           aria-label={label}
+          className="min-w-0 w-full"
         />
         <Button
           type="button"
@@ -101,7 +106,9 @@ export function SetupUnlockPasswordPanel() {
       await queryClient.invalidateQueries({ queryKey: ["settings", "setup-unlock"] });
     },
     onError: (err) => {
-      toast.error(err instanceof ApiError ? err.message : "Failed to change Setup Unlock Password.");
+      toast.error(
+        err instanceof ApiError ? err.message : "Failed to change Setup Unlock Password.",
+      );
     },
   });
 
@@ -121,25 +128,20 @@ export function SetupUnlockPasswordPanel() {
   const configured = statusQuery.data?.configured === true;
   const recoverable = statusQuery.data?.recoverable === true;
   const currentUnlockPassword =
-    recoverable && typeof statusQuery.data?.password === "string"
-      ? statusQuery.data.password
-      : "";
+    recoverable && typeof statusQuery.data?.password === "string" ? statusQuery.data.password : "";
 
   return (
-    <div className="rounded-md border bg-card p-3 space-y-3 max-w-xl">
-      <div className="text-sm font-medium">Setup Security</div>
-      <div className="space-y-1">
-        <div className="text-xs font-medium">Stored unlock password</div>
+    <ConfigCard title="Setup Security">
+      <div className="space-y-1.5">
+        <div className="text-[11px] font-medium text-muted-foreground">Stored Unlock Password</div>
         {statusQuery.isLoading ? (
           <p className="text-sm text-muted-foreground">Loading...</p>
         ) : statusQuery.isError ? (
-          <p className="text-sm text-destructive">
-            Unable to retrieve the Setup Unlock Password.
-          </p>
+          <p className="text-sm text-destructive">Unable to retrieve the Setup Unlock Password.</p>
         ) : recoverable && currentUnlockPassword ? (
           <PasswordRevealField
             id="setupUnlockCurrentStored"
-            label="Stored unlock password"
+            label="Stored Unlock Password"
             value={currentUnlockPassword}
             autoComplete="off"
             readOnly
@@ -151,20 +153,23 @@ export function SetupUnlockPasswordPanel() {
           </p>
         )}
         <p className="text-xs text-muted-foreground">
-          Used with Setup Unlock / Management AP to reconfigure after installation.
-          The Setup Wizard is not available from production Admin.
+          Used with Setup Unlock / Management AP to reconfigure after installation. The Setup Wizard
+          is not available from production Admin.
         </p>
       </div>
-      <div className="text-sm">
-        Status:{" "}
-        <span className={configured ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}>
-          {statusQuery.isLoading ? "Loading..." : configured ? "Configured" : "Not configured"}
-        </span>
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-[11px] font-medium text-muted-foreground">Status</span>
+        <ConfigStatusBadge
+          label={
+            statusQuery.isLoading ? "Loading..." : configured ? "Configured" : "Not configured"
+          }
+          tone={configured ? "ok" : "unknown"}
+        />
       </div>
       <form className="space-y-3" onSubmit={handleSubmit}>
         <PasswordRevealField
           id="setupUnlockCurrent"
-          label="Current password (to authorize change)"
+          label="Current Password"
           value={currentPassword}
           onChange={setCurrentPassword}
           autoComplete="current-password"
@@ -188,19 +193,27 @@ export function SetupUnlockPasswordPanel() {
           minLength={MIN_ADMIN_PASSWORD_LENGTH}
           required
         />
-        <Button type="submit" size="sm" disabled={changeMutation.isPending || statusQuery.isLoading}>
+        <Button
+          type="submit"
+          size="sm"
+          disabled={changeMutation.isPending || statusQuery.isLoading}
+        >
           {changeMutation.isPending ? "Saving..." : "Change Setup Unlock Password"}
         </Button>
       </form>
-    </div>
+    </ConfigCard>
   );
 }
 
 export function OperatorAccountPanel() {
   const queryClient = useQueryClient();
+  const [factoryResetQuiesced, setFactoryResetQuiescedState] = useState(isFactoryResetQuiesced);
+  useEffect(() => onFactoryResetQuiesce(setFactoryResetQuiescedState), []);
+
   const statusQuery = useQuery({
     queryKey: ["settings", "operator"],
     queryFn: () => settingsApi.operator(),
+    enabled: !factoryResetQuiesced,
   });
 
   const [username, setUsername] = useState("");
@@ -248,9 +261,7 @@ export function OperatorAccountPanel() {
   });
 
   const togglePermission = (key: OperatorPermission) => {
-    setPermissions((prev) =>
-      prev.includes(key) ? prev.filter((p) => p !== key) : [...prev, key],
-    );
+    setPermissions((prev) => (prev.includes(key) ? prev.filter((p) => p !== key) : [...prev, key]));
   };
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -277,105 +288,138 @@ export function OperatorAccountPanel() {
   const configured = statusQuery.data?.configured === true;
 
   const permissionChecks = (
-    <div className="space-y-2 rounded-md border p-2">
-      <div className="text-xs font-medium">Sidebar access</div>
-      <p className="text-[11px] text-muted-foreground">
-        Choose which Admin pages this operator may open. System Settings and Setup remain owner-only.
-      </p>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+    <div className="space-y-3">
+      <div>
+        <h4 className="text-[13px] font-semibold">Sidebar Access</h4>
+        <p className="mt-0.5 text-[11px] text-muted-foreground">
+          Choose which Admin pages this operator may open. System Settings and Setup remain
+          owner-only.
+        </p>
+      </div>
+      <div className="grid grid-cols-1 gap-x-4 gap-y-2 sm:grid-cols-2">
         {OPERATOR_PERMISSION_KEYS.map((key) => (
-          <label key={key} className="flex items-center gap-2 text-xs">
-            <input
-              type="checkbox"
+          <label key={key} className="flex min-w-0 items-center gap-2 text-[13px]">
+            <Checkbox
               checked={permissions.includes(key)}
-              onChange={() => togglePermission(key)}
+              onCheckedChange={() => togglePermission(key)}
+              aria-label={OPERATOR_PERMISSION_LABELS[key]}
             />
-            {OPERATOR_PERMISSION_LABELS[key]}
+            <span className="truncate">{OPERATOR_PERMISSION_LABELS[key]}</span>
           </label>
         ))}
       </div>
     </div>
   );
 
-  return (
-    <div className="rounded-md border bg-card p-3 space-y-3 max-w-xl">
-      <div className="text-sm font-medium">Operator Account</div>
-      <p className="text-xs text-muted-foreground">
-        Optional staff login with assignable sidebar access.
-      </p>
-      <div className="text-sm">
-        Status:{" "}
-        {statusQuery.isLoading ? (
-          <span className="text-muted-foreground">Checking…</span>
-        ) : configured ? (
-          <span className="text-emerald-600 dark:text-emerald-400">
-            Operator configured
-            {statusQuery.data?.username ? ` (${statusQuery.data.username})` : ""}
-          </span>
-        ) : (
-          <span className="text-muted-foreground">No operator configured</span>
-        )}
-      </div>
-      {configured ? (
-        <div className="space-y-3">
-          {permissionChecks}
-          <Button
-            type="button"
-            size="sm"
-            disabled={permsMutation.isPending || permissions.length === 0}
-            onClick={() => permsMutation.mutate()}
-          >
-            {permsMutation.isPending ? "Saving…" : "Save sidebar access"}
-          </Button>
-        </div>
+  const accountStatus = (
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-[11px] font-medium text-muted-foreground">Status</span>
+      {statusQuery.isLoading ? (
+        <ConfigStatusBadge label="Checking…" tone="unknown" />
+      ) : configured ? (
+        <ConfigStatusBadge
+          label={
+            statusQuery.data?.username ? `Configured (${statusQuery.data.username})` : "Configured"
+          }
+          tone="ok"
+        />
       ) : (
-        <form className="space-y-3" onSubmit={handleSubmit}>
-          <div className="space-y-1">
-            <Label htmlFor="operatorUsername" className="text-xs">
-              Username
-            </Label>
-            <Input
-              id="operatorUsername"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              autoComplete="username"
-              required
-            />
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="operatorPassword" className="text-xs">
-              Password
-            </Label>
-            <Input
-              id="operatorPassword"
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              autoComplete="new-password"
-              minLength={MIN_ADMIN_PASSWORD_LENGTH}
-              required
-            />
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="operatorConfirm" className="text-xs">
-              Confirm Password
-            </Label>
-            <Input
-              id="operatorConfirm"
-              type="password"
-              value={confirmPassword}
-              onChange={(e) => setConfirmPassword(e.target.value)}
-              autoComplete="new-password"
-              minLength={MIN_ADMIN_PASSWORD_LENGTH}
-              required
-            />
-          </div>
-          {permissionChecks}
-          <Button type="submit" size="sm" disabled={createMutation.isPending || statusQuery.isLoading}>
-            {createMutation.isPending ? "Creating..." : "Create Operator"}
-          </Button>
-        </form>
+        <ConfigStatusBadge label="No operator configured" tone="unknown" />
       )}
     </div>
+  );
+
+  return (
+    <ConfigCard
+      title="Operator Account"
+      description="Optional staff login with assignable sidebar access."
+    >
+      {configured ? (
+        <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
+          <div className="space-y-3 rounded-lg border bg-muted/10 p-4">
+            <h4 className="text-[13px] font-semibold">Account Information</h4>
+            {accountStatus}
+          </div>
+          <div className="space-y-3 rounded-lg border bg-muted/10 p-4">
+            {permissionChecks}
+            <Button
+              type="button"
+              size="sm"
+              disabled={permsMutation.isPending || permissions.length === 0}
+              onClick={() => permsMutation.mutate()}
+            >
+              {permsMutation.isPending ? "Saving…" : "Save sidebar access"}
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <form className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2" onSubmit={handleSubmit}>
+          <div className="space-y-3 rounded-lg border bg-muted/10 p-4">
+            <h4 className="text-[13px] font-semibold">Account Information</h4>
+            {accountStatus}
+            <div className="space-y-1.5">
+              <Label
+                htmlFor="operatorUsername"
+                className="text-[11px] font-medium text-muted-foreground"
+              >
+                Username
+              </Label>
+              <Input
+                id="operatorUsername"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                autoComplete="username"
+                required
+                className="min-w-0 w-full"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label
+                htmlFor="operatorPassword"
+                className="text-[11px] font-medium text-muted-foreground"
+              >
+                Password
+              </Label>
+              <Input
+                id="operatorPassword"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="new-password"
+                minLength={MIN_ADMIN_PASSWORD_LENGTH}
+                required
+                className="min-w-0 w-full"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label
+                htmlFor="operatorConfirm"
+                className="text-[11px] font-medium text-muted-foreground"
+              >
+                Confirm Password
+              </Label>
+              <Input
+                id="operatorConfirm"
+                type="password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                autoComplete="new-password"
+                minLength={MIN_ADMIN_PASSWORD_LENGTH}
+                required
+                className="min-w-0 w-full"
+              />
+            </div>
+            <Button
+              type="submit"
+              size="sm"
+              disabled={createMutation.isPending || statusQuery.isLoading}
+            >
+              {createMutation.isPending ? "Creating..." : "Create Operator"}
+            </Button>
+          </div>
+          <div className="space-y-3 rounded-lg border bg-muted/10 p-4">{permissionChecks}</div>
+        </form>
+      )}
+    </ConfigCard>
   );
 }

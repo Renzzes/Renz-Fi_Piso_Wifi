@@ -31,7 +31,7 @@ export const OPERATOR_PERMISSION_LABELS: Record<OperatorPermission, string> = {
   "coin-settings": "Coin Settings",
   "system-configuration": "System Configuration",
   logs: "Logs",
-  firmware: "Firmware Update",
+  firmware: "Update",
 };
 
 export function pathPermission(path: string): OperatorPermission | null {

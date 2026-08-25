@@ -7,6 +7,9 @@ import { apiUrl, embeddedApi } from "@/services/embeddedApi";
 const THROTTLE_MS = 500;
 const RECONNECT_MS = 3000;
 const FALLBACK_POLL_MS = 30_000;
+const MAX_SEEN_SALE_IDS = 256;
+
+const seenSaleIds = new Set<string>();
 
 const EVENT_QUERY_MAP: Record<string, Array<{ queryKey: readonly unknown[] }>> = {
   "sales.changed": [
@@ -78,16 +81,29 @@ function bumpBucket(
   };
 }
 
+function rememberSaleId(id: string): boolean {
+  if (!id || seenSaleIds.has(id)) return false;
+  seenSaleIds.add(id);
+  if (seenSaleIds.size > MAX_SEEN_SALE_IDS) {
+    const first = seenSaleIds.values().next().value;
+    if (first) seenSaleIds.delete(first);
+  }
+  return true;
+}
+
 /** Apply persisted sale.created to dashboard cards without a full reload. */
 function applySaleCreatedPatch(
   queryClient: ReturnType<typeof useQueryClient>,
   raw: string,
 ): boolean {
   let amount = 0;
+  let saleId = "";
   try {
-    const parsed = JSON.parse(raw) as { amount?: unknown };
+    const parsed = JSON.parse(raw) as { amount?: unknown; id?: unknown };
     amount = Number(parsed.amount);
+    saleId = typeof parsed.id === "string" ? parsed.id : "";
     if (!Number.isFinite(amount) || amount <= 0) return false;
+    if (saleId && !rememberSaleId(saleId)) return false;
   } catch {
     return false;
   }
@@ -211,6 +227,8 @@ export function useDashboardEvents(
   return {
     sseConnected: connected,
     sseReconnecting: reconnecting,
-    fallbackPollMs: fallbackPollMs(connected),
+    // When SSE is intentionally off (logout or factory-reset quiesce), do not
+    // fall back to HTTP polling — that would recreate the Admin request herd.
+    fallbackPollMs: enabled ? fallbackPollMs(connected) : false,
   };
 }

@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { PageHeader } from "@/components/PageHeader";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -14,17 +13,26 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { StatCard } from "@/components/StatCard";
-import { Coins } from "lucide-react";
 import { coinApi } from "@/services/coin";
 import { toast } from "sonner";
 import { useRealtime } from "@/contexts/RealtimeContext";
+import { ConfigCard, ConfigField } from "@/components/system-config/ConfigCard";
+import { ConfigStatusBadge } from "@/components/system-config/ConfigStatusBadge";
+import { MetricTile } from "@/components/system-config/InfoRow";
+import type { StatusTone } from "@/lib/dashboardDisplay";
+
+function coinStateTone(state: string | undefined): StatusTone {
+  const value = (state ?? "").toLowerCase();
+  if (!value || value === "—") return "unknown";
+  if (value.includes("error") || value.includes("fault")) return "bad";
+  if (value.includes("wait") || value.includes("idle")) return "ok";
+  return "neutral";
+}
 
 export default function CoinSettingsPage() {
   const qc = useQueryClient();
   const { fallbackPollMs } = useRealtime();
-  const { data: settings } = useQuery({
+  const { data: settings, isLoading: settingsLoading } = useQuery({
     queryKey: ["coin", "settings"],
     queryFn: () => coinApi.settings(),
   });
@@ -76,59 +84,85 @@ export default function CoinSettingsPage() {
   });
 
   const stats = diagnostics?.stats;
+  const stateLabel = String(stats?.state ?? "—");
 
   return (
-    <div>
-      <PageHeader title="Coin Settings" description="Configure the coin slot acceptor" />
-
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
-        <StatCard label="Last Pulse" value={stats?.last_pulse ?? "0"} icon={Coins} />
-        <StatCard
-          label="Total Today"
-          value={stats?.total_today ?? "0"}
-          icon={Coins}
-          tone="success"
-        />
-        <StatCard label="Errors" value={stats?.errors ?? "0"} tone="success" />
-        <StatCard label="State" value={stats?.state ?? "—"} tone="success" />
+    <div className="flex w-full max-w-none flex-col gap-4">
+      <div>
+        <h2 className="text-2xl font-semibold leading-tight">Coin Settings</h2>
+        <p className="mt-0.5 text-[13px] text-muted-foreground">Configure the coin slot acceptor</p>
       </div>
 
-      <div className="grid md:grid-cols-2 gap-3">
-        <div className="rounded-md border bg-card p-3 space-y-3">
-          <div className="text-sm font-medium">Configuration</div>
-          <div className="space-y-1">
-            <Label className="text-xs">Pulse Width (ms)</Label>
-            <Input type="number" value={pulse} onChange={(e) => setPulse(+e.target.value)} />
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <MetricTile label="Last Pulse" value={String(stats?.last_pulse ?? "0")} />
+        <MetricTile label="Total Today" value={String(stats?.total_today ?? "0")} />
+        <MetricTile label="Errors" value={String(stats?.errors ?? "0")} />
+        <div className="min-w-0 rounded-lg border bg-muted/20 px-3 py-2.5">
+          <div className="text-[11px] font-medium text-muted-foreground">State</div>
+          <div className="mt-1">
+            <ConfigStatusBadge label={stateLabel} tone={coinStateTone(stateLabel)} />
           </div>
-          <div className="space-y-1">
-            <Label className="text-xs">Coin Calibration (pulses per peso)</Label>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
+        <ConfigCard title="Configuration">
+          <ConfigField label="Pulse Width (ms)">
+            <Input
+              type="number"
+              value={pulse}
+              onChange={(e) => setPulse(+e.target.value)}
+              className="min-w-0 w-full"
+              disabled={settingsLoading}
+            />
+          </ConfigField>
+          <ConfigField label="Coin Calibration (pulses per peso)">
             <Input
               type="number"
               value={calibration}
               onChange={(e) => setCalibration(+e.target.value)}
+              className="min-w-0 w-full"
+              disabled={settingsLoading}
             />
-          </div>
-          <div className="space-y-1">
-            <Label className="text-xs">Insert Timeout (seconds)</Label>
-            <Input type="number" value={timeout_} onChange={(e) => setTimeout_(+e.target.value)} />
-          </div>
-          <Button size="sm" onClick={() => saveMutation.mutate()}>
-            Save
+          </ConfigField>
+          <ConfigField label="Insert Timeout (seconds)">
+            <Input
+              type="number"
+              value={timeout_}
+              onChange={(e) => setTimeout_(+e.target.value)}
+              className="min-w-0 w-full"
+              disabled={settingsLoading}
+            />
+          </ConfigField>
+          <Button
+            size="sm"
+            disabled={saveMutation.isPending || settingsLoading}
+            onClick={() => saveMutation.mutate()}
+          >
+            {saveMutation.isPending ? "Saving…" : "Save"}
           </Button>
-        </div>
+        </ConfigCard>
 
-        <div className="rounded-md border bg-card p-3 space-y-3">
-          <div className="text-sm font-medium">Diagnostics</div>
-          <div className="rounded-sm bg-muted/50 p-2 font-mono text-xs h-40 overflow-auto">
-            {(diagnostics?.logs ?? []).map((l, i) => (
-              <div key={i}>
-                [{l.t}] {l.msg}
-              </div>
-            ))}
+        <ConfigCard title="Diagnostics">
+          <div className="max-h-[240px] min-h-[120px] overflow-auto rounded-lg border bg-muted/20 p-3 font-mono text-xs">
+            {(diagnostics?.logs ?? []).length === 0 ? (
+              <p className="text-muted-foreground">No diagnostic messages</p>
+            ) : (
+              (diagnostics?.logs ?? []).map((l, i) => (
+                <div key={i}>
+                  [{l.t}] {l.msg}
+                </div>
+              ))
+            )}
           </div>
-          <div className="flex gap-2">
-            <Button size="sm" variant="outline" onClick={() => testMutation.mutate()}>
-              Test Pulse
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={testMutation.isPending}
+              onClick={() => testMutation.mutate()}
+            >
+              {testMutation.isPending ? "Testing…" : "Test Pulse"}
             </Button>
             <AlertDialog>
               <AlertDialogTrigger asChild>
@@ -153,7 +187,7 @@ export default function CoinSettingsPage() {
               </AlertDialogContent>
             </AlertDialog>
           </div>
-        </div>
+        </ConfigCard>
       </div>
     </div>
   );

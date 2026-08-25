@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import { SetupCard } from "@/components/setup/SetupCard";
 import { WizardProgressBar } from "@/components/setup/WizardProgressBar";
 import { wizardClasses, wizardTheme } from "@/components/setup/WizardTheme";
+import { ThemeToggle } from "@/components/ThemeToggle";
 import { SETUP_SCREEN_LABELS, type SetupScreenId } from "@/components/setup/stepRouter";
 
 export type WizardShellProps = {
@@ -47,11 +48,14 @@ export function WizardShell({
               <p className={cn(wizardTheme.typography.meta, "truncate")}>{screenTitle}</p>
             </div>
           </div>
-          {onCancel ? (
-            <Button type="button" variant="ghost" size="sm" onClick={onCancel}>
-              Cancel
-            </Button>
-          ) : null}
+          <div className="flex shrink-0 items-center gap-1">
+            <ThemeToggle />
+            {onCancel ? (
+              <Button type="button" variant="ghost" size="sm" onClick={onCancel}>
+                Cancel
+              </Button>
+            ) : null}
+          </div>
         </div>
         <div className={wizardClasses.headerProgress}>
           <WizardProgressBar currentScreen={currentScreen} />

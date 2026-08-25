@@ -31,6 +31,7 @@ export function useAdminApiMonitor({
 
     try {
       const json = await authApi.health();
+      if (json.transientLoad) return;
       if (!json?.ok) throw new Error("Health check failed");
 
       if (hadLossRef.current) {

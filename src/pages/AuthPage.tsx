@@ -5,6 +5,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
+import { PasswordField } from "@/components/PasswordField";
+import { SupportContactLinks } from "@/components/SupportContactLinks";
+import { ThemeToggle } from "@/components/ThemeToggle";
 import { getRememberedIp } from "@/services/auth";
 import { getDefaultAdminAddress } from "@/services/embeddedApi";
 
@@ -28,7 +31,10 @@ export default function AuthPage({ onConnect, connecting }: AuthPageProps) {
   };
 
   return (
-    <div className="min-h-screen bg-muted/40 px-4 py-8 flex items-center justify-center">
+    <div className="relative flex min-h-screen items-center justify-center bg-muted/40 px-4 py-8">
+      <div className="absolute right-3 top-3">
+        <ThemeToggle />
+      </div>
       <Card className="w-full max-w-md">
         <CardHeader className="items-center text-center">
           <img src={logoSrc} alt="Renz-Fi logo" className="mb-2 h-32 w-auto object-contain" />
@@ -51,9 +57,8 @@ export default function AuthPage({ onConnect, connecting }: AuthPageProps) {
             </div>
             <div className="space-y-2">
               <Label htmlFor="password">Password</Label>
-              <Input
+              <PasswordField
                 id="password"
-                type="password"
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
                 placeholder="Enter your password"
@@ -78,6 +83,7 @@ export default function AuthPage({ onConnect, connecting }: AuthPageProps) {
             <Button type="submit" className="w-full" disabled={connecting}>
               {connecting ? "Connecting…" : "Connect"}
             </Button>
+            <SupportContactLinks className="mt-2" compact />
           </form>
         </CardContent>
       </Card>

@@ -1,7 +1,6 @@
 import { useRef, useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Trash2, Upload, X } from "lucide-react";
-import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -9,9 +8,9 @@ import { toast } from "sonner";
 import { portalApi } from "@/services/portal";
 import { resolvePortalAssetUrl } from "@/services/embeddedApi";
 
-const BANNER_MAX_BYTES = 2 * 1024 * 1024;
-const MUSIC_MAX_BYTES = 2 * 1024 * 1024;
-const BANNER_ALLOWED = ["image/png", "image/jpeg", "image/jpg"];
+const BANNER_MAX_BYTES = 4 * 1024 * 1024;
+const MUSIC_MAX_BYTES = 4 * 1024 * 1024;
+const BANNER_ALLOWED = ["image/png", "image/jpeg", "image/jpg", "video/mp4"];
 
 export default function CaptivePortalPage() {
   const qc = useQueryClient();
@@ -78,8 +77,7 @@ export default function CaptivePortalPage() {
         !hadBanner ||
         Boolean(latest.bannerConfigured ?? latest.has_banner ?? latest.hasCustomBanner);
       const musicOk =
-        !hadMusic ||
-        Boolean(latest.musicConfigured ?? latest.has_music ?? latest.hasCustomMusic);
+        !hadMusic || Boolean(latest.musicConfigured ?? latest.has_music ?? latest.hasCustomMusic);
       if (!bannerOk || !musicOk) {
         toast.error("Upload did not persist — check device storage");
         return;
@@ -133,14 +131,13 @@ export default function CaptivePortalPage() {
   const handleBanner = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const typeOk =
-      BANNER_ALLOWED.includes(file.type) || /\.(png|jpe?g)$/i.test(file.name);
+    const typeOk = BANNER_ALLOWED.includes(file.type) || /\.(png|jpe?g|mp4)$/i.test(file.name);
     if (!typeOk) {
-      toast.error("Only PNG or JPEG allowed");
+      toast.error("Only PNG, JPEG, or MP4 allowed");
       return;
     }
     if (file.size > BANNER_MAX_BYTES) {
-      toast.error("Banner exceeds 2 MB limit");
+      toast.error("Banner exceeds 4 MB limit");
       return;
     }
     if (bannerPreview?.startsWith("blob:")) URL.revokeObjectURL(bannerPreview);
@@ -159,116 +156,143 @@ export default function CaptivePortalPage() {
       return;
     }
     if (file.size > MUSIC_MAX_BYTES) {
-      toast.error("Music exceeds 2 MB limit");
+      toast.error("Music exceeds 4 MB limit");
       return;
     }
     setMusicFile(file);
   };
 
-  return (
-    <div>
-      <PageHeader
-        title="Captive Portal"
-        description="Configure banner and background music shown on the captive portal login page"
-      />
-      <div className="max-w-xl space-y-4 rounded-md border bg-card p-3">
-        <div className="space-y-1">
-          <Label className="text-xs">Portal Banner / Logo</Label>
-          <Input
-            ref={bannerRef}
-            type="file"
-            accept="image/png,image/jpeg,.png,.jpg,.jpeg"
-            onChange={handleBanner}
-            className="h-9 text-xs"
-          />
-          <p className="text-[11px] text-muted-foreground">
-            PNG or JPEG, maximum 2 MB. Falls back to Default-Banner.png when none is uploaded.
-          </p>
-          <p className="text-[11px]">
-            {bannerConfigured ? (
-              <span className="text-emerald-600">Custom banner active</span>
-            ) : (
-              <span className="text-muted-foreground">Using default banner (Default-Banner.png)</span>
-            )}
-          </p>
-          {bannerPreview && (
-            <div className="relative inline-block mt-2">
-              <img
-                src={bannerPreview}
-                alt="Portal banner preview"
-                className="rounded-md object-contain"
-                style={{ maxWidth: 220, maxHeight: 120 }}
-              />
-              <button
-                type="button"
-                onClick={clearBanner}
-                aria-label="Clear pending banner"
-                className="absolute -top-2 -right-2 h-6 w-6 rounded-full bg-destructive text-destructive-foreground flex items-center justify-center shadow"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-              {bannerBlob ? (
-                <p className="text-[11px] text-muted-foreground mt-1">
-                  Ready to upload: {(bannerSize / 1024).toFixed(1)} KiB
-                </p>
-              ) : null}
-            </div>
-          )}
-          {bannerConfigured && !bannerBlob ? (
-            <Button
-              size="sm"
-              variant="outline"
-              className="mt-2"
-              disabled={removeBannerMutation.isPending}
-              onClick={() => removeBannerMutation.mutate()}
-            >
-              <Trash2 className="h-3.5 w-3.5" /> Remove custom banner
-            </Button>
-          ) : null}
-        </div>
+  const fileInputClass =
+    "h-10 w-full max-w-full text-xs file:mr-3 file:h-8 file:rounded-md file:border-0 file:bg-primary file:px-3 file:text-xs file:font-medium file:text-primary-foreground";
 
-        <div className="space-y-1">
-          <Label className="text-xs">Background Music</Label>
-          <Input
-            ref={musicRef}
-            type="file"
-            accept="audio/mpeg,.mp3"
-            onChange={handleMusic}
-            className="h-9 text-xs"
-          />
-          <p className="text-[11px] text-muted-foreground">
-            MP3 only, maximum 2 MB. Falls back to bg_music.mp3 when none is uploaded.
-          </p>
-          <p className="text-[11px]">
-            {musicConfigured ? (
-              <span className="text-emerald-600">Custom music active</span>
-            ) : (
-              <span className="text-muted-foreground">Using default music (bg_music.mp3)</span>
-            )}
-          </p>
-          {musicConfigured && settings?.musicUrl && !musicFile ? (
-            <audio controls className="w-full mt-2" src={resolvePortalAssetUrl(settings.musicUrl)} />
-          ) : null}
-          {musicFile && (
+  return (
+    <div className="w-full max-w-none space-y-3">
+      <div>
+        <h2 className="text-2xl font-semibold leading-tight">Captive Portal</h2>
+        <p className="mt-0.5 text-[13px] text-muted-foreground">
+          Configure banner and background music for the captive portal.
+        </p>
+      </div>
+      <div className="w-full space-y-5 rounded-[14px] border bg-card p-4 sm:p-5">
+        <div className="grid grid-cols-1 items-start gap-6 lg:grid-cols-2">
+          <div className="min-w-0 space-y-1.5">
+            <Label className="text-xs">Portal Banner / Logo</Label>
+            <Input
+              ref={bannerRef}
+              type="file"
+              accept="image/png,image/jpeg,.png,.jpg,.jpeg,video/mp4,.mp4"
+              onChange={handleBanner}
+              className={fileInputClass}
+            />
             <p className="text-[11px] text-muted-foreground">
-              {musicFile.name} ({(musicFile.size / 1024).toFixed(1)} KiB)
+              PNG, JPEG, or MP4 (short video), maximum 4 MB. Falls back to Default-Banner.png when
+              none is uploaded.
             </p>
-          )}
-          {musicConfigured && !musicFile ? (
-            <Button
-              size="sm"
-              variant="outline"
-              className="mt-2"
-              disabled={removeMusicMutation.isPending}
-              onClick={() => removeMusicMutation.mutate()}
-            >
-              <Trash2 className="h-3.5 w-3.5" /> Remove custom music
-            </Button>
-          ) : null}
+            <p className="text-[11px]">
+              {bannerConfigured ? (
+                <span className="text-emerald-600">Custom banner active</span>
+              ) : (
+                <span className="text-muted-foreground">
+                  Using default banner (Default-Banner.png)
+                </span>
+              )}
+            </p>
+            {bannerPreview && (
+              <div className="relative mt-2 w-full">
+                {bannerBlob?.type === "video/mp4" ||
+                /\.mp4$/i.test(bannerName) ||
+                settings?.bannerIsVideo ? (
+                  <video
+                    src={bannerPreview}
+                    className="max-h-64 w-full rounded-md border bg-muted object-cover"
+                    controls
+                    muted
+                    playsInline
+                  />
+                ) : (
+                  <img
+                    src={bannerPreview}
+                    alt="Portal banner preview"
+                    className="max-h-64 w-full rounded-md border bg-muted object-cover"
+                  />
+                )}
+                <button
+                  type="button"
+                  onClick={clearBanner}
+                  aria-label="Clear pending banner"
+                  className="absolute -top-2 -right-2 flex h-6 w-6 items-center justify-center rounded-full bg-destructive text-destructive-foreground shadow"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+                {bannerBlob ? (
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    Ready to upload: {(bannerSize / 1024).toFixed(1)} KiB
+                  </p>
+                ) : null}
+              </div>
+            )}
+            {bannerConfigured && !bannerBlob ? (
+              <Button
+                size="sm"
+                variant="outline"
+                className="mt-2"
+                disabled={removeBannerMutation.isPending}
+                onClick={() => removeBannerMutation.mutate()}
+              >
+                <Trash2 className="h-3.5 w-3.5" /> Remove custom banner
+              </Button>
+            ) : null}
+          </div>
+
+          <div className="min-w-0 space-y-1.5">
+            <Label className="text-xs">Background Music</Label>
+            <Input
+              ref={musicRef}
+              type="file"
+              accept="audio/mpeg,.mp3"
+              onChange={handleMusic}
+              className={fileInputClass}
+            />
+            <p className="text-[11px] text-muted-foreground">
+              Background music during Insert Coin. MP3 only, maximum 4 MB. Falls back to
+              bg_music.mp3 when none is uploaded.
+            </p>
+            <p className="text-[11px]">
+              {musicConfigured ? (
+                <span className="text-emerald-600">Custom music active</span>
+              ) : (
+                <span className="text-muted-foreground">Using default music (bg_music.mp3)</span>
+              )}
+            </p>
+            {musicConfigured && settings?.musicUrl && !musicFile ? (
+              <audio
+                controls
+                className="mt-2 w-full"
+                src={resolvePortalAssetUrl(settings.musicUrl)}
+              />
+            ) : null}
+            {musicFile && (
+              <p className="break-all text-[11px] text-muted-foreground">
+                {musicFile.name} ({(musicFile.size / 1024).toFixed(1)} KiB)
+              </p>
+            )}
+            {musicConfigured && !musicFile ? (
+              <Button
+                size="sm"
+                variant="outline"
+                className="mt-2"
+                disabled={removeMusicMutation.isPending}
+                onClick={() => removeMusicMutation.mutate()}
+              >
+                <Trash2 className="h-3.5 w-3.5" /> Remove custom music
+              </Button>
+            ) : null}
+          </div>
         </div>
 
         <Button
           size="sm"
+          className="h-9 w-full px-4 sm:w-auto"
           disabled={saveMutation.isPending || (!bannerBlob && !musicFile)}
           onClick={() => saveMutation.mutate()}
         >

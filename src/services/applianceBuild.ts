@@ -27,8 +27,10 @@ export async function fetchApplianceBuildSnapshot(): Promise<ApplianceBuildSnaps
       : undefined;
 
   const runningFirmwareVersion =
-    (typeof data.version === "string" && data.version) ||
-    (typeof device?.firmwareVersion === "string" && device.firmwareVersion) ||
+    (typeof data.version === "string" && data.version.trim()) ||
+    (typeof device?.firmwareVersion === "string" &&
+      device.firmwareVersion.trim()) ||
+    (typeof data.firmwareVersion === "string" && data.firmwareVersion.trim()) ||
     null;
 
   return {

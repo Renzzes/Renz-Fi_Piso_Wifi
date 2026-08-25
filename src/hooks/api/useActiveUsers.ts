@@ -27,6 +27,22 @@ export function useDisconnectUser() {
   });
 }
 
+export function useReconnectUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (mac: string) => usersApi.reconnect(mac),
+    onSuccess: () => invalidateUserQueries(qc),
+  });
+}
+
+export function useTerminateUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (mac: string) => usersApi.terminate(mac),
+    onSuccess: () => invalidateUserQueries(qc),
+  });
+}
+
 export function usePauseUser() {
   const qc = useQueryClient();
   return useMutation({

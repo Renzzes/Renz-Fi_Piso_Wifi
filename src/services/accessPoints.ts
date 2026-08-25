@@ -76,17 +76,16 @@ export type AccessPointJob = {
   accessPointId?: string;
   state?: string;
   ok?: boolean;
+  online?: boolean;
+  method?: string;
+  ipAddress?: string;
+  managementIp?: string;
   status?: AccessPointStatus;
   latencyMs?: number | null;
   startedAt?: number;
   completedAt?: number;
   errorCode?: string;
   message?: string;
-};
-
-export type AccessPointDetectQueued = {
-  jobId: number;
-  state?: string;
 };
 
 export type AccessPointDetectDevice = {
@@ -98,23 +97,32 @@ export type AccessPointDetectDevice = {
   status?: string;
 };
 
-export type AccessPointDetectResult = {
-  devices: AccessPointDetectDevice[];
-  source?: string;
-  oneTime?: boolean;
-  arpRows?: number;
-  returned?: number;
-  filteredOut?: number;
-  bridgeHostWarning?: string;
-  leaseWarning?: string;
+export type AccessPointDetectPayload = {
+  success?: boolean;
+  message?: string;
+  data?: {
+    devices?: AccessPointDetectDevice[];
+    source?: string;
+    oneTime?: boolean;
+    arpRows?: number;
+    returned?: number;
+    filteredOut?: number;
+    bridgeHostWarning?: string;
+    leaseWarning?: string;
+  };
+};
+
+export type AccessPointDetectQueued = {
+  jobId: number;
+  state?: string;
 };
 
 export type AccessPointDetectJob = {
   jobId: number;
   state?: string;
   ok?: boolean;
+  result?: AccessPointDetectPayload | string;
   httpStatus?: number;
-  result?: string | unknown;
 };
 
 const POLL_MS = 450;
@@ -122,22 +130,7 @@ const POLL_DEADLINE_MS = 30_000;
 const NETWORK_RETRY_LIMIT = 4;
 
 const activePollers = new Map<number, Promise<AccessPointJob>>();
-const activeDetectPollers = new Map<number, Promise<AccessPointDetectResult>>();
-
-export class DetectJobError extends Error {
-  constructor(
-    message: string,
-    public code:
-      | "DETECT_FAILED"
-      | "DETECT_TIMEOUT"
-      | "DETECT_EMPTY"
-      | "DETECT_BAD_RESULT",
-    public details?: { jobId?: number; state?: string; candidateCount?: number },
-  ) {
-    super(message);
-    this.name = "DetectJobError";
-  }
-}
+const activeDetectPollers = new Map<number, Promise<AccessPointDetectJob>>();
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -155,49 +148,70 @@ function isRunningState(state: string): boolean {
   return state === "queued" || state === "running";
 }
 
-function toDetectResultObject(raw: unknown): Record<string, unknown> {
-  if (typeof raw === "string") {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!parsed || typeof parsed !== "object") {
-      throw new DetectJobError("Detection result payload is invalid.", "DETECT_BAD_RESULT");
-    }
-    return parsed as Record<string, unknown>;
-  }
-  if (raw && typeof raw === "object") {
-    return raw as Record<string, unknown>;
-  }
-  throw new DetectJobError("Detection result payload is missing.", "DETECT_BAD_RESULT");
+export function accessPointJobSucceeded(job: AccessPointJob): boolean {
+  if (job.state === "failed") return false;
+  if (job.ok === false) return false;
+  if (job.online === true) return true;
+  if (job.online === false) return false;
+  const status = (job.status ?? "").trim().toLowerCase();
+  return (
+    status === "online" ||
+    status === "network_reachable" ||
+    status === "management_reachable"
+  );
 }
 
-function parseDetectResult(job: AccessPointDetectJob): AccessPointDetectResult {
-  const root = toDetectResultObject(job.result);
-  const success = root.success;
-  if (success === false) {
-    throw new DetectJobError(
-      typeof root.error === "string" ? root.error : "Detection failed.",
-      "DETECT_FAILED",
-      { jobId: job.jobId, state: job.state },
-    );
+function parseIpv4Octets(ip: string): number[] | null {
+  const parts = ip.trim().split(".");
+  if (parts.length !== 4) return null;
+  const octets: number[] = [];
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null;
+    const n = Number(part);
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+    octets.push(n);
   }
-  const data =
-    root.data && typeof root.data === "object"
-      ? (root.data as Record<string, unknown>)
-      : root;
-  const devicesRaw = data.devices;
-  const devices = Array.isArray(devicesRaw)
-    ? (devicesRaw as AccessPointDetectDevice[])
-    : [];
-  return {
-    devices,
-    source: typeof data.source === "string" ? data.source : undefined,
-    oneTime: typeof data.oneTime === "boolean" ? data.oneTime : undefined,
-    arpRows: typeof data.arpRows === "number" ? data.arpRows : undefined,
-    returned: typeof data.returned === "number" ? data.returned : devices.length,
-    filteredOut: typeof data.filteredOut === "number" ? data.filteredOut : undefined,
-    bridgeHostWarning:
-      typeof data.bridgeHostWarning === "string" ? data.bridgeHostWarning : undefined,
-    leaseWarning: typeof data.leaseWarning === "string" ? data.leaseWarning : undefined,
-  };
+  return octets;
+}
+
+/** Keep Detect candidates that look like private LAN hosts (not gateways/DNS). */
+export function isDetectCandidateIp(ip: string): boolean {
+  const o = parseIpv4Octets(ip);
+  if (!o) return false;
+  const [a, b, c, d] = o;
+  if (d === 0 || d === 255) return false;
+  // ESP32 SoftAP / appliance management exclusions
+  if (a === 192 && b === 168 && c === 4) return false;
+  if (ip === "10.10.10.1" || ip === "10.10.10.2" || ip === "10.20.0.1") return false;
+  const privateRfc1918 =
+    a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168);
+  return privateRfc1918;
+}
+
+export function parseDetectDevices(
+  job: AccessPointDetectJob,
+): AccessPointDetectDevice[] {
+  let payload = job.result;
+  if (typeof payload === "string") {
+    try {
+      payload = JSON.parse(payload) as AccessPointDetectPayload;
+    } catch {
+      return [];
+    }
+  }
+  if (!payload || typeof payload !== "object") return [];
+  const devices = payload.data?.devices;
+  if (!Array.isArray(devices)) return [];
+  return devices.filter(
+    (row): row is AccessPointDetectDevice =>
+      typeof row?.ip === "string" &&
+      typeof row?.mac === "string" &&
+      row.ip.length > 0 &&
+      row.mac.length > 0 &&
+      isDetectCandidateIp(row.ip),
+  );
 }
 
 async function pollAccessPointJobOnce(jobId: number): Promise<AccessPointJob> {
@@ -220,7 +234,7 @@ async function pollAccessPointJobOnce(jobId: number): Promise<AccessPointJob> {
         continue;
       }
       if (isApiError(err) && err.status === 404) {
-        throw new Error("Access point check job was not found.");
+        throw new Error("Access point job was not found.");
       }
       throw err;
     }
@@ -239,8 +253,26 @@ async function pollAccessPointJobOnce(jobId: number): Promise<AccessPointJob> {
 
   throw new Error(
     last?.message ||
-      "Access point check timed out waiting for job status. The check was not treated as success.",
+      "Access point job timed out waiting for status. The operation was not treated as success.",
   );
+}
+
+async function queueAndWait(
+  queue: () => Promise<AccessPointCheckQueued>,
+  busyMessage: string,
+): Promise<AccessPointJob> {
+  const queued = await queue();
+  const jobId = queued.jobId;
+  if (!jobId) {
+    throw new ApiError(busyMessage, 500, "JOB_FAILED");
+  }
+  const existing = activePollers.get(jobId);
+  if (existing) return existing;
+  const poller = pollAccessPointJobOnce(jobId).finally(() => {
+    activePollers.delete(jobId);
+  });
+  activePollers.set(jobId, poller);
+  return poller;
 }
 
 export const accessPointsApi = {
@@ -263,38 +295,41 @@ export const accessPointsApi = {
       `${embeddedApi.accessPoints}/${encodeURIComponent(id)}/check`,
       {},
     ),
+  syncAccessPoint: (id: string) =>
+    api.post<AccessPointCheckQueued>(
+      `${embeddedApi.accessPoints}/${encodeURIComponent(id)}/sync`,
+      {},
+    ),
   getAccessPointJob: (jobId: number) =>
     api.get<AccessPointJob>(`${embeddedApi.accessPoints}/jobs/${jobId}`),
-  detectAccessPoints: () =>
+  checkAndWait: (id: string) =>
+    queueAndWait(
+      () => accessPointsApi.checkAccessPoint(id),
+      "Check did not return a job id",
+    ),
+  syncAndWait: (id: string) =>
+    queueAndWait(
+      () => accessPointsApi.syncAccessPoint(id),
+      "Sync did not return a job id",
+    ),
+  queueDetect: () =>
     api.post<AccessPointDetectQueued>(`${embeddedApi.accessPoints}/detect`, {}),
   getDetectJob: (jobId: number) =>
-    api.get<AccessPointDetectJob>(`${embeddedApi.accessPoints}/detect/jobs/${jobId}`),
-  checkAndWait: async (id: string): Promise<AccessPointJob> => {
-    const queued = await accessPointsApi.checkAccessPoint(id);
+    api.get<AccessPointDetectJob>(
+      `${embeddedApi.accessPoints}/detect/jobs/${jobId}`,
+    ),
+  detectAndWait: async (): Promise<AccessPointDetectJob> => {
+    const queued = await accessPointsApi.queueDetect();
     const jobId = queued.jobId;
     if (!jobId) {
-      throw new ApiError("Check did not return a job id", 500, "CHECK_FAILED");
-    }
-    const existing = activePollers.get(jobId);
-    if (existing) return existing;
-    const poller = pollAccessPointJobOnce(jobId).finally(() => {
-      activePollers.delete(jobId);
-    });
-    activePollers.set(jobId, poller);
-    return poller;
-  },
-  detectAndWait: async (): Promise<AccessPointDetectResult> => {
-    const queued = await accessPointsApi.detectAccessPoints();
-    const jobId = queued.jobId;
-    if (!jobId) {
-      throw new ApiError("Detect did not return a job id", 500, "DETECT_FAILED");
+      throw new ApiError("Detect did not return a job id", 500, "JOB_FAILED");
     }
     const existing = activeDetectPollers.get(jobId);
     if (existing) return existing;
     const poller = (async () => {
       const startedAt = Date.now();
       let networkFailures = 0;
-      let lastState = "queued";
+      let last: AccessPointDetectJob | null = null;
       while (Date.now() - startedAt < POLL_DEADLINE_MS) {
         let job: AccessPointDetectJob;
         try {
@@ -307,47 +342,22 @@ export const accessPointsApi = {
             continue;
           }
           if (isApiError(err) && err.status === 404) {
-            throw new DetectJobError("Detect job not found.", "DETECT_FAILED", { jobId });
+            throw new Error("Access point detect job was not found.");
           }
           throw err;
         }
-        const state = (job.state ?? "").trim().toLowerCase();
-        lastState = state || lastState;
-        if (state === "queued" || state === "running") {
+        last = job;
+        const state = normalizeJobState(job);
+        if (isRunningState(state)) {
           await sleep(POLL_MS);
           continue;
         }
-        if (state !== "completed") {
-          throw new DetectJobError("Detection failed.", "DETECT_FAILED", {
-            jobId,
-            state,
-          });
-        }
-        if (!job.result) {
-          throw new DetectJobError(
-            "Detection completed with no result payload.",
-            "DETECT_BAD_RESULT",
-            { jobId, state },
-          );
-        }
-        const parsed = parseDetectResult(job);
-        const candidateCount = parsed.devices.length;
-        console.info(
-          `[access-point-detect-ui] jobId=${jobId} state=completed candidateCount=${candidateCount} rawResultShape=${typeof job.result}`,
-        );
-        if (candidateCount === 0) {
-          throw new DetectJobError(
-            "No unregistered access point was detected.",
-            "DETECT_EMPTY",
-            { jobId, state, candidateCount },
-          );
-        }
-        return parsed;
+        if (isTerminalState(state)) return job;
+        await sleep(POLL_MS);
       }
-      throw new DetectJobError("Detection timed out.", "DETECT_TIMEOUT", {
-        jobId,
-        state: lastState,
-      });
+      throw new Error(
+        "Access point detect timed out waiting for MikroTik ARP results.",
+      );
     })().finally(() => {
       activeDetectPollers.delete(jobId);
     });

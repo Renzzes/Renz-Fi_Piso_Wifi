@@ -34,6 +34,9 @@ export default defineConfig({
   define: {
     __APP_BUILD_ID__: JSON.stringify(appBuildId),
   },
+  optimizeDeps: {
+    include: ["exceljs"],
+  },
   plugins: [
     react(),
     tailwindcss(),

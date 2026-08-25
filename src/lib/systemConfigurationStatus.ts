@@ -91,7 +91,10 @@ export function internetReachabilityDisplay(
   }
 
   if (!isInternetStatusKnown(internet)) {
-    return { label: "Not Configured", tone: "not_configured" };
+    return {
+      label: "Not probed yet",
+      tone: "not_configured",
+    };
   }
 
   const status = internetStatusDisplay(internet, loading);

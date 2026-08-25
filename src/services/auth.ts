@@ -6,6 +6,18 @@ const REMEMBER_IP_KEY = "renz_admin_ip";
 
 export type AuthRole = "owner" | "operator" | "none";
 
+export type HealthCheckResult = {
+  ok: boolean;
+  transientLoad?: boolean;
+  session?: {
+    authenticated?: boolean;
+    mustChangePassword?: boolean;
+    firstBootCompleted?: boolean;
+    role?: AuthRole;
+    permissions?: OperatorPermission[];
+  };
+};
+
 export const authApi = {
   login: (password: string) =>
     api.post<{
@@ -27,32 +39,33 @@ export const authApi = {
       payload,
     ),
 
-  health: () =>
-    fetch(apiUrl(embeddedApi.health), { credentials: "include" }).then(async (res) => {
-      if (!res.ok) throw new Error(`Health check failed: ${res.status}`);
-      const json = (await res.json()) as {
-        success?: boolean;
-        data?: {
-          ok: boolean;
-          session?: {
-            authenticated?: boolean;
-            mustChangePassword?: boolean;
-            firstBootCompleted?: boolean;
-            role?: AuthRole;
-            permissions?: OperatorPermission[];
-          };
-        };
-        ok?: boolean;
-        session?: {
-          authenticated?: boolean;
-          mustChangePassword?: boolean;
-          firstBootCompleted?: boolean;
-          role?: AuthRole;
-          permissions?: OperatorPermission[];
-        };
+  health: async (): Promise<HealthCheckResult> => {
+    const res = await fetch(apiUrl(embeddedApi.health), { credentials: "include" });
+    if (res.status === 503) {
+      let code: string | undefined;
+      try {
+        const json = (await res.json()) as { code?: string };
+        code = json.code;
+      } catch {
+        // ignore parse errors
+      }
+      if (code === "ETH_DMA_LOW") {
+        return { ok: true, transientLoad: true };
+      }
+    }
+    if (!res.ok) throw new Error(`Health check failed: ${res.status}`);
+    const json = (await res.json()) as {
+      success?: boolean;
+      data?: {
+        ok: boolean;
+        session?: HealthCheckResult["session"];
       };
-      return json.data ?? { ok: Boolean(json.ok), session: json.session };
-    }),
+      ok?: boolean;
+      session?: HealthCheckResult["session"];
+    };
+    const payload = json.data ?? { ok: Boolean(json.ok), session: json.session };
+    return { ok: Boolean(payload.ok), session: payload.session };
+  },
 };
 
 export function getRememberedIp(): string | null {
