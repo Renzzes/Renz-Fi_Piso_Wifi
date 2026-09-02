@@ -1,0 +1,15 @@
+config renzfi 'core'
+	option enabled '1'
+	option edition 'openwrt'
+	option data_dir '/opt/renzfi/data'
+
+config coin 'coin'
+	option enabled '0'
+	option gpio_pin '18'
+	option pulses_per_coin '1'
+	option active_low '1'
+	option amount_per_coin '5'
+	option minutes_per_coin '15'
+
+config hotspot 'hotspot'
+	option engine 'auto'

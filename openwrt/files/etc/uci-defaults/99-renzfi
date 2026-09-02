@@ -1,0 +1,47 @@
+#!/bin/sh
+# Attach Renz-Fi Lua Core to uhttpd. Runs once on package install.
+
+. /lib/functions.sh
+
+# Lua API on the existing uhttpd instance.
+existing=$(uci -q get uhttpd.main.lua_prefix)
+case "$existing" in
+	*/api=/opt/renzfi/lua/main.lua*) ;;
+	*)
+		uci add_list uhttpd.main.lua_prefix='/api=/opt/renzfi/lua/main.lua'
+		;;
+esac
+
+# Serve Admin + guest portal as the HTTP document root when still /www.
+home=$(uci -q get uhttpd.main.home)
+if [ -z "$home" ] || [ "$home" = "/www" ]; then
+	uci set uhttpd.main.home='/www/renzfi'
+fi
+
+uci set uhttpd.main.index_page='index.html'
+uci set uhttpd.main.error_page='/index.html'
+uci set uhttpd.main.rfc1918_filter='0'
+uci set uhttpd.main.max_requests='50'
+
+# If LuCI is present, keep it reachable on 8080 so port 80 is the Piso portal.
+if [ -d /www/luci-static ] || [ -e /usr/lib/lua/luci ]; then
+	has8080=0
+	for listen in $(uci -q get uhttpd.main.listen_http); do
+		case "$listen" in
+			*:8080) has8080=1 ;;
+		esac
+	done
+	if [ "$has8080" = 0 ]; then
+		uci add_list uhttpd.main.listen_http='0.0.0.0:8080'
+		uci add_list uhttpd.main.listen_http='[::]:8080'
+	fi
+fi
+
+uci commit uhttpd
+
+mkdir -p /tmp/renzfi /tmp/renzfi/sse /opt/renzfi/data /etc/renzfi
+
+[ -x /etc/init.d/uhttpd ] && /etc/init.d/uhttpd reload >/dev/null 2>&1 || true
+[ -x /etc/init.d/renzfi ] && /etc/init.d/renzfi enable >/dev/null 2>&1 || true
+
+exit 0

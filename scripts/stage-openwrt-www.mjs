@@ -1,0 +1,170 @@
+/**
+ * Stage React admin + captive portal into openwrt/files/www/renzfi/
+ *
+ * Pipeline:
+ *   dist-openwrt/  +  portal/  →  openwrt/files/www/renzfi/
+ *
+ * OpenWrt overlay is not SPIFFS — no 32-byte object-name gate.
+ * Do NOT edit www/renzfi assets manually — always run npm run build:openwrt
+ */
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { ensurePortalSources } from "./ensure-portal-sources.mjs";
+import { generateBuildMetadata } from "./generate-build-metadata.mjs";
+import {
+  ADMIN_ROOT_FILES,
+  PORTAL_RECOMMENDED,
+  PORTAL_REQUIRED,
+  PORTAL_SOURCE_DIR,
+} from "./esp32-staging-manifest.mjs";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const dist = join(root, "dist-openwrt");
+const target = join(root, "openwrt", "files", "www", "renzfi");
+const distAssets = join(dist, "assets");
+const targetAssets = join(target, "assets");
+const portalSource = join(root, PORTAL_SOURCE_DIR);
+const targetPortal = join(target, "portal");
+
+const KEEP = new Set([".gitkeep", "README.md"]);
+
+const log = (msg) => console.log(`[stage:openwrt] ${msg}`);
+const fail = (msg) => {
+  console.error(`[stage:openwrt] ERROR: ${msg}`);
+  process.exit(1);
+};
+
+function wipeGenerated(dir) {
+  if (!existsSync(dir)) return;
+  for (const name of readdirSync(dir)) {
+    if (KEEP.has(name)) continue;
+    rmSync(join(dir, name), { recursive: true, force: true });
+  }
+}
+
+function printPortalValidation() {
+  log("Checking portal assets...");
+  let ok = true;
+  for (const { source, label } of PORTAL_REQUIRED) {
+    const present = existsSync(join(targetPortal, source));
+    console.log(`  ${present ? "✓" : "✗"} ${label}`);
+    if (!present) ok = false;
+  }
+  for (const { source, label } of PORTAL_RECOMMENDED) {
+    const present = existsSync(join(targetPortal, source));
+    if (present) console.log(`  ✓ ${label} (optional)`);
+  }
+  if (!ok) {
+    fail("Portal staging incomplete — fix portal/ sources and re-run npm run build:openwrt");
+  }
+  log("Portal assets verified");
+}
+
+function printAdminValidation() {
+  log("Checking admin dashboard assets...");
+  if (!existsSync(join(target, "index.html"))) fail("Missing www/renzfi/index.html");
+  if (!existsSync(targetAssets)) fail("Missing www/renzfi/assets/");
+  const assetFiles = readdirSync(targetAssets).filter((n) =>
+    statSync(join(targetAssets, n)).isFile(),
+  );
+  const hasJs = assetFiles.some((n) => n.endsWith(".js"));
+  const hasCss = assetFiles.some((n) => n.endsWith(".css"));
+  if (!hasJs || !hasCss) {
+    fail(
+      `www/renzfi/assets/ must contain .js and .css bundles (found: ${assetFiles.join(", ")})`,
+    );
+  }
+  console.log(`  ✓ index.html`);
+  console.log(`  ✓ ${assetFiles.filter((n) => n.endsWith(".js")).length} JS bundle(s)`);
+  console.log(`  ✓ ${assetFiles.filter((n) => n.endsWith(".css")).length} CSS bundle(s)`);
+  log("Admin dashboard verified");
+}
+
+log("Ensuring portal sources...");
+await ensurePortalSources();
+
+if (!existsSync(dist)) {
+  fail("dist-openwrt/ not found. Run vite build --config vite.config.openwrt.ts first.");
+}
+if (!existsSync(join(dist, "index.html"))) fail("dist-openwrt/index.html not found");
+if (!existsSync(distAssets)) fail("dist-openwrt/assets/ not found");
+
+log(`Cleaning generated files under ${target} ...`);
+mkdirSync(target, { recursive: true });
+wipeGenerated(target);
+
+log("Staging admin dashboard...");
+for (const name of ADMIN_ROOT_FILES) {
+  const src = join(dist, name);
+  if (existsSync(src)) cpSync(src, join(target, name));
+}
+
+const distIcons = join(dist, "icons");
+const targetIcons = join(target, "icons");
+if (existsSync(distIcons)) {
+  mkdirSync(targetIcons, { recursive: true });
+  cpSync(distIcons, targetIcons, { recursive: true });
+} else {
+  console.warn("[stage:openwrt] WARN: dist-openwrt/icons/ missing — run npm run pwa:icons");
+}
+
+const adminBuildSrc = join(dist, "admin-build.json");
+if (existsSync(adminBuildSrc)) {
+  cpSync(adminBuildSrc, join(target, "admin-build.json"));
+}
+
+mkdirSync(targetAssets, { recursive: true });
+cpSync(distAssets, targetAssets, { recursive: true });
+
+log("Staging captive portal...");
+mkdirSync(targetPortal, { recursive: true });
+for (const { source } of [...PORTAL_REQUIRED, ...PORTAL_RECOMMENDED]) {
+  const src = join(portalSource, source);
+  if (existsSync(src)) {
+    cpSync(src, join(targetPortal, source));
+  }
+}
+
+const buildInfo = {
+  ...generateBuildMetadata({
+    root,
+    distDir: dist,
+    portalDir: portalSource,
+  }),
+  edition: "openwrt",
+};
+writeFileSync(join(target, "build-info.json"), JSON.stringify(buildInfo, null, 2));
+log(
+  `Build metadata: firmware=${buildInfo.firmwareVersion} portal=${buildInfo.portalRevision} git=${buildInfo.gitCommit}`,
+);
+
+writeFileSync(
+  join(target, "DO_NOT_EDIT.txt"),
+  [
+    "This directory is GENERATED by npm run build:openwrt",
+    "",
+    "Do not edit manually.",
+    "",
+    "Sources:",
+    "  Admin  → Vite dist-openwrt/ (vite.config.openwrt.ts)",
+    "  Portal → portal/",
+    "",
+    "Regenerate: npm run build:openwrt",
+    "",
+  ].join("\n"),
+);
+
+printPortalValidation();
+printAdminValidation();
+
+log("Ready for OpenWrt package");
+log("  openwrt/Makefile installs /www/renzfi and /opt/renzfi/lua");

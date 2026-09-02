@@ -10,6 +10,7 @@
     "pwa:icons": "node scripts/generate-pwa-icons.mjs",
     "build": "npm run pwa:icons && cross-env EMBEDDED_BUILD=1 vite build",
     "build:web": "npm run pwa:icons && vite build",
+    "build:openwrt": "npm run pwa:icons && vite build --config vite.config.openwrt.ts && node scripts/stage-openwrt-www.mjs",
     "typecheck": "tsc --noEmit",
     "build:esp32": "npm run build && node scripts/stage-esp32-data.mjs",
     "stage:esp32": "node scripts/stage-esp32-data.mjs",
