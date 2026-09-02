@@ -28,13 +28,23 @@ void clearLwIpDnsServers() {
 void restoreLwIpDnsFromEth(EthernetManager *eth) {
   if (!eth || !eth->hasIp()) return;
 
+  String dnsStr = eth->dns();
+  // DHCP sometimes reports 0.0.0.0; MikroTik gateway is the usual DNS.
+  if (dnsStr.isEmpty() || dnsStr == "0.0.0.0") {
+    dnsStr = eth->gateway();
+  }
+  if (dnsStr.isEmpty() || dnsStr == "0.0.0.0") {
+    dnsStr = "8.8.8.8";
+  }
+
   IPAddress dnsIp;
-  if (!dnsIp.fromString(eth->dns())) return;
+  if (!dnsIp.fromString(dnsStr)) return;
 
   ip_addr_t dns;
   IP4_ADDR(ip_2_ip4(&dns), dnsIp[0], dnsIp[1], dnsIp[2], dnsIp[3]);
   dns.type = IPADDR_TYPE_V4;
   dns_setserver(0, &dns);
+  Serial.printf("[setup-dns] production DNS server=%s\n", dnsStr.c_str());
 }
 
 }  // namespace

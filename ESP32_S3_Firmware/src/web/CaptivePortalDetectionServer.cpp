@@ -1,6 +1,8 @@
 #include "CaptivePortalDetectionServer.h"
 
+#include "DmaMemoryMonitor.h"
 #include "ManagementApConfig.h"
+#include "RouterProvisioningWorker.h"
 #include "WebRequestDiagnostics.h"
 #include "WebResponse.h"
 #include "WebServerManager.h"
@@ -19,9 +21,14 @@ const char *const kDetectionPaths[] = {
     "/connecttest.txt",           // Windows NCSI
     "/ncsi.txt",                  // Windows NCSI
     "/fwlink",                    // Windows (legacy captive portal probe)
+    "/redirect",                  // Windows captive "open browser" path
 };
 
 }  // namespace
+
+void CaptivePortalDetectionServer::begin(RouterProvisioningWorker *routerWorker) {
+  _routerWorker = routerWorker;
+}
 
 bool CaptivePortalDetectionServer::isManagementApRequest(
     AsyncWebServerRequest *req) const {
@@ -40,7 +47,17 @@ void CaptivePortalDetectionServer::handleProbe(AsyncWebServerRequest *req) {
     return;
   }
 
-  WebResponse::serveRedirect(req, ManagementApConfig::SETUP_URL);
+  // Cheap no-body reply while RouterOS setup work or DMA is tight. Avoids
+  // SoftAP HTML redirect storms that compete with W5500 SPI DMA (Guru).
+  // Installer already on /admin/setup is unaffected; first join still gets
+  // 302 when the worker is idle and DMA has headroom.
+  if ((_routerWorker && _routerWorker->isBusy()) ||
+      !DmaMemoryMonitor::hasEthTransmitHeadroom()) {
+    req->send(204);
+    return;
+  }
+
+  WebResponse::serveRedirect(req, ManagementApConfig::SETUP_PATH);
 }
 
 void CaptivePortalDetectionServer::registerRoutes(WebServerManager &web) {
@@ -54,7 +71,7 @@ void CaptivePortalDetectionServer::registerRoutes(WebServerManager &web) {
 
   Serial.println("[web] CaptivePortalDetectionServer routes registered (Management AP only):");
   Serial.println("[web]   GET /generate_204, /gen_204, /hotspot-detect.html, /library/test/success.html,");
-  Serial.println("[web]   GET /connecttest.txt, /ncsi.txt, /fwlink -> 302 http://192.168.4.1 (AP requests only)");
+  Serial.println("[web]   GET /connecttest.txt, /ncsi.txt, /fwlink, /redirect -> 302 /admin/setup (or 204 when busy/DMA-low)");
 }
 
 const char *CaptivePortalDetectionServer::providerName() const {

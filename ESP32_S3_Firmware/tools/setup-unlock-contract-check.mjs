@@ -144,6 +144,25 @@ check("6 GET /api/setup/status and unlock stay ungated", () => {
   );
 });
 
+check("8 unlock verifies password whenever Setup is locked", () => {
+  const start = SETUP.indexOf('"/api/setup/unlock", HTTP_POST');
+  if (start < 0) throw new Error("POST /api/setup/unlock missing");
+  const next = SETUP.indexOf('"/api/setup/lock", HTTP_POST', start);
+  const handler = SETUP.slice(start, next > start ? next : start + 3500);
+  mustNotContain(
+    "no !isReady short-circuit success",
+    handler,
+    String.raw`!_installation->isReady\(\)[\s\S]{0,200}?Setup already available`,
+  );
+  mustContain(
+    "skip only when unlock not required or session active",
+    handler,
+    String.raw`!_provisioning->requiresSetupUnlock\(\)[\s\S]{0,120}?hasActiveSetupUnlockSession`,
+  );
+  mustContain("always unlockSetup when locked", handler, String.raw`unlockSetup\(password\)`);
+  mustContain("invalid still 403", handler, "SETUP_UNLOCK_INVALID");
+});
+
 const failed = checks.filter((c) => !c).length;
 console.log(
   failed === 0

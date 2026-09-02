@@ -1,20 +1,19 @@
 import { systemApi } from "./system";
-import { routerApi } from "./router";
 import type { SystemStatus } from "@/types/api";
 
 /**
- * Admin synchronization = sync the Admin UI with authoritative Renz-Fi Core state.
+ * Admin synchronization = thin Core state for Connect (no RouterOS, no sales chart).
  *
  * Does NOT:
  * - send MikroTik passwords to the browser
  * - open RouterOS on every connect
+ * - enqueue POST /api/router/cache/sync (owner uses Synchronize Router)
  * - create a second credential store
  *
- * MAY (only when Core reports router cache stale + credentials present):
- * - enqueue existing POST /api/router/cache/sync (202 → worker → cache)
- * - still load the Dashboard if that worker refresh fails (degraded RouterOS)
+ * Connect loads GET /api/status only so the Dashboard can paint from Core RAM/SPIFFS
+ * without a DMA-heavy fan-out. Live SSE / secondary panels are opt-in on the Dashboard.
  */
-export type AdminSyncPhase = "device" | "router" | "dashboard" | "ready";
+export type AdminSyncPhase = "device" | "dashboard" | "ready";
 
 export type AdminSyncResult = {
   ok: true;
@@ -22,14 +21,13 @@ export type AdminSyncResult = {
   routerConnectivity: string;
   cachePopulated: boolean;
   cacheStale: boolean;
-  workerRefreshRequested: boolean;
-  workerRefreshOk: boolean | null;
+  workerRefreshRequested: false;
+  workerRefreshOk: null;
   status: SystemStatus;
 };
 
 export const ADMIN_SYNC_PHASES: { id: AdminSyncPhase; label: string }[] = [
   { id: "device", label: "Synchronizing Renz-Fi state…" },
-  { id: "router", label: "Checking router state…" },
   { id: "dashboard", label: "Loading dashboard…" },
   { id: "ready", label: "Connected." },
 ];
@@ -38,43 +36,13 @@ export async function synchronizeAdminClient(
   onPhase?: (phase: AdminSyncPhase) => void,
 ): Promise<AdminSyncResult> {
   onPhase?.("device");
-  let status = await systemApi.status();
+  const status = await systemApi.status();
 
   const host = status.mikrotik?.host?.trim() ?? "";
   const routerCredentialsPresent = Boolean(status.mikrotik?.configured || host);
-  let routerConnectivity = (status.mikrotik?.connectivity ?? "unknown").toLowerCase();
-  let cachePopulated = Boolean(status.routerCache?.populated);
-  let cacheStale = Boolean(status.routerCache?.stale);
-
-  const storage = status.storageStatus;
-  const storageBlockingRouter =
-    Boolean(storage?.recoveryInProgress) ||
-    Boolean(storage?.recoveryMode) ||
-    storage?.mounted === false;
-
-  onPhase?.("router");
-
-  let workerRefreshRequested = false;
-  let workerRefreshOk: boolean | null = null;
-
-  // Fresh cache / unconfigured router → never open RouterOS on connect.
-  // Stale + credentials present → existing worker job only (never async_tcp RouterOS).
-  // Storage remount/degraded → backend already returns 503 without queuing;
-  // skip the enqueue so Admin does not hammer deferred jobs.
-  if (cacheStale && routerCredentialsPresent && !storageBlockingRouter) {
-    workerRefreshRequested = true;
-    try {
-      await routerApi.syncRouter();
-      workerRefreshOk = true;
-      status = await systemApi.status();
-      routerConnectivity = (status.mikrotik?.connectivity ?? "unknown").toLowerCase();
-      cachePopulated = Boolean(status.routerCache?.populated);
-      cacheStale = Boolean(status.routerCache?.stale);
-    } catch {
-      // Core healthy; RouterOS may be offline. Dashboard still loads.
-      workerRefreshOk = false;
-    }
-  }
+  const routerConnectivity = (status.mikrotik?.connectivity ?? "unknown").toLowerCase();
+  const cachePopulated = Boolean(status.routerCache?.populated);
+  const cacheStale = Boolean(status.routerCache?.stale);
 
   onPhase?.("dashboard");
   onPhase?.("ready");
@@ -85,8 +53,8 @@ export async function synchronizeAdminClient(
     routerConnectivity,
     cachePopulated,
     cacheStale,
-    workerRefreshRequested,
-    workerRefreshOk,
+    workerRefreshRequested: false,
+    workerRefreshOk: null,
     status,
   };
 }

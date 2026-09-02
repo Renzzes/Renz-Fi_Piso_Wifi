@@ -64,7 +64,7 @@ const char *NdjsonLedger::spoolFor(Kind kind) {
     case Kind::Sales: return StoragePaths::Spiffs::SalesHistorySpool;
     case Kind::Sessions: return StoragePaths::Spiffs::SessionsHistorySpool;
     case Kind::Vouchers: return StoragePaths::Spiffs::VouchersHistorySpool;
-    case Kind::Logs: return nullptr;
+    case Kind::Logs: return StoragePaths::Spiffs::LogsHistorySpool;
   }
   return nullptr;
 }

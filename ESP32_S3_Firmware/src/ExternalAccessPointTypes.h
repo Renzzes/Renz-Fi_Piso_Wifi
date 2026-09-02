@@ -143,6 +143,22 @@ inline bool ipv4OnSubnet(uint32_t ip, uint32_t networkIp, uint32_t mask) {
   return (ip & mask) == (networkIp & mask);
 }
 
+// RFC1918 private ranges only — not a specific site subnet (no hardcoding).
+inline bool ipv4IsPrivateLan(uint32_t ip) {
+  if ((ip & 0xFF000000u) == 0x0A000000u) return true;       // 10.0.0.0/8
+  if ((ip & 0xFFF00000u) == 0xAC100000u) return true;       // 172.16.0.0/12
+  if ((ip & 0xFFFF0000u) == 0xC0A80000u) return true;       // 192.168.0.0/16
+  return false;
+}
+
+inline bool ipv4IsUnusableHost(uint32_t ip) {
+  if (ip == 0 || ip == 0xFFFFFFFFu) return true;
+  if ((ip & 0xFF000000u) == 0x7F000000u) return true;       // 127.0.0.0/8
+  if ((ip & 0xFFFF0000u) == 0xA9FE0000u) return true;       // 169.254.0.0/16
+  if ((ip & 0xF0000000u) >= 0xE0000000u) return true;       // multicast / reserved
+  return false;
+}
+
 enum class IpCheckResult : uint8_t {
   Ok = 0,
   InvalidIp,
@@ -151,13 +167,16 @@ enum class IpCheckResult : uint8_t {
   NotOnLan,
 };
 
-// Live Ethernet LAN only. Does not scan, ping, or use NetworkSettings defaults.
+// Live Ethernet must be up. Accepts same-subnet hosts or any other RFC1918
+// private address (routed via MikroTik). Sync/Check prove reachability.
+// Does not hardcode site subnets (e.g. 192.168.88.0/24). Does not scan or ping.
 inline IpCheckResult validateManagementIp(const char *candidateIp,
                                           const char *liveEsp32Ip,
                                           const char *liveGatewayIp,
                                           const char *liveSubnetMask) {
   uint32_t candidate = 0;
   if (!parseIpv4Packed(candidateIp, candidate)) return IpCheckResult::InvalidIp;
+  if (ipv4IsUnusableHost(candidate)) return IpCheckResult::InvalidIp;
 
   uint32_t esp32Ip = 0;
   uint32_t mask = 0;
@@ -170,11 +189,7 @@ inline IpCheckResult validateManagementIp(const char *candidateIp,
     return IpCheckResult::Reserved;
   }
 
-  const uint32_t network = ipv4Network(esp32Ip, mask);
-  const uint32_t broadcast = ipv4Broadcast(esp32Ip, mask);
-  if (candidate == network || candidate == broadcast || candidate == esp32Ip) {
-    return IpCheckResult::Reserved;
-  }
+  if (candidate == esp32Ip) return IpCheckResult::Reserved;
 
   uint32_t gateway = 0;
   if (parseIpv4Packed(liveGatewayIp, gateway) && gateway != 0 &&
@@ -182,7 +197,18 @@ inline IpCheckResult validateManagementIp(const char *candidateIp,
     return IpCheckResult::Reserved;
   }
 
-  if (!ipv4OnSubnet(candidate, esp32Ip, mask)) return IpCheckResult::NotOnLan;
+  // Same subnet: also reject that subnet's network / broadcast addresses.
+  if (ipv4OnSubnet(candidate, esp32Ip, mask)) {
+    const uint32_t network = ipv4Network(esp32Ip, mask);
+    const uint32_t broadcast = ipv4Broadcast(esp32Ip, mask);
+    if (candidate == network || candidate == broadcast) {
+      return IpCheckResult::Reserved;
+    }
+    return IpCheckResult::Ok;
+  }
+
+  // Routed private LAN (any RFC1918 site/subnet — not hardcoded).
+  if (!ipv4IsPrivateLan(candidate)) return IpCheckResult::NotOnLan;
   return IpCheckResult::Ok;
 }
 
@@ -330,7 +356,7 @@ inline const char *crudMessage(CrudStatus status) {
     case CrudStatus::IpReserved:
       return "Management IP is reserved";
     case CrudStatus::IpNotOnLan:
-      return "Management IP is not on the live Ethernet LAN";
+      return "Management IP must be a private LAN address reachable via Ethernet";
     case CrudStatus::DuplicateIp:
       return "Management IP is already registered";
     case CrudStatus::LimitReached:

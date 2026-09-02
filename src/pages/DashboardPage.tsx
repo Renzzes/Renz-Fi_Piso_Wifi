@@ -1,47 +1,51 @@
 import { useOutletContext } from "react-router-dom";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 import { RouterCacheStaleBanner } from "@/components/RouterCacheStaleBanner";
 import type { AdminOutletContext } from "@/components/AdminLayout";
 import {
   ActiveUsersCard,
-  CoinSlotStatusCard,
   CoinSummaryCard,
-  ConnectivityStatusRow,
+  ContentFilteringCard,
+  MikrotikRouterCard,
   MonthlySalesCard,
-  QuickActionsCard,
+  NetworkStatusCard,
+  QuickActionsBar,
   SdCardHealthCard,
-  StorageUsageCard,
   SystemHealthCard,
-  SystemStatusCard,
   TotalCoinsCard,
+  type SalesPeriod,
 } from "@/components/dashboard";
-import type { DashboardStatusRow } from "@/components/dashboard/MonitoringCards";
+import type { NetworkStatusRow } from "@/components/dashboard/NetworkStatusCard";
+import type { MikrotikRouterSnapshot } from "@/components/dashboard/MikrotikRouterCard";
 import { useSystemStatus } from "@/hooks/api/useSystemStatus";
+import { useRollingMetricHistory } from "@/hooks/useRollingMetricHistory";
 import { useRealtime } from "@/contexts/RealtimeContext";
+import { ACCESS_POINTS_QUERY_KEY, accessPointsApi } from "@/services/accessPoints";
+import { CONTENT_FILTER_QUERY_KEY, contentFilterApi } from "@/services/contentFilter";
 import { coinApi } from "@/services/coin";
 import { routerApi } from "@/services/router";
 import { salesApi } from "@/services/sales";
 import { healthApi } from "@/services/rgb";
-import { routerCacheLastSyncLabel } from "@/lib/routerCacheStatus";
-import {
-  isProductionNetworkHealthy,
-  productionNetworkReasonLabel,
-} from "@/lib/productionNetworkReason";
+import { systemApi } from "@/services/system";
+import { Button } from "@/components/ui/button";
+import { toast } from "sonner";
+import { routerCacheLastSyncLabel, isRouterCacheStale } from "@/lib/routerCacheStatus";
 import { refreshProductionRouterViews } from "@/lib/refreshProductionRouterViews";
-import { adminConnectionStatusDisplay, wanStatusDisplay } from "@/lib/adminStatus";
+import { wanStatusDisplay } from "@/lib/adminStatus";
 import {
-  boolStatus,
+  accessPointRegistryDisplay,
   coinDisplay,
-  coinHardwareTone,
-  coinRateLabel,
   connectivityTone,
-  hotspotDisplay,
   mikrotikDisplay,
+  type StatusTone,
 } from "@/lib/dashboardDisplay";
 import {
   clampPct,
   formatKb,
+  formatRouterHddOverview,
   formatRouterMemory,
+  formatRouterTemperature,
   formatStorageFromMb,
   usagePct,
 } from "@/lib/dashboardFormat";
@@ -80,14 +84,41 @@ export default function DashboardPage() {
   const outlet = useOutletContext<AdminOutletContext | undefined>();
   const isOwner = outlet?.isOwner ?? true;
   const permissions = outlet?.permissions ?? DEFAULT_OPERATOR_PERMISSIONS;
-  const { fallbackPollMs, adminApiReachable } = useRealtime();
+  const { fallbackPollMs, liveUpdatesEnabled, setLiveUpdatesEnabled } = useRealtime();
+  const [detailsEnabled, setDetailsEnabled] = useState(false);
+  const [salesChartEnabled, setSalesChartEnabled] = useState(false);
+  const [salesPeriod, setSalesPeriod] = useState<SalesPeriod>("today");
   const {
     data: status,
     isLoading: statusLoading,
     isError: statusError,
     error: statusErr,
+    refetch: refetchStatus,
+    isFetching: statusFetching,
+    dataUpdatedAt: statusDataUpdatedAt,
   } = useSystemStatus();
-  const secondaryQueriesEnabled = !statusLoading && status !== undefined;
+  const {
+    data: accessPointList,
+    isLoading: accessPointsLoading,
+    isError: accessPointsError,
+  } = useQuery({
+    queryKey: ACCESS_POINTS_QUERY_KEY,
+    queryFn: () => accessPointsApi.list(),
+    enabled: isOwner,
+    staleTime: Number.POSITIVE_INFINITY,
+    refetchOnMount: false,
+  });
+  const {
+    data: contentFilter,
+    isLoading: contentFilterLoading,
+    isError: contentFilterError,
+  } = useQuery({
+    queryKey: CONTENT_FILTER_QUERY_KEY,
+    queryFn: () => contentFilterApi.get(),
+    enabled: isOwner,
+    staleTime: 30_000,
+  });
+  const secondaryQueriesEnabled = detailsEnabled && !statusLoading && status !== undefined;
   const {
     data: coinDiagnostics,
     isLoading: coinDiagLoading,
@@ -96,7 +127,7 @@ export default function DashboardPage() {
     queryKey: ["coin", "diagnostics"],
     queryFn: () => coinApi.diagnostics(),
     enabled: secondaryQueriesEnabled,
-    refetchInterval: fallbackPollMs,
+    refetchInterval: liveUpdatesEnabled ? fallbackPollMs : false,
     staleTime: 5000,
     refetchIntervalInBackground: false,
   });
@@ -108,7 +139,7 @@ export default function DashboardPage() {
     queryKey: ["system", "health"],
     queryFn: () => healthApi.get(),
     enabled: secondaryQueriesEnabled,
-    refetchInterval: fallbackPollMs,
+    refetchInterval: liveUpdatesEnabled ? fallbackPollMs : false,
     staleTime: 5000,
     refetchIntervalInBackground: false,
   });
@@ -120,26 +151,50 @@ export default function DashboardPage() {
     queryKey: ["system", "coin"],
     queryFn: () => coinApi.system(),
     enabled: secondaryQueriesEnabled,
-    refetchInterval: fallbackPollMs,
+    refetchInterval: liveUpdatesEnabled ? fallbackPollMs : false,
     staleTime: 5000,
     refetchIntervalInBackground: false,
   });
-  const { data: coinSettings, isLoading: coinSettingsLoading } = useQuery({
-    queryKey: ["coin", "settings"],
-    queryFn: () => coinApi.settings(),
-    enabled: secondaryQueriesEnabled,
-    staleTime: 30_000,
-    refetchIntervalInBackground: false,
-  });
-  const { data: dailyChart } = useQuery({
-    queryKey: ["sales", "chart", "daily"],
-    queryFn: () => salesApi.chartDaily(),
-    enabled: secondaryQueriesEnabled,
+  const { data: salesChart, isFetching: chartFetching } = useQuery({
+    queryKey: ["sales", "chart", salesPeriod],
+    queryFn: () => {
+      if (salesPeriod === "weekly") return salesApi.chartWeekly();
+      if (salesPeriod === "monthly") return salesApi.chartMonthly();
+      return salesApi.chartDaily();
+    },
+    enabled: salesChartEnabled,
     staleTime: 30_000,
     refetchIntervalInBackground: false,
   });
 
-  const coinLoading = statusLoading || coinDiagLoading || coinSystemLoading;
+  const reloadSalesMutation = useMutation({
+    mutationFn: async () => {
+      setSalesChartEnabled(true);
+      setDetailsEnabled(true);
+      await refetchStatus();
+      await queryClient.invalidateQueries({ queryKey: ["sales"] });
+      await queryClient.invalidateQueries({ queryKey: ["sales", "chart"] });
+      const sdMissing =
+        status?.storage?.sd?.present === false ||
+        status?.storageStatus?.mounted === false ||
+        status?.storage?.sd?.status === "Missing";
+      if (sdMissing) {
+        try {
+          await systemApi.retrySd();
+        } catch {
+          // Optional promote/retry — Core status refresh still succeeds from SPIFFS.
+        }
+      }
+    },
+    onSuccess: () => {
+      toast.success("Sales refreshed from appliance storage.");
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "Unable to reload sales.");
+    },
+  });
+
+  const coinLoading = statusLoading || (detailsEnabled && (coinDiagLoading || coinSystemLoading));
   const today = status?.sales?.today;
   const weekly = status?.sales?.weekly;
   const monthly = status?.sales?.monthly;
@@ -148,6 +203,7 @@ export default function DashboardPage() {
 
   const mikrotik = mikrotikDisplay(status?.mikrotik, statusLoading);
   const routerCache = status?.routerCache;
+  const routerOs = routerCache?.routerOs;
   const storageRecovering =
     Boolean(status?.storageStatus?.recoveryInProgress) ||
     Boolean(status?.storageStatus?.recoveryMode) ||
@@ -158,15 +214,6 @@ export default function DashboardPage() {
       await refreshProductionRouterViews(queryClient);
     },
   });
-  const routerOs = routerCache?.routerOs;
-  const mikrotikHint = [
-    mikrotik.ok ? `Online • Identity: ${routerCache?.identity || mikrotik.host}` : mikrotik.host,
-    routerCache?.populated ? `Last sync: ${routerCacheLastSyncLabel(routerCache)}` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
-  const hotspot = hotspotDisplay(status?.hotspot, statusLoading);
-  const adminConnection = adminConnectionStatusDisplay(adminApiReachable, statusLoading);
   const wan = wanStatusDisplay(status?.internet, statusLoading, status?.wan);
   const coin = coinDisplay(
     status,
@@ -181,142 +228,117 @@ export default function DashboardPage() {
   const sdReady = sd?.mounted === true && sd?.status === "Ready";
   const sdFreePct = sdReady && sd && sd.totalMb > 0 ? (sd.freeMb / sd.totalMb) * 100 : undefined;
 
-  const database = boolStatus(status?.database?.ok, statusLoading, "Healthy", "Error");
-  const server = boolStatus(status?.server?.ok, statusLoading, "Running", "Down");
-
-  const uptimeStatus = statusLoading ? "Loading..." : (status?.esp32?.uptime ?? "N/A");
-  const syncStatus = statusLoading
-    ? "Loading..."
-    : status?.sync?.pending !== undefined
-      ? `${status.sync.pending} items`
-      : "N/A";
-
   const pausedUsers = status?.activeUsers?.paused;
-  const pausedUsersStatus = statusLoading
-    ? "Loading..."
-    : pausedUsers !== undefined
-      ? String(pausedUsers)
-      : "N/A";
+  const activeSessionCount = status?.activeUsers?.count;
+  const sessionHistory = useRollingMetricHistory(
+    statusLoading ? undefined : activeSessionCount,
+    24,
+    statusDataUpdatedAt,
+  );
 
   const loadErrors: string[] = [];
   if (statusError) loadErrors.push("Unable to load data from /api/status");
-  if (healthError) loadErrors.push("Unable to load data from /api/system/health");
-  if (coinSystemError) loadErrors.push("Unable to load data from /api/system/coin");
-  if (coinDiagError) loadErrors.push("Unable to load coin diagnostics");
+  if (detailsEnabled && healthError) {
+    loadErrors.push("Unable to load data from /api/system/health");
+  }
+  if (detailsEnabled && coinSystemError) {
+    loadErrors.push("Unable to load data from /api/system/coin");
+  }
+  if (detailsEnabled && coinDiagError) {
+    loadErrors.push("Unable to load coin diagnostics");
+  }
 
   if (statusErr) {
     console.warn("[dashboard] status query error detail", statusErr);
   }
 
-  const wanTone = wan.variant === "unknown" ? "unknown" : wan.ok ? "ok" : "bad";
-  const productionSsid = statusLoading
-    ? "Loading..."
-    : routerCache?.productionNetwork?.ssid || routerCache?.ssid || "N/A";
   const routerOsVersion = statusLoading
     ? "Loading..."
     : routerOs?.version || routerCache?.routerOsVersion || "N/A";
 
-  const primaryStatusRows: DashboardStatusRow[] = [
-    { label: "MikroTik Router", value: mikrotik.label, tone: mikrotik.ok ? "ok" : "bad" },
+  const routerCacheStale = isRouterCacheStale(routerCache);
+  const controllerOnline = Boolean(status?.server?.ok) && Boolean(status);
+  const internetRowTone: StatusTone = wan.variant === "unknown" ? "unknown" : wan.ok ? "ok" : "bad";
+  const mikrotikConnectionLabel = statusLoading
+    ? "Loading..."
+    : !mikrotik.ok
+      ? "Not configured"
+      : mikrotik.connectivityOk
+        ? "Connected"
+        : mikrotik.connectivityLabel === "Offline"
+          ? "Disconnected"
+          : mikrotik.connectivityLabel;
+  const mikrotikConnectionTone = connectivityTone(
+    mikrotik.connectivityOk,
+    mikrotik.connectivityLabel,
+  );
+  const controllerLabel = statusLoading
+    ? "Loading..."
+    : controllerOnline
+      ? "Connected"
+      : "Disconnected";
+  const accessPointRow = isOwner
+    ? accessPointRegistryDisplay(
+        accessPointList?.accessPoints,
+        accessPointsLoading,
+        accessPointsError,
+      )
+    : { label: "Unknown", tone: "unknown" as const };
+  const internetStatusLabel = statusLoading
+    ? "Loading..."
+    : wan.show && wan.ok
+      ? "Online"
+      : wan.show
+        ? wan.label
+        : "Unknown";
+  const networkStatusRows: NetworkStatusRow[] = [
     {
-      label: "Connectivity",
-      value: mikrotik.connectivityLabel,
-      tone: connectivityTone(mikrotik.connectivityOk, mikrotik.connectivityLabel),
+      label: "Internet",
+      value: internetStatusLabel,
+      tone: internetRowTone,
     },
     {
-      label: "RouterOS Version",
-      value: routerOsVersion,
-      tone: routerOsVersion !== "N/A" && routerOsVersion !== "Loading..." ? "ok" : "unknown",
-      mono: true,
+      label: "MikroTik",
+      value: mikrotikConnectionLabel,
+      tone: mikrotikConnectionTone,
     },
     {
-      label: "Production SSID",
-      value: productionSsid,
-      tone: productionSsid !== "N/A" && productionSsid !== "Loading..." ? "ok" : "unknown",
-    },
-    ...(wan.show
-      ? [{ label: "WAN Internet", value: wan.label, tone: wanTone as DashboardStatusRow["tone"] }]
-      : []),
-    {
-      label: "Coin Hardware",
-      value: coin.hardwareLabel,
-      tone: coinHardwareTone(coin.hardwareState),
+      label: "KonekSik-fi Controller",
+      value: controllerLabel,
+      tone: controllerOnline ? "ok" : statusLoading ? "unknown" : "bad",
     },
     {
-      label: "ESP32",
-      value: statusLoading && !status ? "Loading..." : status ? "Online" : "Offline",
-      tone: status ? "ok" : statusLoading ? "unknown" : "bad",
-    },
-    {
-      label: "ESP32 Uptime",
-      value: uptimeStatus,
-      tone: status ? "ok" : statusLoading ? "unknown" : "bad",
-      mono: true,
+      label: "Access Point",
+      value: accessPointRow.label,
+      tone: accessPointRow.tone,
     },
   ];
-
-  const extraStatusRows: DashboardStatusRow[] = [
-    {
-      label: "Router Identity",
-      value: statusLoading ? "Loading..." : routerCache?.identity || "N/A",
-      tone: routerCache?.identity ? "ok" : "unknown",
+  const routerHdd = formatRouterHddOverview(routerOs?.freeHddSpace, routerOs?.totalHddSpace);
+  const routerTemperature = formatRouterTemperature(routerOs?.cpuTemperature);
+  const hasRouterStorage = routerHdd.total !== "N/A";
+  const mikrotikSnapshot: MikrotikRouterSnapshot = {
+    model: statusLoading
+      ? "Loading..."
+      : routerOs?.boardName?.trim() || routerCache?.identity?.trim() || "N/A",
+    routerOs: routerOsVersion,
+    uptime: statusLoading ? "Loading..." : routerOs?.uptime || "N/A",
+    connection: mikrotikConnectionLabel,
+    connectionTone: mikrotikConnectionTone,
+    cpu: statusLoading ? "Loading..." : routerOs?.cpuLoad ? `${routerOs.cpuLoad}%` : "N/A",
+    memory: statusLoading
+      ? "Loading..."
+      : formatRouterMemory(routerOs?.freeMemory, routerOs?.totalMemory),
+    storage: {
+      total: routerHdd.total,
+      used: routerHdd.used,
+      available: routerHdd.available,
+      usagePctLabel: routerHdd.usagePct,
+      usagePctValue: routerHdd.usagePctValue,
+      hasData: hasRouterStorage,
     },
-    {
-      label: "CPU",
-      value: statusLoading ? "Loading..." : routerOs?.cpuLoad ? `${routerOs.cpuLoad}%` : "N/A",
-      tone: routerOs?.cpuLoad ? "ok" : "unknown",
-      mono: true,
-    },
-    {
-      label: "Memory",
-      value: statusLoading
-        ? "Loading..."
-        : formatRouterMemory(routerOs?.freeMemory, routerOs?.totalMemory),
-      tone:
-        formatRouterMemory(routerOs?.freeMemory, routerOs?.totalMemory) !== "N/A"
-          ? "ok"
-          : "unknown",
-      mono: true,
-    },
-    {
-      label: "Router Uptime",
-      value: statusLoading ? "Loading..." : routerOs?.uptime || "N/A",
-      tone: routerOs?.uptime ? "ok" : "unknown",
-      mono: true,
-    },
-    { label: "Hotspot", value: hotspot.label, tone: hotspot.ok ? "ok" : "unknown" },
-    {
-      label: "Admin Connection",
-      value: adminConnection.label,
-      tone: adminConnection.ok ? "ok" : "bad",
-    },
-    { label: "Coin Slot Feature", value: coin.featureLabel, tone: coin.ok ? "ok" : "neutral" },
-    {
-      label: "Paused Users",
-      value: pausedUsersStatus,
-      tone: pausedUsers === 0 ? "ok" : pausedUsers ? "warn" : "unknown",
-    },
-    {
-      label: "Pending Sync",
-      value: syncStatus,
-      tone: status?.sync?.pending === 0 ? "ok" : "unknown",
-    },
-    { label: "Database", value: database.label, tone: database.ok ? "ok" : "bad" },
-    { label: "API Server", value: server.label, tone: server.ok ? "ok" : "bad" },
-    ...(routerCache?.populated && routerCache.productionNetwork
-      ? [
-          {
-            label: "Production Wi-Fi",
-            value: isProductionNetworkHealthy(routerCache.productionNetwork)
-              ? "Healthy"
-              : productionNetworkReasonLabel(routerCache.productionNetwork.reason),
-            tone: (isProductionNetworkHealthy(routerCache.productionNetwork)
-              ? "ok"
-              : "warn") as DashboardStatusRow["tone"],
-          },
-        ]
-      : []),
-  ];
+    temperature: statusLoading ? "Loading..." : routerTemperature,
+    lastSyncLabel: routerCache?.populated ? routerCacheLastSyncLabel(routerCache) : undefined,
+  };
 
   const sdInfo = sdBadge(status?.storageStatus?.health, sd?.status, sd?.present);
   const cpuMhz = systemHealth?.esp32?.cpuFreqMHz;
@@ -361,6 +383,61 @@ export default function DashboardPage() {
         <p className="mt-0.5 text-[13px] text-muted-foreground">Overview of your Renz-Fi system</p>
       </div>
 
+      <div
+        className="page-enter flex flex-col gap-2 rounded-md border border-border/70 bg-muted/30 px-3 py-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between"
+        style={{ animationDelay: "30ms" }}
+      >
+        <p className="text-sm text-muted-foreground">
+          Standby mode: Connect loads Core status only. Use the buttons for RouterOS, sales chart,
+          or live EventSource updates.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant="secondary"
+            disabled={reloadSalesMutation.isPending || statusFetching || chartFetching}
+            onClick={() => reloadSalesMutation.mutate()}
+          >
+            {reloadSalesMutation.isPending ? "Reloading…" : "Reload Sales"}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="secondary"
+            disabled={syncRouterMutation.isPending || storageRecovering}
+            onClick={() => syncRouterMutation.mutate()}
+          >
+            {syncRouterMutation.isPending ? "Synchronizing…" : "Synchronize Router"}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={liveUpdatesEnabled ? "default" : "outline"}
+            onClick={() => {
+              const next = !liveUpdatesEnabled;
+              setLiveUpdatesEnabled(next);
+              if (next) setDetailsEnabled(true);
+              toast.message(
+                next ? "Live updates on (SSE + refresh)." : "Live updates off — Admin standby.",
+              );
+            }}
+          >
+            {liveUpdatesEnabled ? "Live updates: On" : "Live updates: Off"}
+          </Button>
+          {!detailsEnabled ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => setDetailsEnabled(true)}
+            >
+              Load coin / health details
+            </Button>
+          ) : null}
+        </div>
+      </div>
+
       {loadErrors.length > 0 ? (
         <div className="page-enter" style={{ animationDelay: "40ms" }}>
           <DashboardLoadError
@@ -377,71 +454,51 @@ export default function DashboardPage() {
         />
       </div>
 
-      <div
-        className="page-enter grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4"
-        style={{ animationDelay: "90ms" }}
-      >
-        <MonthlySalesCard
-          loading={statusLoading}
-          amount={monthly?.amount}
-          sessions={monthly?.sessions}
-          todayAmount={today?.amount}
-          weekAmount={weekly?.amount}
-          chartValues={dailyChart?.data ?? []}
-        />
-        <ActiveUsersCard
-          loading={statusLoading}
-          count={status?.activeUsers?.count}
-          paused={pausedUsers}
-        />
-        <CoinSummaryCard
-          loading={coinLoading}
-          coinsToday={coinsToday}
-          lastCoin={lastCoin}
-          hardwareState={coinSystem?.state ?? coin.hardwareState}
-        />
-        <TotalCoinsCard
-          loading={coinLoading}
-          totalCoins={totalCoins}
-          monthlySessions={monthly?.sessions}
-        />
-      </div>
+      <section className="page-enter space-y-3" style={{ animationDelay: "90ms" }}>
+        <h3 className="text-lg font-semibold tracking-tight text-foreground">Sales</h3>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <MonthlySalesCard
+            loading={statusLoading}
+            period={salesPeriod}
+            onPeriodChange={setSalesPeriod}
+            todayAmount={today?.amount}
+            todaySessions={today?.sessions}
+            weekAmount={weekly?.amount}
+            weekSessions={weekly?.sessions}
+            monthAmount={monthly?.amount}
+            monthSessions={monthly?.sessions}
+            chartValues={salesChart?.data ?? []}
+          />
+          <ActiveUsersCard
+            loading={statusLoading}
+            count={status?.activeUsers?.count}
+            paused={pausedUsers}
+          />
+          <CoinSummaryCard
+            loading={coinLoading}
+            coinsToday={coinsToday}
+            lastCoin={lastCoin}
+            hardwareState={coinSystem?.state ?? coin.hardwareState}
+          />
+          <TotalCoinsCard
+            loading={coinLoading}
+            totalCoins={totalCoins}
+            monthlySessions={monthly?.sessions}
+          />
+        </div>
+      </section>
+
+      <section className="page-enter space-y-2" style={{ animationDelay: "160ms" }}>
+        <h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+          Quick Actions
+        </h3>
+        <QuickActionsBar isOwner={isOwner} permissions={permissions} />
+      </section>
 
       <div
-        className="page-enter grid grid-cols-1 gap-3 xl:grid-cols-3"
-        style={{ animationDelay: "160ms" }}
+        className="page-enter grid grid-cols-1 gap-3 xl:grid-cols-2"
+        style={{ animationDelay: "230ms" }}
       >
-        <SystemStatusCard
-          loading={statusLoading}
-          error={statusError}
-          onRetry={retryStatus}
-          primary={primaryStatusRows}
-          extra={extraStatusRows}
-        />
-        <CoinSlotStatusCard
-          loading={coinLoading}
-          error={coinSystemError || coinDiagError}
-          onRetry={() => {
-            void queryClient.invalidateQueries({ queryKey: ["system", "coin"] });
-            void queryClient.invalidateQueries({ queryKey: ["coin", "diagnostics"] });
-          }}
-          enabled={Boolean(
-            coinSystem?.enabled ?? status?.coinSlot?.enabled ?? status?.coinSlot?.ok,
-          )}
-          featureLabel={coin.featureLabel}
-          hardwareLabel={coin.hardwareLabel}
-          hardwareState={coinSystem?.state ?? coin.hardwareState}
-          coinsToday={coinsToday}
-          totalCoins={
-            coinSystemLoading
-              ? "…"
-              : coinSystem?.totalCoinCount !== undefined
-                ? String(coinSystem.totalCoinCount)
-                : coin.totalCoins
-          }
-          lastCoin={lastCoin}
-          rateLabel={coinRateLabel(coinSettings, coinSettingsLoading)}
-        />
         <SdCardHealthCard
           loading={statusLoading}
           error={statusError}
@@ -452,13 +509,27 @@ export default function DashboardPage() {
           capacityLabel={sdReady ? formatStorageFromMb(sd?.totalMb) : "N/A"}
           uptimeLabel={status?.esp32?.uptime ?? "N/A"}
           mounted={sdReady}
+          flashUsed={storage?.flashUsedMb}
+          flashTotal={storage?.flashTotalMb}
+          flashPct={flashPct}
+          logsUsed={storage?.logsUsedKb}
+          logsTotal={storage?.logsTotalKb}
+          logsPct={logsPct}
+          sdReady={sdReady}
+          sdUsed={sd?.usedMb}
+          sdTotal={sd?.totalMb}
+          sdFree={sd?.freeMb}
+          sdPct={sdPct}
+          sdStatus={statusLoading ? "Loading..." : (sd?.status ?? "N/A")}
         />
-      </div>
-
-      <div
-        className="page-enter grid grid-cols-1 gap-3 xl:grid-cols-3"
-        style={{ animationDelay: "230ms" }}
-      >
+        <MikrotikRouterCard
+          loading={statusLoading}
+          error={statusError}
+          onRetry={retryStatus}
+          snapshot={mikrotikSnapshot}
+          stale={routerCacheStale}
+          showStorageSyncHint={!hasRouterStorage && !statusLoading}
+        />
         <SystemHealthCard
           loading={healthLoading}
           error={healthError}
@@ -478,49 +549,25 @@ export default function DashboardPage() {
           ethernetDriver={healthLoading ? "Loading..." : (systemHealth?.ethernet?.driver ?? "N/A")}
           ethernetLink={healthLoading ? "Loading..." : (systemHealth?.ethernet?.link ?? "N/A")}
         />
-        <StorageUsageCard
-          loading={statusLoading}
-          error={statusError}
-          onRetry={retryStatus}
-          flashUsed={storage?.flashUsedMb}
-          flashTotal={storage?.flashTotalMb}
-          flashPct={flashPct}
-          logsUsed={storage?.logsUsedKb}
-          logsTotal={storage?.logsTotalKb}
-          logsPct={logsPct}
-          sdReady={sdReady}
-          sdUsed={sd?.usedMb}
-          sdTotal={sd?.totalMb}
-          sdFree={sd?.freeMb}
-          sdPct={sdPct}
-          sdStatus={statusLoading ? "Loading..." : (sd?.status ?? "N/A")}
-          heapUsed={storage?.internalHeap?.usedKb ?? storage?.ramUsedKb}
-          heapTotal={storage?.internalHeap?.totalKb ?? storage?.ramTotalKb}
-          psramPresent={Boolean(storage?.psram?.present)}
-          psramUsed={storage?.psram?.usedKb}
-          psramTotal={storage?.psram?.totalKb}
-          dmaFree={storage?.dma?.freeKb}
-          dmaLargest={storage?.dma?.largestKb}
+        <ContentFilteringCard
+          loading={contentFilterLoading}
+          error={contentFilterError}
+          onRetry={() => {
+            void queryClient.invalidateQueries({ queryKey: CONTENT_FILTER_QUERY_KEY });
+          }}
+          state={contentFilter}
         />
-        <QuickActionsCard isOwner={isOwner} permissions={permissions} />
       </div>
 
       <div className="page-enter" style={{ animationDelay: "300ms" }}>
-        <ConnectivityStatusRow
-          mikrotikLabel={mikrotik.label}
-          mikrotikTone={mikrotik.ok ? "ok" : "bad"}
-          mikrotikHint={mikrotikHint}
-          adminLabel={adminConnection.label}
-          adminTone={adminConnection.ok ? "ok" : "bad"}
-          wanLabel={wan.label}
-          wanTone={wanTone}
-          wanHint={wan.latency}
-          showWan={wan.show}
-          coinLabel={coin.hardwareLabel}
-          coinTone={coinHardwareTone(coinSystem?.state ?? coin.hardwareState)}
-          coinHint={coin.pulses}
-          hotspotLabel={hotspot.label}
-          hotspotTone={hotspot.ok ? "ok" : "unknown"}
+        <NetworkStatusCard
+          loading={statusLoading}
+          error={statusError}
+          onRetry={retryStatus}
+          rows={networkStatusRows}
+          stale={routerCacheStale}
+          sessionHistory={sessionHistory}
+          sessionCount={activeSessionCount}
         />
       </div>
     </div>

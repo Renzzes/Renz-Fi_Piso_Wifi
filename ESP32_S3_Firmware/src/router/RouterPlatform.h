@@ -114,6 +114,8 @@ class RouterPlatform {
   size_t _driverCount = 0;
   IRouterDriver *_active = nullptr;
   bool _healthConfigured = false;
+  bool _healthCacheLoaded = false;
+  uint32_t _lastHealthCacheMs = 0;
   String _healthHost;
   String _lastCollectError;
 

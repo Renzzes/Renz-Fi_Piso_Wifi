@@ -13,13 +13,15 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { CoinSlotStatusCard } from "@/components/dashboard";
 import { coinApi } from "@/services/coin";
 import { toast } from "sonner";
 import { useRealtime } from "@/contexts/RealtimeContext";
+import { useSystemStatus } from "@/hooks/api/useSystemStatus";
 import { ConfigCard, ConfigField } from "@/components/system-config/ConfigCard";
 import { ConfigStatusBadge } from "@/components/system-config/ConfigStatusBadge";
 import { MetricTile } from "@/components/system-config/InfoRow";
-import type { StatusTone } from "@/lib/dashboardDisplay";
+import { coinDisplay, coinRateLabel, type StatusTone } from "@/lib/dashboardDisplay";
 
 function coinStateTone(state: string | undefined): StatusTone {
   const value = (state ?? "").toLowerCase();
@@ -31,15 +33,31 @@ function coinStateTone(state: string | undefined): StatusTone {
 
 export default function CoinSettingsPage() {
   const qc = useQueryClient();
-  const { fallbackPollMs } = useRealtime();
+  const { fallbackPollMs, liveUpdatesEnabled } = useRealtime();
+  const { data: status, isLoading: statusLoading, isError: statusError } = useSystemStatus();
   const { data: settings, isLoading: settingsLoading } = useQuery({
     queryKey: ["coin", "settings"],
     queryFn: () => coinApi.settings(),
   });
-  const { data: diagnostics } = useQuery({
+  const {
+    data: diagnostics,
+    isLoading: diagLoading,
+    isError: diagError,
+  } = useQuery({
     queryKey: ["coin", "diagnostics"],
     queryFn: () => coinApi.diagnostics(),
-    refetchInterval: fallbackPollMs,
+    refetchInterval: liveUpdatesEnabled ? fallbackPollMs : false,
+    staleTime: 5000,
+    refetchIntervalInBackground: false,
+  });
+  const {
+    data: coinSystem,
+    isLoading: coinSystemLoading,
+    isError: coinSystemError,
+  } = useQuery({
+    queryKey: ["system", "coin"],
+    queryFn: () => coinApi.system(),
+    refetchInterval: liveUpdatesEnabled ? fallbackPollMs : false,
     staleTime: 5000,
     refetchIntervalInBackground: false,
   });
@@ -85,13 +103,49 @@ export default function CoinSettingsPage() {
 
   const stats = diagnostics?.stats;
   const stateLabel = String(stats?.state ?? "—");
+  const coinLoading = statusLoading || coinSystemLoading || (diagLoading && !diagnostics);
+  const coin = coinDisplay(
+    status,
+    diagnostics?.stats?.state,
+    diagnostics?.stats?.total_today,
+    coinLoading,
+  );
+  const coinsToday = coin.pulsesToday;
+  const totalCoins = coinSystem?.totalCoinCount ?? status?.coinSlot?.totalCoinCount;
+  const lastCoin =
+    coinSystem?.lastCoinTimestamp ||
+    coinSystem?.lastPulseTimestamp ||
+    status?.coinSlot?.lastCoinTimestamp ||
+    status?.coinSlot?.lastPulseTimestamp;
 
   return (
     <div className="flex w-full max-w-none flex-col gap-4">
       <div>
-        <h2 className="text-2xl font-semibold leading-tight">Coin Settings</h2>
-        <p className="mt-0.5 text-[13px] text-muted-foreground">Configure the coin slot acceptor</p>
+        <h2 className="text-2xl font-semibold leading-tight">Coin Slot</h2>
+        <p className="mt-0.5 text-[13px] text-muted-foreground">
+          Operational status and coin acceptor configuration
+        </p>
       </div>
+
+      <CoinSlotStatusCard
+        loading={coinLoading}
+        error={statusError || coinSystemError || diagError}
+        onRetry={() => {
+          void qc.invalidateQueries({ queryKey: ["system", "status"] });
+          void qc.invalidateQueries({ queryKey: ["system", "coin"] });
+          void qc.invalidateQueries({ queryKey: ["coin", "diagnostics"] });
+        }}
+        enabled={Boolean(coinSystem?.enabled ?? status?.coinSlot?.enabled ?? status?.coinSlot?.ok)}
+        featureLabel={coin.featureLabel}
+        hardwareLabel={coin.hardwareLabel}
+        hardwareState={coinSystem?.state ?? coin.hardwareState}
+        coinsToday={coinsToday}
+        totalCoins={
+          coinSystemLoading ? "…" : totalCoins !== undefined ? String(totalCoins) : coin.totalCoins
+        }
+        lastCoin={lastCoin}
+        rateLabel={coinRateLabel(settings, settingsLoading)}
+      />
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <MetricTile label="Last Pulse" value={String(stats?.last_pulse ?? "0")} />

@@ -5,7 +5,9 @@
 
 #include "BootDiagnostics.h"
 #include "BurnInDiagnostics.h"
+#include "CrashBootReport.h"
 #include "DmaMemoryMonitor.h"
+#include "MemoryDiagnostics.h"
 #include "MemoryDiagnostics.h"
 #include "GpioIsrService.h"
 #include "InstallationState.h"
@@ -19,6 +21,8 @@
 #include "SetupDnsPolicy.h"
 #include "W5500Config.h"
 #include "web/HttpPlaneGate.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 FirmwareApp::FirmwareApp() : _events("/api/events") {}
 
@@ -150,6 +154,14 @@ void FirmwareApp::begin() {
   Serial.printf("[boot] Installation state: %s (%u%%)\n",
                 installationStateLabel(_installation.current()),
                 static_cast<unsigned>(_installation.progressPercent()));
+  // One-shot previous-reset capture (Guru / WDT / brownout / SW). Runs on
+  // loopTask after storage+logger are ready — never continuous, never on
+  // async_tcp. Dated entry lands in /history/logs (or SPIFFS spool).
+  salesTimeBindInstallation(&_installation);
+  if (_installation.isReady()) {
+    salesTimeBegin();
+  }
+  CrashBootReport::reportPreviousReset(&_storage, &_logger);
   _auth.begin(&_storage, &_logger);
   _setupRouterConnection.begin(&_storage, &_installation, &_eth);
   _routerProvisioning.begin(&_storage, &_installation, &_setupRouterConnection, &_eth);
@@ -216,24 +228,28 @@ void FirmwareApp::begin() {
 
   HttpPlaneGate::bindEthernet(&_eth);
   HttpPlaneGate::bindAuth(&_auth);
+  HttpPlaneGate::bindFactoryReset(&_factoryReset);
 
   CoinManager *coin = RenzFiConfig::ENABLE_COIN_MANAGER ? &_coin : nullptr;
   _accessPoints.begin(&_storage, &_eth, &_logger);
+  _contentFilter.begin(&_storage, &_logger);
+  _gamingPriority.begin(&_storage);
 
   _api.begin(&_storage, &_auth, &_sessions, &_promos, &_vouchers,
              coin, &_router, &_logger, &_events, &_eth,
              &_portalSessions, &_portalConfig, &_assetManager, &_rgb, &_health,
              &_buildMetadata, &_installation, &_mgmtAp, &_mgmtApLifecycle,
-             &_networkSettings, &_routerWorker, &_factoryReset, &_accessPoints);
+             &_networkSettings, &_routerWorker, &_factoryReset, &_accessPoints,
+             &_contentFilter, &_gamingPriority);
 
   if (_mgmtAp.isRunning()) {
     startSetupServices();
     SetupDnsPolicy::applySetupPhasePolicy();
   }
 
-  if (_installation.isReady()) {
-    salesTimeBegin();
-  }
+  // NTP may start once owner exists (not only Ready/Provisioned) so voucher
+  // wall-clock works on incomplete-wizard production installs.
+  salesTimeBegin();
 
   updateNetworkLifecycle();
 
@@ -265,6 +281,7 @@ void FirmwareApp::loop() {
     return;
   }
   MemoryDiagnostics::periodicLog();
+  MemoryDiagnostics::checkEthDmaQuiesce();
   _eth.loop();
   NetworkDiagnostics::loop();
 #if RENZFI_BURN_IN_DIAG
@@ -274,7 +291,17 @@ void FirmwareApp::loop() {
   _mgmtApLifecycle.loop();
 
   if (SetupDnsPolicy::isSetupLifecycleActive()) {
-    SetupDnsPolicy::applySetupPhasePolicy();
+    // SoftAP installer path: isolate outbound DNS.
+    // SoftAP already stopped (production yield) but install still pre-Ready
+    // (e.g. owner_created): must NOT re-clear DNS every loop — that permanently
+    // blocked NTP and voucher redeem (CLOCK_NOT_READY) while coin still worked.
+    if (_mgmtAp.isRunning()) {
+      SetupDnsPolicy::applySetupPhasePolicy();
+    } else if (_eth.hasIp()) {
+      SetupDnsPolicy::restoreProductionDns();
+    }
+  } else if (_eth.hasIp()) {
+    SetupDnsPolicy::restoreProductionDns();
   }
 
   updateNetworkLifecycle();
@@ -296,6 +323,9 @@ void FirmwareApp::loop() {
     // Health poll uses try-lock; also skip while voucher persist holds storage.
     if (!_vouchers.generateBusy()) {
       _storage.pollStorageHealth();
+    }
+    if (_storage.consumePortalSessionsStale()) {
+      _portalSessions.reloadFromStorage();
     }
   }
   if (_setupServerStarted) {
@@ -347,9 +377,33 @@ void FirmwareApp::refreshHealthSnapshots() {
   if (now - _lastHealthSnapshotMs < 2000U) return;
   _lastHealthSnapshotMs = now;
 
+  // Under portal coin/activation + Admin SPA load, defer SPIFFS capacity probes
+  // and sales SD reads so W5500 DMA headroom stays available for Core HTTP.
+  if (MemoryDiagnostics::shouldDeferNonCriticalStorageWork()) {
+    static uint32_t s_lastDeferLogMs = 0;
+    if (s_lastDeferLogMs == 0 || (now - s_lastDeferLogMs) >= 10000U) {
+      s_lastDeferLogMs = now;
+      Serial.println("[health-snapshot] defer storage-heavy work (portal+DMA)");
+    }
+    _router.refreshHealthCache();
+    vTaskDelay(1);
+    _sessions.refreshMergedActiveUserSnapshot(&_portalSessions);
+    const bool coinEnabled = RenzFiConfig::ENABLE_COIN_MANAGER;
+    DeviceIdentity::refreshRuntimeProfile(&_eth, &_storage, &_router, coinEnabled);
+    return;
+  }
+
+  // Yield between storage / router / sales phases so async_tcp on shared CPU1
+  // can reset TWDT during Admin login and dashboard poll storms.
   _storage.refreshRuntimeSnapshot();
+  vTaskDelay(1);
+  if (_storage.consumeSalesSummaryStale()) {
+    _sessions.invalidateSalesChartCache();
+  }
   _router.refreshHealthCache();
+  vTaskDelay(1);
   _sessions.refreshSalesSummarySnapshot();
+  vTaskDelay(1);
   _sessions.refreshMergedActiveUserSnapshot(&_portalSessions);
   _promos.ensureCacheLoaded();
   const bool coinEnabled = RenzFiConfig::ENABLE_COIN_MANAGER;
@@ -444,5 +498,6 @@ void FirmwareApp::registerProductionServices() {
   _productionRegistered = true;
   Serial.println(
       "[net] Production HTTP plane registered (Ethernet routes, server not restarted)");
+  _mgmtApLifecycle.notifyProductionPlaneReady();
   NetworkDiagnostics::printRegisteredInterfaces(&_eth, &_mgmtAp);
 }

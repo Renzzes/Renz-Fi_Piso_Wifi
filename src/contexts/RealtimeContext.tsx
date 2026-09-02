@@ -6,14 +6,21 @@ export type RealtimeContextValue = {
   fallbackPollMs: number | false;
   connectionLost: boolean;
   adminApiReachable: boolean;
+  /** Owner opt-in: EventSource + dashboard refetch. Off by default (standby). */
+  liveUpdatesEnabled: boolean;
+  setLiveUpdatesEnabled: (enabled: boolean) => void;
 };
+
+const noopSetLive = (_enabled: boolean) => {};
 
 const defaultValue: RealtimeContextValue = {
   sseConnected: false,
   sseReconnecting: false,
-  fallbackPollMs: 5000,
+  fallbackPollMs: false,
   connectionLost: false,
   adminApiReachable: false,
+  liveUpdatesEnabled: false,
+  setLiveUpdatesEnabled: noopSetLive,
 };
 
 export const RealtimeContext = createContext<RealtimeContextValue>(defaultValue);

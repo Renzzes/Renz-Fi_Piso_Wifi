@@ -31,6 +31,10 @@ class SetupServer : public IWebRouteProvider {
   void registerRoutes(WebServerManager &web) override;
   const char *providerName() const override;
 
+  // Same wizard HTML as GET /admin/setup. SoftAP `/` uses this so laptop
+  // Chrome does not stack a 302 body with the destination document.
+  void servePage(AsyncWebServerRequest *req);
+
  private:
   EthernetManager           *_eth          = nullptr;
   InstallationStateManager  *_installation = nullptr;

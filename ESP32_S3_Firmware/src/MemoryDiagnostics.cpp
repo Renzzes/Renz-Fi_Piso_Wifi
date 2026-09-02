@@ -52,7 +52,7 @@ void periodicLog() {
   const uint8_t inspection = g_inspectionActive ? 1 : 0;
   const uint8_t wifiCache  = WifiDiscoveryCache::hasAny() ? 1 : 0;
   const uint8_t portalActive =
-      g_portalSessions && g_portalSessions->hasActiveClientSession() ? 1 : 0;
+      g_portalSessions && g_portalSessions->hasOperationalPortalLoad() ? 1 : 0;
   // 255 = intentional UNKNOWN sentinel (stale/missing sample), not 255% CPU.
   const uint8_t rosCpu = RouterApiTransportGate::lastObservedCpuLoadPercent();
   const char *rosCpuLabel =
@@ -85,6 +85,36 @@ void periodicLog() {
   }
 
   DmaMemoryMonitor::logSnapshot("periodic-dma");
+  checkEthDmaQuiesce();
+}
+
+void checkEthDmaQuiesce() {
+  DmaMemoryMonitor::tickEmergencyRecovery();
+
+  // Emergency quiesce: when largest DMA falls below the W5500 RX survival
+  // floor (or a W5500 SPI bounce alloc just failed), drop SSE clients so
+  // Admin EventSource stops competing for SPI DMA bounce buffers. Portal
+  // coin/session Core continues; Admin reconnects later.
+  if (!DmaMemoryMonitor::isEthDmaCritical()) return;
+  if (!g_events || g_events->clientCount() == 0) return;
+  Serial.println(
+      "[http-quiesce] ETH DMA critical — closing SSE to protect W5500 RX");
+  DmaMemoryMonitor::logSnapshot("sse-quiesce-dma-critical");
+  g_events->closeAllClients();
+}
+
+bool hasOperationalPortalLoad() {
+  return g_portalSessions && g_portalSessions->hasOperationalPortalLoad();
+}
+
+bool shouldDeferNonCriticalStorageWork() {
+  if (!hasOperationalPortalLoad()) return false;
+  if (DmaMemoryMonitor::isEthDmaCritical()) return true;
+  if (!DmaMemoryMonitor::hasHttpServeHeadroom()) return true;
+  if (g_worker && g_worker->isBusy()) return true;
+  if (DmaMemoryMonitor::pacedHttpInFlight() > 0) return true;
+  return !DmaMemoryMonitor::hasDmaHeadroom(
+      DmaMemoryMonitor::kMinLargestDmaBlockForLargeAssetWithPortal);
 }
 
 }  // namespace MemoryDiagnostics

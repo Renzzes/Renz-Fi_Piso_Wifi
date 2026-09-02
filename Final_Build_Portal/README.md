@@ -22,11 +22,15 @@ The live router's native servlet files must remain in place:
 
 - `alogin.html`
 - `redirect.html`
-- `status.html`
 - `logout.html`
 - `error.html`
 - `errors.txt`
 - `api.json`
+
+**Overwrite `status.html`.** RouterOS `/status` is a customer portal page. The
+Renz-Fi overlay `status.html` is the same app as `login.html`. Leaving an older
+`status.html` on the router serves the previous light UI (or a broken mix of
+new HTML and old CSS) after the client is authenticated.
 
 Also preserve `rlogin.html`, `radvert.html`, `xml/`, and `css/style.css` when
 WISPr or advertisement support is enabled.
@@ -44,9 +48,10 @@ Preferred:
 
 | Local file | Router destination | Purpose |
 |---|---|---|
-| `login.html` | `hotspot/login.html` | Customer UI shell |
+| `login.html` | `hotspot/login.html` | Customer UI (unauthenticated `/login`) |
+| `status.html` | `hotspot/status.html` | **Required overwrite** — customer UI for `/status` |
 | `renzfi-app.js` | `hotspot/renzfi-app.js` | Portal logic (API base URL baked in) |
-| `renzfi-style.css` | `hotspot/renzfi-style.css` | Styles |
+| `renzfi-style.css` | `hotspot/renzfi-style.css` | Styles (must upload with status.html) |
 | `md5.js` | `hotspot/md5.js` | CHAP helper |
 | `Default-Banner.png` | `hotspot/Default-Banner.png` | Default banner |
 | `bg_music.mp3` | `hotspot/bg_music.mp3` | Optional audio |
@@ -113,7 +118,7 @@ replacement.
 
 1. Use a private/incognito browser session or clear the captive portal cache.
 2. Connect an unauthenticated client to the guest Wi-Fi.
-3. Open `http://10.20.0.1/login`.
+3. Confirm `/login` and `/status` both show the same Renz-Fi HUD (not the old light page).
 4. Confirm captive redirect and CHAP voucher form behavior.
 5. Confirm coin credits and purchased minutes.
 6. Confirm Done Paying reaches Connected.

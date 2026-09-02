@@ -21,11 +21,14 @@
 #include "ManagementApConfig.h"
 #include "ManagementApManager.h"
 #include "ExternalAccessPointManager.h"
+#include "ContentFilterManager.h"
+#include "GamingPriorityManager.h"
 #include "NetworkDiagnostics.h"
 #include "NetworkStatusModel.h"
 #include "PortalConfigManager.h"
 #include "ProductionHandoff.h"
 #include "RouterApiTransportGate.h"
+#include "RouterProvisioningApi.h"
 #include "SalesTime.h"
 #include "SetupProvisioningManager.h"
 #include "StoragePaths.h"
@@ -44,7 +47,9 @@ namespace {
 struct PsramJsonBody {
   char *buf = nullptr;
   size_t len = 0;
+  bool holdsSlot = false;
   ~PsramJsonBody() {
+    if (holdsSlot) DmaMemoryMonitor::releaseHttpSlot();
     if (buf) heap_caps_free(buf);
   }
 };
@@ -62,19 +67,70 @@ std::shared_ptr<PsramJsonBody> makePsramJsonBody(JsonDocument &doc) {
   return body;
 }
 
+void sendEthDmaLowJson(AsyncWebServerRequest *req, const char *detail) {
+  if (DmaMemoryMonitor::isEthDmaCritical()) {
+    Serial.printf("[http] drop reason=%s (ETH DMA critical, no socket I/O)\n",
+                  detail ? detail : "api-json");
+    DmaMemoryMonitor::logSnapshot("api-json-drop-critical");
+    return;
+  }
+  Serial.printf("[http] 503 reason=ETH_DMA_LOW detail=%s\n",
+                detail ? detail : "");
+  DmaMemoryMonitor::logSnapshot("api-json-dma-low");
+  AsyncWebServerResponse *res = req->beginResponse(
+      503, "application/json",
+      "{\"success\":false,\"error\":\"Ethernet DMA temporarily "
+      "exhausted\",\"code\":\"ETH_DMA_LOW\"}");
+  WebResponse::addCorsHeaders(res);
+  res->addHeader("Retry-After", "2");
+  req->send(res);
+}
+
 void sendJsonResponse(AsyncWebServerRequest *req, int httpStatus,
-                      JsonDocument &doc) {
+                      JsonDocument &doc, const String *setCookie = nullptr,
+                      bool liveness = false) {
+  // /api/health is session liveness — must not compete for paced JSON slots
+  // or the 3072 B HTTP-admit floor while Admin/Sales fan-out is in flight.
+  if (liveness) {
+    if (DmaMemoryMonitor::isEthDmaCritical()) {
+      Serial.println("[http] drop reason=api-health-liveness (ETH DMA critical)");
+      DmaMemoryMonitor::logSnapshot("api-health-drop-critical");
+      return;
+    }
+    if (!DmaMemoryMonitor::hasEthTransmitHeadroom()) {
+      sendEthDmaLowJson(req, "health-liveness");
+      return;
+    }
+  } else {
+    if (!WebResponse::ensureEthTransmitHeadroom(req, "api-json-admit")) return;
+    if (!DmaMemoryMonitor::tryAcquireHttpSlot()) {
+      Serial.println("[http] 503 reason=ETH_DMA_LOW detail=concurrency");
+      DmaMemoryMonitor::logSnapshot("api-json-concurrency");
+      sendEthDmaLowJson(req, "concurrency");
+      return;
+    }
+  }
+
   auto body = makePsramJsonBody(doc);
   if (!body) {
+    if (!liveness) DmaMemoryMonitor::releaseHttpSlot();
     req->send(500, "application/json",
               "{\"success\":false,\"error\":\"JSON alloc failed\","
               "\"code\":\"JSON_ALLOC_FAILED\"}");
     return;
   }
+  body->holdsSlot = !liveness;
+
   AsyncWebServerResponse *res = req->beginResponse(
       "application/json", body->len,
       [body](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
         if (!buffer || !body->buf || index >= body->len) return 0;
+        // Same ETH TX pause as large SPA streams: do not drive W5500
+        // setup_dma_priv_buffer when dma_largest is already below one frame.
+        if (DmaMemoryMonitor::isEthDmaCritical() ||
+            !DmaMemoryMonitor::hasEthTransmitHeadroom()) {
+          return RESPONSE_TRY_AGAIN;
+        }
         const size_t remain = body->len - index;
         const size_t n = remain < maxLen ? remain : maxLen;
         memcpy(buffer, reinterpret_cast<const uint8_t *>(body->buf) + index, n);
@@ -84,6 +140,9 @@ void sendJsonResponse(AsyncWebServerRequest *req, int httpStatus,
   res->setCode(httpStatus);
   WebResponse::addCorsHeaders(res);
   res->addHeader("Cache-Control", "no-store");
+  if (setCookie && setCookie->length() > 0) {
+    res->addHeader("Set-Cookie", *setCookie);
+  }
   req->send(res);
 }
 
@@ -110,6 +169,19 @@ bool parseExternalAccessPointId(const String &path, String &idOut) {
 bool parseExternalAccessPointCheckPath(const String &path, String &idOut) {
   const String prefix = "/api/access-points/";
   const String suffix = "/check";
+  if (!path.startsWith(prefix) || !path.endsWith(suffix)) return false;
+  if (path.length() <= prefix.length() + suffix.length()) return false;
+  const String rest =
+      path.substring(prefix.length(), path.length() - suffix.length());
+  if (rest.length() == 0 || rest.indexOf('/') >= 0) return false;
+  if (rest == "jobs") return false;
+  idOut = urlDecode(rest);
+  return idOut.length() > 0;
+}
+
+bool parseExternalAccessPointSyncPath(const String &path, String &idOut) {
+  const String prefix = "/api/access-points/";
+  const String suffix = "/sync";
   if (!path.startsWith(prefix) || !path.endsWith(suffix)) return false;
   if (path.length() <= prefix.length() + suffix.length()) return false;
   const String rest =
@@ -270,6 +342,7 @@ struct PortalAssetUpload {
   uint32_t startedAt = 0;
   size_t expectedTotal = 0;
   size_t bytesReceived = 0;
+  size_t lastLoggedBytes = 0;
 };
 
 struct FirmwareOtaUpload {
@@ -330,7 +403,9 @@ void ApiServer::begin(StorageManager       *storage,
                       NetworkSettingsManager *networkSettings,
                       RouterProvisioningWorker *routerWorker,
                       FactoryResetWorker *factoryReset,
-                      ExternalAccessPointManager *accessPoints) {
+                      ExternalAccessPointManager *accessPoints,
+                      ContentFilterManager *contentFilter,
+                      GamingPriorityManager *gamingPriority) {
   _server         = nullptr;
   _storage        = storage;
   _auth           = auth;
@@ -355,6 +430,8 @@ void ApiServer::begin(StorageManager       *storage,
   _routerWorker    = routerWorker;
   _factoryReset    = factoryReset;
   _accessPoints    = accessPoints;
+  _contentFilter   = contentFilter;
+  _gamingPriority  = gamingPriority;
   _backup.begin(_storage, _logger, _auth, _portalConfig, _assets, _installation);
 }
 
@@ -416,6 +493,16 @@ void ApiServer::sendOk(AsyncWebServerRequest *req, const String &message) {
   sendJsonResponse(req, 200, env);
 }
 
+void ApiServer::sendOkLiveness(AsyncWebServerRequest *req, JsonDocument &data) {
+  logRequest(req, "api-ok-liveness");
+  PsramJsonDocument envHeap;
+  JsonDocument &env = envHeap.doc();
+  env["success"] = true;
+  env["data"] = data;
+  env["message"] = "OK";
+  sendJsonResponse(req, 200, env, nullptr, true);
+}
+
 void ApiServer::sendError(AsyncWebServerRequest *req, int status,
                           const String &error, const String &code) {
   logRequest(req, "api-error");
@@ -430,6 +517,7 @@ void ApiServer::sendError(AsyncWebServerRequest *req, int status,
 void ApiServer::sendWorkerResult(AsyncWebServerRequest *req,
                                  const RouterProvisioningWorker::Result &result) {
   logRequest(req, result.ok ? "api-ok" : "api-error");
+  if (!WebResponse::ensureEthTransmitHeadroom(req, "worker-result")) return;
   AsyncWebServerResponse *res =
       req->beginResponse(result.httpStatus, "application/json", result.body);
   addCorsHeaders(res);
@@ -439,21 +527,113 @@ void ApiServer::sendWorkerResult(AsyncWebServerRequest *req,
 
 void ApiServer::sendAdminJobAccepted(AsyncWebServerRequest *req, uint32_t jobId,
                                      const char *typeLabel) {
-  DynamicJsonDocument doc(192);
+  PsramJsonDocument envHeap;
+  JsonDocument &doc = envHeap.doc();
   doc["success"] = true;
   JsonObject data = doc.createNestedObject("data");
   data["jobId"] = jobId;
   data["state"] = "queued";
   if (typeLabel && typeLabel[0]) data["type"] = typeLabel;
-  String body;
-  serializeJson(doc, body);
   logRequest(req, "admin-router-job-accepted");
   Serial.printf("[admin-router-api] accepted job=%u type=%s\n",
                 static_cast<unsigned>(jobId), typeLabel ? typeLabel : "?");
-  AsyncWebServerResponse *res = req->beginResponse(202, "application/json", body);
-  addCorsHeaders(res);
-  res->addHeader("Cache-Control", "no-store");
-  req->send(res);
+  sendJsonResponse(req, 202, doc);
+}
+
+void ApiServer::enqueueContentFilterSyncOrError(
+    AsyncWebServerRequest *req, const char *okMessage,
+    ContentFilterManager::SyncEnqueueStatus mutationStatus,
+    const char *extraFieldKey, const String *extraFieldValue) {
+  if (mutationStatus != ContentFilterManager::SyncEnqueueStatus::Ok) {
+    sendError(req, ContentFilterManager::syncEnqueueHttpStatus(mutationStatus),
+              ContentFilterManager::syncEnqueueMessage(mutationStatus),
+              ContentFilterManager::syncEnqueueCode(mutationStatus));
+    return;
+  }
+  if (!_contentFilter || !_routerWorker) {
+    sendError(req, 503, "Content filter unavailable", "INTERNAL_ERROR");
+    return;
+  }
+  HeapJsonDocument payload(RenzFiConfig::JSON_DOC_MEDIUM);
+  _contentFilter->buildSyncPayload(payload.doc());
+  String requestJson;
+  serializeJson(payload.doc(), requestJson);
+  const auto outcome = _routerWorker->enqueueContentFilterSync(requestJson);
+  if (!outcome.accepted) {
+    sendError(req, 503, outcome.rejectMessage ? outcome.rejectMessage
+                                              : "Router worker busy",
+              outcome.rejectCode ? outcome.rejectCode : "WORKER_BUSY");
+    return;
+  }
+  PsramJsonDocument dataHeap;
+  JsonObject data = dataHeap.doc().to<JsonObject>();
+  data["jobId"] = outcome.jobId;
+  data["state"] = "queued";
+  if (extraFieldKey && extraFieldValue) {
+    data[extraFieldKey] = *extraFieldValue;
+  }
+  sendOk(req, dataHeap.doc(), 202, okMessage);
+}
+
+void ApiServer::enqueueGamingPrioritySyncOrError(AsyncWebServerRequest *req,
+                                                 const char *okMessage) {
+  if (!_gamingPriority || !_routerWorker) {
+    sendError(req, 503, "Gaming priority unavailable", "INTERNAL_ERROR");
+    return;
+  }
+  HeapJsonDocument payload(RenzFiConfig::JSON_DOC_SMALL);
+  _gamingPriority->buildSyncPayload(payload.doc());
+  String requestJson;
+  serializeJson(payload.doc(), requestJson);
+  const auto outcome = _routerWorker->enqueueGamingPrioritySync(requestJson);
+  if (!outcome.accepted) {
+    sendError(req, 503, outcome.rejectMessage ? outcome.rejectMessage
+                                              : "Router worker busy",
+              outcome.rejectCode ? outcome.rejectCode : "WORKER_BUSY");
+    return;
+  }
+  PsramJsonDocument dataHeap;
+  JsonObject data = dataHeap.doc().to<JsonObject>();
+  data["jobId"] = outcome.jobId;
+  data["state"] = "queued";
+  sendOk(req, dataHeap.doc(), 202, okMessage);
+}
+
+bool ApiServer::pollWorkerJobOrError(AsyncWebServerRequest *req,
+                                     const char *urlPrefix, const char *opType,
+                                     const char *notFoundMessage,
+                                     RouterProvisioningWorker::JobRecord &job) {
+  if (!_routerWorker) {
+    sendError(req, 503, "Router worker unavailable", "INTERNAL_ERROR");
+    return false;
+  }
+  String tail = req->url().substring(strlen(urlPrefix));
+  tail.trim();
+  const uint32_t jobId = static_cast<uint32_t>(tail.toInt());
+  if (jobId == 0 || !_routerWorker->pollJob(jobId, job) ||
+      job.opType != opType) {
+    sendError(req, 404, notFoundMessage, "NOT_FOUND");
+    return false;
+  }
+  return true;
+}
+
+void ApiServer::sendWorkerJobPollOk(
+    AsyncWebServerRequest *req,
+    const RouterProvisioningWorker::JobRecord &job) {
+  PsramJsonDocument dataHeap;
+  JsonObject data = dataHeap.doc().to<JsonObject>();
+  data["jobId"] = job.jobId;
+  data["state"] = RouterProvisioningWorker::jobStateLabel(job.state);
+  const bool terminal =
+      job.state == RouterProvisioningWorker::JobState::Completed ||
+      job.state == RouterProvisioningWorker::JobState::Failed;
+  if (terminal) {
+    data["ok"] = job.result.ok;
+    data["httpStatus"] = job.result.httpStatus;
+    if (job.result.body.length() > 0) data["result"] = job.result.body;
+  }
+  sendOk(req, dataHeap.doc());
 }
 
 String ApiServer::getBody(AsyncWebServerRequest *req) {
@@ -573,7 +753,7 @@ void ApiServer::registerSetupRoutes(WebServerManager &web,
         JsonArray perms = data["session"]["permissions"].to<JsonArray>();
         _auth->fillOperatorPermissions(perms);
       }
-      sendOk(req, data);
+      sendOkLiveness(req, data);
       return;
     }
 
@@ -686,7 +866,7 @@ void ApiServer::registerSetupRoutes(WebServerManager &web,
       mgmtApObj["ip"]               = nullptr;
     }
 
-    sendOk(req, data);
+    sendOkLiveness(req, data);
   });
 
   // ── Auth ─────────────────────────────────────────────────────────────────
@@ -694,11 +874,17 @@ void ApiServer::registerSetupRoutes(WebServerManager &web,
       "/api/auth/login", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
     RENZFI_APPLIANCE_GATE(req);
-        DynamicJsonDocument body(RenzFiConfig::JSON_DOC_SMALL);
-        String raw = getBody(req);
-        if (raw.length() > 0) deserializeJson(body, raw);
+        // CPU JSON — PSRAM. Login previously bypassed sendOk (Set-Cookie) and
+        // allocated 3× JSON_DOC_SMALL + Arduino String serialize on INTERNAL
+        // (ALWAYSINTERNAL=4096). That overlaps the dashboard fan-out / SPA TX.
+        PsramJsonDocument bodyHeap;
+        JsonDocument &body = bodyHeap.doc();
+        if (req->_tempObject) {
+          deserializeJson(body, static_cast<const char *>(req->_tempObject));
+        }
 
-        DynamicJsonDocument response(RenzFiConfig::JSON_DOC_SMALL);
+        PsramJsonDocument responseHeap;
+        JsonDocument &response = responseHeap.doc();
         String              username   = body["username"]   | "";
         String              password   = body["password"]   | "";
         bool                rememberIp = body["rememberIp"] | false;
@@ -708,18 +894,12 @@ void ApiServer::registerSetupRoutes(WebServerManager &web,
           sendError(req, 401, "Invalid password", "INVALID_CREDENTIALS");
           return;
         }
-        DynamicJsonDocument envelope(RenzFiConfig::JSON_DOC_SMALL);
+        PsramJsonDocument envelopeHeap;
+        JsonDocument &envelope = envelopeHeap.doc();
         envelope["success"] = true;
         envelope["data"].set(response.as<JsonObject>());
         envelope["message"] = "OK";
-        String payload;
-        serializeJson(envelope, payload);
-        AsyncWebServerResponse *res =
-            req->beginResponse(200, "application/json", payload);
-        addCorsHeaders(res);
-        res->addHeader("Set-Cookie", setCookieVal);
-        res->addHeader("Cache-Control", "no-store");
-        req->send(res);
+        sendJsonResponse(req, 200, envelope, &setCookieVal);
       },
       nullptr, bodyCollect);
 
@@ -1208,6 +1388,27 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
       data["routerCache"]["populated"] = false;
     }
 
+    if (_routerProvisioning) {
+      routerProvisioningFillNetworkModeStatus(_routerProvisioning,
+                                            data.as<JsonObject>());
+      if (_router) {
+        DynamicJsonDocument cacheDoc(RenzFiConfig::JSON_DOC_MEDIUM);
+        if (_router->fillRouterCache(cacheDoc)) {
+          String boardLower =
+              String(cacheDoc["routerOs"]["boardName"] | "") + " " +
+              String(cacheDoc["identity"] | "");
+          boardLower.toLowerCase();
+          if (boardLower.indexOf("hex") >= 0 ||
+              boardLower.indexOf("rb750") >= 0 ||
+              boardLower.indexOf("rb760") >= 0) {
+            JsonObject network = data["networkProvisioning"].to<JsonObject>();
+            network["externalApOnly"] = true;
+            network["noWirelessCapabilityDetected"] = true;
+          }
+        }
+      }
+    }
+
     data["esp32"]["uptime"]              = String(millis() / 1000) + "s";
     data["esp32"]["lastSeen"]            = nullptr;
     {
@@ -1291,7 +1492,10 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
   _server->on("/api/storage/status", HTTP_GET, [this](AsyncWebServerRequest *req) {
     RENZFI_PROD_GATE(req);
     if (!requireAuth(req)) return;
-    DynamicJsonDocument data(RenzFiConfig::JSON_DOC_MEDIUM);
+    // Dashboard StorageHealthCard polls this on the same cadence as status.
+    // JSON_DOC_MEDIUM on default heap was the N16R8 INTERNAL shredder class.
+    PsramJsonDocument dataHeap;
+    JsonDocument &data = dataHeap.doc();
     _storage->fillStorageStatus(data.to<JsonObject>());
     Serial.printf(
         "[storage-api] status snapshot state=%s recoveryInProgress=%s\n",
@@ -1530,6 +1734,10 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
                     "FACTORY_RESET_IN_PROGRESS");
           return;
         }
+        // Drop SSE immediately so Admin EventSource cannot keep allocating
+        // W5500 TX while FactoryResetWorker performs storage teardown.
+        if (_events) _events->closeAllClients();
+        Serial.println("[http-quiesce] factory-reset busy — communication quiesced");
         DynamicJsonDocument envelope(256);
         envelope["success"] = true;
         JsonObject data     = envelope.createNestedObject("data");
@@ -1816,15 +2024,69 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
         String mac = body["mac"] | "";
-        bool removed = false;
-        if (_portalSessions && _portalSessions->reset(mac)) {
-          removed = true;
-        } else if (_portalSessions) {
-          _portalSessions->deferRouterDisconnect(mac);
+        if (mac.isEmpty()) {
+          sendError(req, 400, "mac field required", "MISSING_MAC");
+          return;
         }
-        if (_sessions->disconnect(mac)) removed = true;
-        if (removed) sendOk(req);
-        else sendError(req, 404, "Active user not found", "USER_NOT_FOUND");
+        String errorCode;
+        if (_portalSessions &&
+            _portalSessions->suspendInternet(mac, &errorCode)) {
+          sendOk(req, "Internet suspended — time preserved");
+          return;
+        }
+        sendError(req, 404,
+                  errorCode.length() > 0 ? errorCode : "Active user not found",
+                  errorCode.length() > 0 ? errorCode : "USER_NOT_FOUND");
+      },
+      nullptr, bodyCollect);
+
+  _server->on(
+      "/api/users/reconnect", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        DynamicJsonDocument body(256);
+        String raw = getBody(req);
+        if (raw.length() > 0) deserializeJson(body, raw);
+        String mac = body["mac"] | "";
+        if (mac.isEmpty()) {
+          sendError(req, 400, "mac field required", "MISSING_MAC");
+          return;
+        }
+        String errorCode;
+        if (_portalSessions &&
+            _portalSessions->reconnectInternet(mac, &errorCode)) {
+          sendOk(req, "Internet reconnect queued");
+          return;
+        }
+        sendError(req, 404,
+                  errorCode.length() > 0 ? errorCode : "Active user not found",
+                  errorCode.length() > 0 ? errorCode : "USER_NOT_FOUND");
+      },
+      nullptr, bodyCollect);
+
+  _server->on(
+      "/api/users/terminate", HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        DynamicJsonDocument body(256);
+        String raw = getBody(req);
+        if (raw.length() > 0) deserializeJson(body, raw);
+        String mac = body["mac"] | "";
+        if (mac.isEmpty()) {
+          sendError(req, 400, "mac field required", "MISSING_MAC");
+          return;
+        }
+        String errorCode;
+        if (_portalSessions &&
+            _portalSessions->ownerTerminateSession(mac, &errorCode)) {
+          sendOk(req, "Session terminated by owner");
+          return;
+        }
+        sendError(req, 404,
+                  errorCode.length() > 0 ? errorCode : "Active user not found",
+                  errorCode.length() > 0 ? errorCode : "USER_NOT_FOUND");
       },
       nullptr, bodyCollect);
 
@@ -1842,12 +2104,15 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
           return;
         }
         if (_portalSessions && _portalSessions->hasSession(mac)) {
-          // Owner pause is an operational override — not subject to the
-          // customer's per-session pause budget.
-          if (_portalSessions->pause(mac, nullptr, false))
+          String errorCode;
+          if (_portalSessions->pause(mac, &errorCode))
             sendOk(req, "Session paused");
+          else if (errorCode == "PAUSE_LIMIT_REACHED")
+            sendError(req, 409, "Pause limit reached for this session",
+                      "PAUSE_LIMIT_REACHED");
           else
-            sendError(req, 400, "Session cannot be paused", "INVALID_STATE");
+            sendError(req, 400, "Session cannot be paused",
+                      errorCode.isEmpty() ? "INVALID_STATE" : errorCode.c_str());
           return;
         }
         if (_sessions && _sessions->pause(mac)) sendOk(req, "Session paused");
@@ -1903,6 +2168,7 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
             sendError(req, 404, "History file not found", "HISTORY_NOT_FOUND");
             return;
           }
+          if (!WebResponse::ensureEthTransmitHeadroom(req, "history-download")) return;
           AsyncWebServerResponse *res =
               req->beginResponse(SD, path.c_str(), "application/x-ndjson");
           res->addHeader(
@@ -1979,6 +2245,7 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
               [this](AsyncWebServerRequest *req) {
     RENZFI_PROD_GATE(req);
                 if (!requireOwnerAuth(req)) return;
+                if (!WebResponse::ensureEthTransmitHeadroom(req, "sales-export")) return;
                 String csv;
                 String filename;
                 _sessions->buildSalesCsv(csv, filename);
@@ -2065,16 +2332,26 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
       [this](AsyncWebServerRequest *req, bool isBanner, const uint8_t *data,
              size_t len, size_t index, size_t total, bool final,
              const char *via, const String &filename) {
-        Serial.printf(
-            "[portal-upload] %s kind=%s index=%u len=%u total=%u final=%s "
-            "filename=%s contentLength=%u contentType=%s\n",
-            via, isBanner ? "banner" : "music", (unsigned)index, (unsigned)len,
-            (unsigned)total, final ? "yes" : "no", filename.c_str(),
-            (unsigned)req->contentLength(), req->contentType().c_str());
-
         const size_t maxBytes =
             isBanner ? RenzFiConfig::PORTAL_BANNER_MAX_BYTES
                      : RenzFiConfig::PORTAL_MUSIC_MAX_BYTES;
+
+        // Per-chunk Serial on a ~4 MiB upload is thousands of lines and stalls
+        // async_tcp / SD writes. Log start, ~256 KiB progress, errors, and end.
+        const bool logChunk =
+            index == 0 || final ||
+            (gPortalUpload.bytesReceived >=
+             gPortalUpload.lastLoggedBytes + (256U * 1024U));
+        if (logChunk && !gPortalUpload.rejected) {
+          Serial.printf(
+              "[portal-upload] %s kind=%s index=%u len=%u total=%u final=%s "
+              "filename=%s contentLength=%u written=%u\n",
+              via, isBanner ? "banner" : "music", (unsigned)index,
+              (unsigned)len, (unsigned)total, final ? "yes" : "no",
+              filename.c_str(), (unsigned)req->contentLength(),
+              (unsigned)gPortalUpload.bytesReceived);
+          gPortalUpload.lastLoggedBytes = gPortalUpload.bytesReceived;
+        }
 
         if (index == 0) {
           if (gPortalUpload.active && gPortalUpload.owner != req) {
@@ -2107,14 +2384,19 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
           gPortalUpload.rejectReason = "";
           gPortalUpload.streamActive = false;
           gPortalUpload.streamFinished = false;
+          // Multipart file callbacks often pass total=0 until the final chunk.
+          // Prefer known total; otherwise leave 0 and finalize size on last chunk.
           gPortalUpload.expectedTotal = total;
           gPortalUpload.bytesReceived = 0;
+          gPortalUpload.lastLoggedBytes = 0;
 
           if (total > maxBytes) {
             gPortalUpload.rejected = true;
             gPortalUpload.rejectReason =
-                isBanner ? "Banner exceeds 2 MB limit"
-                         : "Music exceeds 2 MB limit";
+                isBanner ? "Banner exceeds 4 MB limit"
+                         : "Music exceeds 4 MB limit";
+            Serial.printf("[portal-upload] REJECT begin size total=%u max=%u\n",
+                          (unsigned)total, (unsigned)maxBytes);
             return;
           }
 
@@ -2122,9 +2404,11 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
             String lower = filename;
             lower.toLowerCase();
             if (!lower.endsWith(".png") && !lower.endsWith(".jpg") &&
-                !lower.endsWith(".jpeg")) {
+                !lower.endsWith(".jpeg") && !lower.endsWith(".mp4")) {
               gPortalUpload.rejected = true;
-              gPortalUpload.rejectReason = "Only PNG and JPEG banners are allowed";
+              gPortalUpload.rejectReason =
+                  "Only PNG, JPEG, and MP4 banners are allowed";
+              Serial.println("[portal-upload] REJECT begin extension");
               return;
             }
           }
@@ -2133,6 +2417,7 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
               !filename.endsWith(".mp3") && !filename.endsWith(".MP3")) {
             gPortalUpload.rejected = true;
             gPortalUpload.rejectReason = "Only MP3 files are allowed";
+            Serial.println("[portal-upload] REJECT begin extension");
             return;
           }
 
@@ -2148,6 +2433,8 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
                   began.errorMessage.length() > 0
                       ? began.errorMessage
                       : String("Unable to begin upload");
+              Serial.printf("[portal-upload] REJECT beginSave: %s\n",
+                            gPortalUpload.rejectReason.c_str());
             }
           }
         }
@@ -2168,6 +2455,10 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
                 chunk.errorMessage.length() > 0
                     ? chunk.errorMessage
                     : String("Unable to write upload chunk");
+            Serial.printf(
+                "[portal-upload] REJECT append at written=%u index=%u: %s\n",
+                (unsigned)gPortalUpload.bytesReceived, (unsigned)index,
+                gPortalUpload.rejectReason.c_str());
             _assets->abortSaveAsset();
             return;
           }
@@ -2175,6 +2466,7 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
         } else if (len > 0) {
           gPortalUpload.rejected = true;
           gPortalUpload.rejectReason = "Asset manager unavailable";
+          Serial.println("[portal-upload] REJECT stream inactive");
         }
 
         if (isFinal) gPortalUpload.streamFinished = true;
@@ -2499,6 +2791,7 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
                   sendError(req, 500, "Backup file missing", "BACKUP_FAILED");
                   return;
                 }
+                if (!WebResponse::ensureEthTransmitHeadroom(req, "backup-download")) return;
 
                 const char *mime =
                     useZip ? "application/zip" : "application/json";
@@ -2943,7 +3236,10 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
               [this](AsyncWebServerRequest *req) {
     RENZFI_PROD_GATE(req);
                 if (!requireAuth(req)) return;
-                DynamicJsonDocument data(RenzFiConfig::JSON_DOC_SMALL);
+                // Dashboard polls this every fallbackPollMs. JSON_DOC_SMALL
+                // (2048) is below ALWAYSINTERNAL and lands in DMA SRAM.
+                PsramJsonDocument dataHeap;
+                JsonDocument &data = dataHeap.doc();
                 if (_coin) {
                   _coin->diagnostics(data);
                 } else {
@@ -3082,6 +3378,32 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
                 if (!requireOwnerAuth(req)) return;
                 DynamicJsonDocument result(RenzFiConfig::JSON_DOC_SMALL);
                 const bool ok = _router && _router->fillWireless(result);
+                if (_routerProvisioning) {
+                  routerProvisioningFillWirelessStatus(
+                      _routerProvisioning, result.as<JsonObject>());
+                }
+                if (_router) {
+                  DynamicJsonDocument cacheDoc(RenzFiConfig::JSON_DOC_MEDIUM);
+                  if (_router->fillRouterCache(cacheDoc)) {
+                    String boardLower =
+                        String(cacheDoc["routerOs"]["boardName"] | "") + " " +
+                        String(cacheDoc["identity"] | "");
+                    boardLower.toLowerCase();
+                    if (boardLower.indexOf("hex") >= 0 ||
+                        boardLower.indexOf("rb750") >= 0 ||
+                        boardLower.indexOf("rb760") >= 0) {
+                      result["externalApOnly"] = true;
+                      result["noWirelessCapabilityDetected"] = true;
+                      result["configured"] = false;
+                    }
+                  }
+                }
+                if (result["externalApOnly"] | false) {
+                  result.remove("interface");
+                  result.remove("interfaceId");
+                  result.remove("band");
+                  result["guestTopologyMode"] = "external_access_point";
+                }
                 const char *message =
                     ok ? "Wireless settings loaded from cache"
                        : (result["error"] | "Failed to load wireless settings");
@@ -3350,13 +3672,89 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
               [this](AsyncWebServerRequest *req) {
     RENZFI_PROD_GATE(req);
     if (!requireOwnerAuth(req)) return;
-    if (!_accessPoints) {
-      sendError(req, 503, "Access point registry unavailable", "INTERNAL_ERROR");
-      return;
-    }
     uint32_t jobId = 0;
     if (!parseExternalAccessPointJobPath(req->url(), jobId)) {
       sendError(req, 404, "Access point job not found", "NOT_FOUND");
+      return;
+    }
+
+    // Prefer MikroTik-backed Check jobs (Router Worker), then legacy Sync jobs.
+    if (_routerWorker) {
+      RouterProvisioningWorker::JobRecord job;
+      if (_routerWorker->pollJob(jobId, job) &&
+          job.opType == "access-point-check") {
+        PsramJsonDocument dataHeap;
+        JsonObject data = dataHeap.doc().to<JsonObject>();
+        data["jobId"] = job.jobId;
+        data["state"] = RouterProvisioningWorker::jobStateLabel(job.state);
+        const bool terminal =
+            job.state == RouterProvisioningWorker::JobState::Completed ||
+            job.state == RouterProvisioningWorker::JobState::Failed;
+        if (terminal) {
+          data["ok"] = job.result.ok;
+          data["httpStatus"] = job.result.httpStatus;
+          bool online = false;
+          String accessPointId;
+          String ipAddress;
+          String method = "arp_ping";
+          String status = "unknown";
+          String message;
+          String errorCode;
+          if (!job.result.body.isEmpty()) {
+            HeapJsonDocument parsed(RenzFiConfig::JSON_DOC_MEDIUM);
+            if (!deserializeJson(parsed.doc(), job.result.body)) {
+              JsonObjectConst root = parsed.doc().as<JsonObjectConst>();
+              JsonObjectConst payload =
+                  root["data"].is<JsonObjectConst>()
+                      ? root["data"].as<JsonObjectConst>()
+                      : root;
+              online = payload["online"] | false;
+              accessPointId = payload["accessPointId"] | "";
+              ipAddress = payload["ipAddress"] | payload["managementIp"] | "";
+              method = payload["method"] | "arp_ping";
+              status = payload["status"] | (online ? "online" : "unreachable");
+              message = root["message"] | "";
+              errorCode = payload["errorCode"] | root["code"] | "";
+              if (message.isEmpty()) {
+                message = online ? "Online" : "Offline";
+              }
+            } else if (!job.result.ok) {
+              status = "unknown";
+              message = "Access point check failed";
+              errorCode = "AP_CHECK_FAILED";
+            }
+          } else if (!job.result.ok) {
+            status = "unknown";
+            message = "Access point check failed";
+            errorCode = "AP_CHECK_FAILED";
+          }
+
+          if (accessPointId.length() > 0) data["accessPointId"] = accessPointId;
+          if (ipAddress.length() > 0) {
+            data["ipAddress"] = ipAddress;
+            data["managementIp"] = ipAddress;
+          }
+          data["online"] = online;
+          data["method"] = method;
+          data["status"] = status;
+          data["latencyMs"] = nullptr;
+          if (errorCode.length() > 0) data["errorCode"] = errorCode;
+          if (message.length() > 0) data["message"] = message;
+
+          if (job.state == RouterProvisioningWorker::JobState::Completed &&
+              _accessPoints && accessPointId.length() > 0 &&
+              (status == "online" || status == "unreachable")) {
+            _accessPoints->applyMikroTikCheckResult(accessPointId, online,
+                                                    method.c_str(), 0);
+          }
+        }
+        sendOk(req, dataHeap.doc(), "Access point job");
+        return;
+      }
+    }
+
+    if (!_accessPoints) {
+      sendError(req, 503, "Access point registry unavailable", "INTERNAL_ERROR");
       return;
     }
     ExternalAccessPointManager::CheckJobSnapshot snap;
@@ -3371,6 +3769,11 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
     data["state"] = snap.state;
     data["ok"] = snap.ok;
     data["status"] = snap.status;
+    data["online"] =
+        snap.ok && snap.status &&
+        (strcmp(snap.status, "online") == 0 ||
+         strcmp(snap.status, "network_reachable") == 0 ||
+         strcmp(snap.status, "management_reachable") == 0);
     if (snap.latencyValid) {
       data["latencyMs"] = snap.latencyMs;
     } else {
@@ -3394,8 +3797,8 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
 
     PsramJsonDocument listHeap;
     _accessPoints->fillList(listHeap.doc());
-    DynamicJsonDocument detectReq(RenzFiConfig::JSON_DOC_MEDIUM);
-    JsonArray registered = detectReq["registeredIps"].to<JsonArray>();
+    PsramJsonDocument detectReq;
+    JsonArray registered = detectReq.doc()["registeredIps"].to<JsonArray>();
     if (listHeap.doc()["accessPoints"].is<JsonArrayConst>()) {
       for (JsonObjectConst row : listHeap.doc()["accessPoints"].as<JsonArrayConst>()) {
         const String ip = row["managementIp"] | "";
@@ -3403,7 +3806,7 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
       }
     }
     String requestJson;
-    serializeJson(detectReq, requestJson);
+    serializeJson(detectReq.doc(), requestJson);
 
     const auto outcome = _routerWorker->enqueueAccessPointDetect(requestJson);
     if (!outcome.accepted) {
@@ -3462,23 +3865,73 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
       sendError(req, 503, "Access point registry unavailable", "INTERNAL_ERROR");
       return;
     }
+    String syncId;
+    if (parseExternalAccessPointSyncPath(req->url(), syncId)) {
+      uint32_t jobId = 0;
+      const ExternalAccessPoint::CheckEnqueueStatus status =
+          _accessPoints->enqueueSync(syncId, jobId);
+      if (status != ExternalAccessPoint::CheckEnqueueStatus::Ok) {
+        sendError(req, ExternalAccessPoint::checkEnqueueHttpStatus(status),
+                  ExternalAccessPoint::checkEnqueueMessage(status),
+                  ExternalAccessPoint::checkEnqueueCode(status));
+        return;
+      }
+      PsramJsonDocument dataHeap;
+      JsonObject data = dataHeap.doc().to<JsonObject>();
+      data["jobId"] = jobId;
+      data["accessPointId"] = syncId;
+      data["state"] = "queued";
+      sendOk(req, dataHeap.doc(), 202, "Access point sync queued");
+      return;
+    }
     String id;
     if (!parseExternalAccessPointCheckPath(req->url(), id)) {
       sendError(req, 404, "Access point not found", "NOT_FOUND");
       return;
     }
-    uint32_t jobId = 0;
-    const ExternalAccessPoint::CheckEnqueueStatus status =
-        _accessPoints->enqueueCheck(id, jobId);
-    if (status != ExternalAccessPoint::CheckEnqueueStatus::Ok) {
-      sendError(req, ExternalAccessPoint::checkEnqueueHttpStatus(status),
-                ExternalAccessPoint::checkEnqueueMessage(status),
-                ExternalAccessPoint::checkEnqueueCode(status));
+    if (!_routerWorker || !_accessPoints) {
+      sendError(req, 503, "Access point check unavailable", "INTERNAL_ERROR");
       return;
     }
+
+    PsramJsonDocument apHeap;
+    const ExternalAccessPoint::CrudStatus getStatus =
+        _accessPoints->getById(id, apHeap.doc());
+    if (getStatus != ExternalAccessPoint::CrudStatus::Ok) {
+      sendError(req, ExternalAccessPoint::crudHttpStatus(getStatus),
+                ExternalAccessPoint::crudMessage(getStatus),
+                ExternalAccessPoint::crudCode(getStatus));
+      return;
+    }
+    const String managementIp = apHeap.doc()["managementIp"] | "";
+    const bool enabled = apHeap.doc()["enabled"] | false;
+    if (!enabled) {
+      sendError(req, 400, "Access point is disabled", "ACCESS_POINT_DISABLED");
+      return;
+    }
+    if (managementIp.length() == 0) {
+      sendError(req, 400, "Access point management IP missing", "INVALID_IP");
+      return;
+    }
+
+    DynamicJsonDocument checkReq(RenzFiConfig::JSON_DOC_SMALL);
+    checkReq["accessPointId"] = id;
+    checkReq["managementIp"] = managementIp;
+    String requestJson;
+    serializeJson(checkReq, requestJson);
+
+    const auto outcome = _routerWorker->enqueueAccessPointCheck(requestJson);
+    if (!outcome.accepted) {
+      const char *code = outcome.rejectCode ? outcome.rejectCode : "ROUTER_WORKER_BUSY";
+      const char *message = outcome.rejectMessage ? outcome.rejectMessage
+                                                  : "Router worker is busy";
+      sendError(req, 503, message, code);
+      return;
+    }
+
     PsramJsonDocument dataHeap;
     JsonObject data = dataHeap.doc().to<JsonObject>();
-    data["jobId"] = jobId;
+    data["jobId"] = outcome.jobId;
     data["accessPointId"] = id;
     data["state"] = "queued";
     sendOk(req, dataHeap.doc(), 202, "Access point check queued");
@@ -3554,6 +4007,192 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
   _server->on("/api/access-points/*", HTTP_GET, accessPointItem);
   _server->on("/api/access-points/*", HTTP_PUT, accessPointItem, nullptr, bodyCollect);
   _server->on("/api/access-points/*", HTTP_DELETE, accessPointItem);
+
+  // Content filtering — guest-network domain blocking (owner, Router Worker apply).
+  _server->on(AsyncURIMatcher::exact("/api/content-filter"), HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_contentFilter) {
+      sendError(req, 503, "Content filter unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    PsramJsonDocument heap;
+    _contentFilter->fillList(heap.doc());
+    sendOk(req, heap.doc());
+  });
+
+  _server->on(
+      AsyncURIMatcher::exact("/api/content-filter"), HTTP_PUT,
+      [this](AsyncWebServerRequest *req) {
+        RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        if (!_contentFilter || !_routerWorker) {
+          sendError(req, 503, "Content filter unavailable", "INTERNAL_ERROR");
+          return;
+        }
+        PsramJsonDocument bodyHeap;
+        const String raw = getBody(req);
+        if (raw.length() == 0 ||
+            deserializeJson(bodyHeap.doc(), raw) ||
+            bodyHeap.doc()["enabled"].isNull()) {
+          sendError(req, 400, "Invalid JSON body", "INVALID_REQUEST");
+          return;
+        }
+        const bool enabled = bodyHeap.doc()["enabled"].as<bool>();
+        const auto status = _contentFilter->setEnabled(enabled);
+        enqueueContentFilterSyncOrError(req, "Content filter sync queued", status);
+      },
+      nullptr, bodyCollect);
+
+  _server->on(
+      AsyncURIMatcher::exact("/api/content-filter/domains"), HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+        RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        if (!_contentFilter || !_routerWorker) {
+          sendError(req, 503, "Content filter unavailable", "INTERNAL_ERROR");
+          return;
+        }
+        PsramJsonDocument bodyHeap;
+        const String raw = getBody(req);
+        if (raw.length() == 0 || deserializeJson(bodyHeap.doc(), raw)) {
+          sendError(req, 400, "Invalid JSON body", "INVALID_REQUEST");
+          return;
+        }
+        String normalized;
+        const auto status =
+            _contentFilter->addDomain(bodyHeap.doc()["domain"] | "", normalized);
+        enqueueContentFilterSyncOrError(req, "Blocked domain queued for MikroTik apply",
+                                        status, "domain", &normalized);
+      },
+      nullptr, bodyCollect);
+
+  _server->on(
+      AsyncURIMatcher::exact("/api/content-filter/sync"), HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+        RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        enqueueContentFilterSyncOrError(req, "Content filter sync queued");
+      });
+
+  _server->on("/api/content-filter/jobs/*", HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    RouterProvisioningWorker::JobRecord job;
+    if (!pollWorkerJobOrError(req, "/api/content-filter/jobs/",
+                              "content-filter-sync",
+                              "Content filter job not found", job)) {
+      return;
+    }
+    const bool terminal =
+        job.state == RouterProvisioningWorker::JobState::Completed ||
+        job.state == RouterProvisioningWorker::JobState::Failed;
+    if (terminal && _contentFilter && job.result.body.length() > 0) {
+      HeapJsonDocument resultDoc(RenzFiConfig::JSON_DOC_SMALL);
+      if (!deserializeJson(resultDoc.doc(), job.result.body)) {
+        JsonObjectConst payload = resultDoc.doc().as<JsonObjectConst>();
+        JsonObjectConst inner = payload["data"].as<JsonObjectConst>();
+        const char *message = payload["message"] | "";
+        _contentFilter->applySyncResult(inner, job.result.ok, String(message));
+      }
+    }
+    sendWorkerJobPollOk(req, job);
+  });
+
+  _server->on("/api/content-filter/domains/*", HTTP_DELETE,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_contentFilter || !_routerWorker) {
+      sendError(req, 503, "Content filter unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    const String prefix = "/api/content-filter/domains/";
+    String domain = req->url().substring(prefix.length());
+    domain.trim();
+    if (domain.isEmpty()) {
+      sendError(req, 400, "Domain is required", "INVALID_REQUEST");
+      return;
+    }
+    domain.replace("%2E", ".");
+    domain.replace("%2e", ".");
+    const auto status = _contentFilter->removeDomain(domain);
+    enqueueContentFilterSyncOrError(req, "Blocked domain removal queued", status);
+  });
+
+  // Gaming priority — guest-network QoS pilot (owner, manual Router Worker apply).
+  _server->on(AsyncURIMatcher::exact("/api/gaming-priority"), HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    if (!_gamingPriority) {
+      sendError(req, 503, "Gaming priority unavailable", "INTERNAL_ERROR");
+      return;
+    }
+    PsramJsonDocument heap;
+    _gamingPriority->fillJson(heap.doc());
+    sendOk(req, heap.doc());
+  });
+
+  _server->on(
+      AsyncURIMatcher::exact("/api/gaming-priority"), HTTP_PUT,
+      [this](AsyncWebServerRequest *req) {
+        RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        if (!_gamingPriority) {
+          sendError(req, 503, "Gaming priority unavailable", "INTERNAL_ERROR");
+          return;
+        }
+        PsramJsonDocument bodyHeap;
+        const String raw = getBody(req);
+        if (raw.length() == 0 || deserializeJson(bodyHeap.doc(), raw)) {
+          sendError(req, 400, "Invalid JSON body", "INVALID_REQUEST");
+          return;
+        }
+        String error;
+        if (!_gamingPriority->updateFromJson(bodyHeap.doc().as<JsonObjectConst>(),
+                                             error)) {
+          sendError(req, 400, error, "INVALID_GAMING_PRIORITY");
+          return;
+        }
+        PsramJsonDocument outHeap;
+        _gamingPriority->fillJson(outHeap.doc());
+        sendOk(req, outHeap.doc(), 200, "Gaming priority configuration saved");
+      },
+      nullptr, bodyCollect);
+
+  _server->on(
+      AsyncURIMatcher::exact("/api/gaming-priority/apply"), HTTP_POST,
+      [this](AsyncWebServerRequest *req) {
+        RENZFI_PROD_GATE(req);
+        if (!requireOwnerAuth(req)) return;
+        enqueueGamingPrioritySyncOrError(req, "Gaming priority apply queued");
+      });
+
+  _server->on("/api/gaming-priority/jobs/*", HTTP_GET,
+              [this](AsyncWebServerRequest *req) {
+    RENZFI_PROD_GATE(req);
+    if (!requireOwnerAuth(req)) return;
+    RouterProvisioningWorker::JobRecord job;
+    if (!pollWorkerJobOrError(req, "/api/gaming-priority/jobs/",
+                              "gaming-priority-sync",
+                              "Gaming priority job not found", job)) {
+      return;
+    }
+    const bool terminal =
+        job.state == RouterProvisioningWorker::JobState::Completed ||
+        job.state == RouterProvisioningWorker::JobState::Failed;
+    if (terminal && _gamingPriority && job.result.body.length() > 0) {
+      HeapJsonDocument resultDoc(RenzFiConfig::JSON_DOC_SMALL);
+      if (!deserializeJson(resultDoc.doc(), job.result.body)) {
+        const char *message = resultDoc.doc()["message"] | "";
+        _gamingPriority->applySyncResult(job.result.ok, String(message));
+      }
+    }
+    sendWorkerJobPollOk(req, job);
+  });
 
   // ── Portal session API (/api/portal/*) ────────────────────────────────────
   // These endpoints are intentionally open (no requireAuth) — called by the
@@ -3711,13 +4350,20 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
           sendOk(req, outHeap.doc(), "Voucher activating");
           return;
         }
+        Serial.printf("[voucher-redeem] fail mac=%s code=%s\n", mac.c_str(),
+                      errorCode.isEmpty() ? "(none)" : errorCode.c_str());
         int status = 409;
+        const char *message = "Voucher redemption failed";
         if (errorCode == "VOUCHER_NOT_FOUND") status = 404;
-        else if (errorCode == "CLOCK_NOT_READY" ||
-                 errorCode == "STORAGE_ERROR" ||
-                 errorCode == "ACTIVATION_QUEUE_FULL")
+        else if (errorCode == "CLOCK_NOT_READY") {
           status = 503;
-        sendError(req, status, "Voucher redemption failed",
+          message =
+              "Device clock not ready — check WAN/DNS, then try again";
+        } else if (errorCode == "STORAGE_ERROR" ||
+                   errorCode == "ACTIVATION_QUEUE_FULL") {
+          status = 503;
+        }
+        sendError(req, status, message,
                   errorCode.isEmpty() ? "VOUCHER_UNAVAILABLE" : errorCode);
       },
       nullptr, bodyCollect);
@@ -3764,6 +4410,7 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
         String mac = body["mac"] | "";
+        String ip  = body["ip"]  | "";
         if (mac.isEmpty()) {
           sendError(req, 400, "mac field required", "MISSING_MAC");
           return;
@@ -3774,7 +4421,9 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
         }
         String errorCode;
         if (_portalSessions->pause(mac, &errorCode)) {
-          sendOk(req, "Session paused");
+          PsramJsonDocument outHeap;
+          _portalSessions->getSession(mac, ip, outHeap.doc());
+          sendOk(req, outHeap.doc(), "Session paused");
         } else if (errorCode == "SESSION_NOT_FOUND") {
           sendError(req, 404, "Session not found", "SESSION_NOT_FOUND");
         } else if (errorCode == "PAUSE_LIMIT_REACHED") {
@@ -3797,6 +4446,7 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
         String raw = getBody(req);
         if (raw.length() > 0) deserializeJson(body, raw);
         String mac = body["mac"] | "";
+        String ip  = body["ip"]  | "";
         if (mac.isEmpty()) {
           sendError(req, 400, "mac field required", "MISSING_MAC");
           return;
@@ -3807,7 +4457,9 @@ void ApiServer::registerProductionRoutes(WebServerManager &web) {
         }
         String errorCode;
         if (_portalSessions->resume(mac, &errorCode)) {
-          sendOk(req, "Session resumed");
+          PsramJsonDocument outHeap;
+          _portalSessions->getSession(mac, ip, outHeap.doc());
+          sendOk(req, outHeap.doc(), "Session resumed");
         } else if (errorCode == "SESSION_NOT_FOUND") {
           sendError(req, 404, "Session not found", "SESSION_NOT_FOUND");
         } else if (errorCode == "ACTIVATION_QUEUE_FULL") {

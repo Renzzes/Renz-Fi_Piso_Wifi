@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useOutletContext } from "react-router-dom";
 import { Eye, ExternalLink, Pencil, Plus, RadioTower, Search, Trash2 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
@@ -43,9 +44,14 @@ import { toast } from "sonner";
 import { isApiError } from "@/services/api";
 import {
   ACCESS_POINT_VENDORS,
+  ACCESS_POINTS_QUERY_KEY,
   accessPointJobSucceeded,
   accessPointsApi,
   parseDetectDevices,
+  parseDetectFailureMessage,
+  parseDetectRegisteredDevices,
+  persistDetectBridgePorts,
+  resolveDetectBridgePort,
   type AccessPointDetectDevice,
   type AccessPointList,
   type AccessPointRecord,
@@ -58,6 +64,18 @@ import { EmptyState } from "@/components/admin/EmptyState";
 import { ConfigStatusBadge } from "@/components/system-config/ConfigStatusBadge";
 import type { StatusTone } from "@/lib/dashboardDisplay";
 import { clampPage, PAGE_SIZE_DEFAULT, pageSlice } from "@/lib/pagination";
+import { AccessPointGuestNetworkCard } from "@/components/access-points/AccessPointGuestNetworkCard";
+import { AccessPointPortLayoutCard } from "@/components/access-points/AccessPointPortLayoutCard";
+import { AccessPointRegisteredSummaryCard } from "@/components/access-points/AccessPointGuidanceCards";
+import { systemApi } from "@/services/system";
+import { routerApi } from "@/services/router";
+import {
+  resolveValidatedApManagementNetwork,
+  type NetworkAddressSnapshot,
+} from "@/lib/apManagementIpRecommendations";
+import type { EthernetPortSnapshot } from "@/lib/mikrotikPortLayout";
+import type { AdminOutletContext } from "@/components/AdminLayout";
+import { healthApi } from "@/services/rgb";
 
 const EMPTY_FORM: AccessPointWritePayload = {
   name: "",
@@ -135,13 +153,37 @@ function suggestName(device: AccessPointDetectDevice): string {
 
 export default function AccessPointsPage() {
   const queryClient = useQueryClient();
+  const { isOwner } = useOutletContext<AdminOutletContext>();
   const { data, isLoading } = useQuery({
-    queryKey: ["access-points"],
+    queryKey: ACCESS_POINTS_QUERY_KEY,
     queryFn: () => accessPointsApi.list(),
     staleTime: Number.POSITIVE_INFINITY,
     refetchOnMount: false,
   });
-  const records = data?.accessPoints ?? [];
+  const { data: systemStatus, isLoading: statusLoading } = useQuery({
+    queryKey: ["system", "status"],
+    queryFn: () => systemApi.status(),
+    staleTime: 60_000,
+    refetchOnMount: true,
+  });
+  const { data: routerCache } = useQuery({
+    queryKey: ["router", "cache"],
+    queryFn: () => routerApi.cache(),
+    enabled: isOwner,
+    staleTime: 60_000,
+    refetchOnMount: true,
+  });
+  const { data: systemHealth } = useQuery({
+    queryKey: ["system", "health"],
+    queryFn: () => healthApi.get(),
+    staleTime: 60_000,
+  });
+  const records = useMemo(() => data?.accessPoints ?? [], [data?.accessPoints]);
+  const provisioning = systemStatus?.networkProvisioning;
+  const primaryAp = useMemo(
+    () => records.find((row) => row.enabled) ?? records[0] ?? null,
+    [records],
+  );
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<AccessPointRecord | null>(null);
@@ -150,6 +192,7 @@ export default function AccessPointsPage() {
   const [enablingIds, setEnablingIds] = useState<Set<string>>(new Set());
   const [detectOpen, setDetectOpen] = useState(false);
   const [detectDevices, setDetectDevices] = useState<AccessPointDetectDevice[]>([]);
+  const [detectBridgeRows, setDetectBridgeRows] = useState<AccessPointDetectDevice[]>([]);
   const [viewing, setViewing] = useState<AccessPointRecord | null>(null);
   const [removeTarget, setRemoveTarget] = useState<AccessPointRecord | null>(null);
   const [page, setPage] = useState(1);
@@ -224,7 +267,7 @@ export default function AccessPointsPage() {
       return accessPointsApi.create(payload);
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["access-points"] });
+      queryClient.invalidateQueries({ queryKey: ACCESS_POINTS_QUERY_KEY });
       toast.success(editing ? "Access point updated" : "Access point registered");
       closeDialog();
     },
@@ -236,7 +279,7 @@ export default function AccessPointsPage() {
   const deleteMutation = useMutation({
     mutationFn: (id: string) => accessPointsApi.remove(id),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["access-points"] });
+      queryClient.invalidateQueries({ queryKey: ACCESS_POINTS_QUERY_KEY });
       toast.success("Access point removed");
     },
     onError: (error) => {
@@ -264,7 +307,7 @@ export default function AccessPointsPage() {
       });
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["access-points"] });
+      queryClient.invalidateQueries({ queryKey: ACCESS_POINTS_QUERY_KEY });
       toast.success("Access point enabled");
     },
     onError: (error) => {
@@ -296,7 +339,7 @@ export default function AccessPointsPage() {
       if (job.state !== "failed") {
         const nextStatus: AccessPointStatus = online ? "online" : "unreachable";
         const now = Date.now();
-        queryClient.setQueryData<AccessPointList>(["access-points"], (prev) => {
+        queryClient.setQueryData<AccessPointList>(ACCESS_POINTS_QUERY_KEY, (prev) => {
           if (!prev) return prev;
           return {
             ...prev,
@@ -325,7 +368,7 @@ export default function AccessPointsPage() {
             : current,
         );
         // Background refresh; UI already shows sticky last Check result.
-        void queryClient.invalidateQueries({ queryKey: ["access-points"] });
+        void queryClient.invalidateQueries({ queryKey: ACCESS_POINTS_QUERY_KEY });
       }
 
       if (job.state === "failed") {
@@ -356,24 +399,113 @@ export default function AccessPointsPage() {
     mutationFn: () => accessPointsApi.detectAndWait(),
     onSuccess: (job) => {
       if (job.state === "failed" || job.ok === false) {
-        toast.error("Detect failed — confirm MikroTik credentials and Router Worker are healthy.");
+        toast.error(parseDetectFailureMessage(job));
         setDetectDevices([]);
         setDetectOpen(true);
         return;
       }
-      const devices = parseDetectDevices(job);
-      setDetectDevices(devices);
+      const candidates = parseDetectDevices(job);
+      const registered = parseDetectRegisteredDevices(job);
+      const allBridgeRows = [...candidates, ...registered];
+      persistDetectBridgePorts(allBridgeRows);
+      setDetectBridgeRows(allBridgeRows);
+      setDetectDevices(candidates);
       setDetectOpen(true);
-      if (devices.length === 0) {
-        toast.message("Detect finished — no new private LAN candidates found in MikroTik ARP.");
+      if (candidates.length === 0 && registered.length === 0) {
+        toast.message("Detect finished — no private LAN candidates found in MikroTik ARP.");
         return;
       }
-      toast.success(`Detect found ${devices.length} candidate${devices.length === 1 ? "" : "s"}`);
+      if (registered.length > 0 && primaryAp?.managementIp) {
+        const port = resolveDetectBridgePort(primaryAp.managementIp, allBridgeRows);
+        if (port) {
+          toast.success(`Detect mapped registered AP to bridge port ${port}`);
+          return;
+        }
+      }
+      if (candidates.length === 0) {
+        toast.success("Detect refreshed bridge port data for registered access points.");
+        return;
+      }
+      toast.success(
+        `Detect found ${candidates.length} candidate${candidates.length === 1 ? "" : "s"}`,
+      );
     },
     onError: (error) => {
       toast.error(isApiError(error) ? error.message : "Unable to detect access points");
     },
   });
+
+  const detectedBridgePort = useMemo(
+    () => resolveDetectBridgePort(primaryAp?.managementIp, [...detectDevices, ...detectBridgeRows]),
+    [detectDevices, detectBridgeRows, primaryAp?.managementIp],
+  );
+
+  const networkAddresses = useMemo((): NetworkAddressSnapshot[] => {
+    const raw = routerCache?.observation?.networkAddresses;
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(
+      (row): row is NetworkAddressSnapshot =>
+        typeof row === "object" &&
+        row != null &&
+        typeof (row as NetworkAddressSnapshot).interface === "string" &&
+        typeof (row as NetworkAddressSnapshot).address === "string",
+    );
+  }, [routerCache?.observation?.networkAddresses]);
+
+  const validatedManagement = useMemo(
+    () =>
+      resolveValidatedApManagementNetwork({
+        networkAddresses: networkAddresses,
+        networkAddressesKnown: routerCache?.observation?.networkAddressesKnown,
+        guestBridgeName: provisioning?.guestBridgeName,
+        registeredApManagementIp: primaryAp?.managementIp,
+        guestNetwork: provisioning?.guestNetwork,
+        guestGateway: provisioning?.guestGateway,
+        dhcpPool: provisioning?.dhcpPool,
+        esp32Ip: systemHealth?.ethernet?.ip,
+        esp32Gateway: systemHealth?.ethernet?.gateway,
+        registeredAps: records,
+        count: 3,
+      }),
+    [
+      networkAddresses,
+      routerCache?.observation?.networkAddressesKnown,
+      provisioning?.guestBridgeName,
+      provisioning?.guestNetwork,
+      provisioning?.guestGateway,
+      provisioning?.dhcpPool,
+      primaryAp?.managementIp,
+      systemHealth?.ethernet?.ip,
+      systemHealth?.ethernet?.gateway,
+      records,
+    ],
+  );
+
+  const lastObservedAt = useMemo(() => {
+    const raw = routerCache?.lastSynchronizedAt?.trim();
+    if (!raw) return undefined;
+    try {
+      return new Intl.DateTimeFormat(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short",
+      }).format(new Date(raw));
+    } catch {
+      return raw;
+    }
+  }, [routerCache?.lastSynchronizedAt]);
+
+  const ethernetPorts = useMemo((): EthernetPortSnapshot[] => {
+    const raw = routerCache?.observation?.ethernetPorts;
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(
+      (row): row is EthernetPortSnapshot =>
+        typeof row === "object" &&
+        row != null &&
+        typeof (row as EthernetPortSnapshot).name === "string",
+    );
+  }, [routerCache?.observation?.ethernetPorts]);
+
+  const guestDns = provisioning?.guestGateway?.trim() || undefined;
 
   return (
     <div className="w-full max-w-none space-y-3">
@@ -401,6 +533,52 @@ export default function AccessPointsPage() {
           </Button>
         </div>
       </div>
+
+      <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+        <AccessPointGuestNetworkCard provisioning={provisioning} loading={statusLoading} />
+        <AccessPointRegisteredSummaryCard
+          record={primaryAp}
+          detectedBridgePort={detectedBridgePort}
+        />
+      </div>
+
+      <AccessPointPortLayoutCard
+        boardName={routerCache?.routerOs?.boardName}
+        identity={routerCache?.identity}
+        wanInterface={systemStatus?.wan?.interface}
+        wanLink={systemStatus?.wan?.link}
+        detectedBridgePort={detectedBridgePort}
+        registeredAp={primaryAp}
+        ethernetPorts={ethernetPorts}
+        ethernetPortsKnown={routerCache?.observation?.ethernetPortsKnown}
+        networkAddresses={networkAddresses}
+        networkAddressesKnown={routerCache?.observation?.networkAddressesKnown}
+        guestNetwork={provisioning?.guestNetwork}
+        guestGateway={provisioning?.guestGateway}
+        guestDns={guestDns}
+        guestBridgeName={provisioning?.guestBridgeName}
+        validatedManagement={validatedManagement}
+        lastObservedAt={lastObservedAt}
+      />
+
+      <Alert>
+        <AlertTitle>MikroTik + External Access Point topology</AlertTitle>
+        <AlertDescription className="space-y-2">
+          <p>
+            On routers without built-in Wi-Fi (for example MikroTik hEX), guest clients connect
+            through an external access point on the LAN:
+          </p>
+          <p className="font-mono text-xs text-muted-foreground">
+            MikroTik hEX → Guest bridge → External Access Point → Guest clients → HotSpot / DHCP /
+            NAT → Renz-Fi
+          </p>
+          <p>
+            Renz-Fi registers and checks the AP here; it does not configure the AP device. Use{" "}
+            <strong>Detect</strong> or <strong>Add Access Point</strong> after the AP is configured
+            in its manufacturer web UI.
+          </p>
+        </AlertDescription>
+      </Alert>
 
       {data?.registryError ? (
         <Alert>

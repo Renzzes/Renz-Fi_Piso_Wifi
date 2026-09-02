@@ -169,6 +169,7 @@ void WebServerManager::wireSetupProviders(const WebServerDependencies &deps) {
 
   registerSetupProvider(&s.setupServer);
 
+  s.captivePortalDetection.begin(deps.routerWorker);
   registerSetupProvider(&s.captivePortalDetection);
 
   if (deps.api) {
@@ -225,19 +226,25 @@ void WebServerManager::registerAdminEntryRoute() {
 
 
 
-  _server->on("/admin", HTTP_GET, [this](AsyncWebServerRequest *req) {
+  // SoftAP (setup plane): entry URLs land on the wizard. Ethernet (production):
 
-    WebRequestDiagnostics::RequestTimer timer(req, "WebServer/admin-entry");
+  // same paths serve the Admin SPA. First-match registration — do not also
+
+  // register these in SetupServer with ensureSetupPlane (would steal ETH).
+
+  auto servePlaneAwareEntry = [this](AsyncWebServerRequest *req,
+
+                                     const char *timerLabel) {
+
+    WebRequestDiagnostics::RequestTimer timer(req, timerLabel);
 
     if (HttpPlaneGate::isSetupPlane(req)) {
 
-#if RENZFI_DEBUG_HTTP
+      // Serve the wizard on `/` (no 302). Laptop Chrome was stacking the
 
-      Serial.println("[setup] GET /admin redirected to /admin/setup");
+      // redirect hop with /admin/setup and drawing Step 1 twice.
 
-#endif
-
-      WebResponse::serveRedirect(req, ManagementApConfig::SETUP_URL);
+      _subsystems->setupServer.servePage(req);
 
       return;
 
@@ -257,13 +264,35 @@ void WebServerManager::registerAdminEntryRoute() {
 
     }
 
-#if RENZFI_DEBUG_HTTP
-
-    Serial.println("[production] GET /admin served via ETH");
-
-#endif
-
     _subsystems->staticFiles.serveStaticOrIndex(req);
+
+  };
+
+
+
+  _server->on("/", HTTP_GET, [servePlaneAwareEntry](AsyncWebServerRequest *req) {
+
+    servePlaneAwareEntry(req, "WebServer/root-entry");
+
+  });
+
+  _server->on("/login", HTTP_GET, [servePlaneAwareEntry](AsyncWebServerRequest *req) {
+
+    servePlaneAwareEntry(req, "WebServer/login-entry");
+
+  });
+
+  _server->on("/dashboard", HTTP_GET,
+
+              [servePlaneAwareEntry](AsyncWebServerRequest *req) {
+
+                servePlaneAwareEntry(req, "WebServer/dashboard-entry");
+
+              });
+
+  _server->on("/admin", HTTP_GET, [servePlaneAwareEntry](AsyncWebServerRequest *req) {
+
+    servePlaneAwareEntry(req, "WebServer/admin-entry");
 
   });
 
@@ -271,7 +300,7 @@ void WebServerManager::registerAdminEntryRoute() {
 
   Serial.println(
 
-      "[web] Plane-aware GET /admin registered (AP -> setup, ETH -> admin SPA)");
+      "[web] Plane-aware GET /, /login, /dashboard, /admin (AP -> wizard HTML, ETH -> SPA)");
 
 }
 

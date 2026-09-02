@@ -68,8 +68,12 @@ class SessionManager {
  private:
   class SalesLock;
 
-  static constexpr size_t kSalesMaxRecords = 20;
-  static constexpr size_t kSalesMaxSerializedBytes = 12U * 1024U;
+  // Live sales.json is a bounded ring used for Today/Week/Month aggregates.
+  // Cap of 20 was proven to silently drop the oldest row on every new sale
+  // once full (e.g. +₱5 and evict ₱1 → display +₱4). Keep enough headroom
+  // for a busy site-day; NDJSON history remains the long-term ledger.
+  static constexpr size_t kSalesMaxRecords = 200;
+  static constexpr size_t kSalesMaxSerializedBytes = 96U * 1024U;
 
   StorageManager *_storage = nullptr;
   Logger *_logger = nullptr;

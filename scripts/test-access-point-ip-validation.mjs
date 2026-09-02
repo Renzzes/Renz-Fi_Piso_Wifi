@@ -53,9 +53,27 @@ function ipv4OnSubnet(ip, networkIp, mask) {
   return (ip & mask) >>> 0 === (networkIp & mask) >>> 0;
 }
 
+function ipv4IsPrivateLan(ip) {
+  ip >>>= 0;
+  return (
+    (ip & 0xff000000) >>> 0 === 0x0a000000 ||
+    (ip & 0xfff00000) >>> 0 === 0xac100000 ||
+    (ip & 0xffff0000) >>> 0 === 0xc0a80000
+  );
+}
+
+function ipv4IsUnusableHost(ip) {
+  if (ip === 0 || ip === 0xffffffff) return true;
+  if ((ip & 0xff000000) === 0x7f000000) return true;
+  if ((ip & 0xffff0000) === 0xa9fe0000) return true;
+  if ((ip & 0xf0000000) >= 0xe0000000) return true;
+  return false;
+}
+
 function validateManagementIp(candidateIp, liveEsp32Ip, liveGatewayIp, liveSubnetMask) {
   const candidate = parseIpv4Packed(candidateIp);
   if (candidate == null) return "INVALID_IP";
+  if (ipv4IsUnusableHost(candidate)) return "INVALID_IP";
 
   const esp32Ip = parseIpv4Packed(liveEsp32Ip);
   const mask = parseIpv4Packed(liveSubnetMask);
@@ -67,18 +85,21 @@ function validateManagementIp(candidateIp, liveEsp32Ip, liveGatewayIp, liveSubne
     return "IP_RESERVED";
   }
 
-  const network = ipv4Network(esp32Ip, mask);
-  const broadcast = ipv4Broadcast(esp32Ip, mask);
-  if (candidate === network || candidate === broadcast || candidate === esp32Ip) {
-    return "IP_RESERVED";
-  }
+  if (candidate === esp32Ip) return "IP_RESERVED";
 
   const gateway = parseIpv4Packed(liveGatewayIp);
   if (gateway != null && gateway !== 0 && candidate === gateway) {
     return "IP_RESERVED";
   }
 
-  if (!ipv4OnSubnet(candidate, esp32Ip, mask)) return "IP_NOT_ON_LAN";
+  if (ipv4OnSubnet(candidate, esp32Ip, mask)) {
+    const network = ipv4Network(esp32Ip, mask);
+    const broadcast = ipv4Broadcast(esp32Ip, mask);
+    if (candidate === network || candidate === broadcast) return "IP_RESERVED";
+    return "OK";
+  }
+
+  if (!ipv4IsPrivateLan(candidate)) return "IP_NOT_ON_LAN";
   return "OK";
 }
 
@@ -189,8 +210,18 @@ assertEqual(
 );
 assertEqual(
   validateManagementIp("10.20.20.10", live.esp32Ip, live.gateway, live.mask),
+  "OK",
+  "routed RFC1918 private LAN",
+);
+assertEqual(
+  validateManagementIp("192.168.88.20", live.esp32Ip, live.gateway, live.mask),
+  "OK",
+  "routed 192.168.88.x AP subnet",
+);
+assertEqual(
+  validateManagementIp("8.8.8.8", live.esp32Ip, live.gateway, live.mask),
   "IP_NOT_ON_LAN",
-  "AP outside subnet",
+  "public IP rejected",
 );
 assertEqual(
   validateManagementIp("192.168.4.10", live.esp32Ip, live.gateway, live.mask),

@@ -6,9 +6,10 @@ class EthernetManager;
 class InstallationStateManager;
 
 // Setup-phase DNS isolation: AP clients get local captive answers only;
-// the ESP32 must not issue outbound DNS queries over Ethernet while setup
-// lifecycle states are active (factory / owner_created / router_configured and
-// any pre-ready state where the Management AP is running).
+// the ESP32 must not issue outbound DNS queries over Ethernet while the
+// Management SoftAP installer is running. Once SoftAP is stopped for
+// production (even if install state is still pre-Ready), Ethernet DNS must
+// be restored so NTP / voucher wall-clock can work.
 class SetupDnsPolicy {
  public:
   static void begin(InstallationStateManager *installation,

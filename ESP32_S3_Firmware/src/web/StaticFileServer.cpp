@@ -40,6 +40,7 @@ const char *methodStr(WebRequestMethodComposite method) {
 }
 
 void sendFallbackPage(AsyncWebServerRequest *req) {
+  if (!WebResponse::ensureEthTransmitHeadroom(req, "static-fallback")) return;
   AsyncWebServerResponse *res = req->beginResponse(
       200, "text/html; charset=utf-8", String(FPSTR(SPIFFS_FALLBACK_PAGE)));
   WebResponse::addCorsHeaders(res);

@@ -1,5 +1,7 @@
 #include "SystemHealthService.h"
 
+#include <cmath>
+
 #include "CoinManager.h"
 #include "Config.h"
 #include "EthernetManager.h"
@@ -59,6 +61,22 @@ void SystemHealthService::fillHealth(JsonObject out) const {
   JsonObject memory = out["memory"].to<JsonObject>();
   memory["heap"] = ESP.getFreeHeap();
   memory["minimumHeap"] = ESP.getMinFreeHeap();
+  memory["psram"] = ESP.getFreePsram();
+  memory["psramSize"] = ESP.getPsramSize();
+
+  JsonObject esp32 = out["esp32"].to<JsonObject>();
+  esp32["cpuFreqMHz"] = ESP.getCpuFreqMHz();
+  esp32["chipModel"] = ESP.getChipModel();
+  esp32["chipRevision"] = ESP.getChipRevision();
+  // Internal die temperature (not ambient). temperatureRead() is supported on
+  // ESP32-S3 Arduino core; NAN means sensor unavailable for this build/board.
+  const float chipTempC = temperatureRead();
+  if (!isnan(chipTempC)) {
+    esp32["chipTempC"] = roundf(chipTempC * 10.0f) / 10.0f;
+    esp32["chipTempAvailable"] = true;
+  } else {
+    esp32["chipTempAvailable"] = false;
+  }
 
   switch (overallLevel()) {
     case SystemHealthLevel::Error:

@@ -3,6 +3,7 @@
 #include <SPIFFS.h>
 #include <cstring>
 #include <math.h>
+#include <strings.h>
 
 #include "BackupManager.h"
 #include "Config.h"
@@ -13,6 +14,8 @@
 #include "JsonHeap.h"
 #include "SdSpi.h"
 #include "StoragePaths.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 namespace {
 
@@ -36,6 +39,162 @@ constexpr const char *kDefaultRouter =
 constexpr const char *kDefaultVouchers = "[]";
 constexpr const char *kDefaultPortalSessions = "{\"sessions\":[]}";
 constexpr const char *kDefaultSales = "[]";
+constexpr size_t kSalesMergeCap = 96U * 1024U;
+constexpr size_t kPortalSessionsMergeCap = 128U * 1024U;
+
+bool saleIdListed(JsonArrayConst arr, const char *id) {
+  if (!id || !id[0]) return false;
+  for (JsonObjectConst row : arr) {
+    if (strcmp(row["id"] | "", id) == 0) return true;
+  }
+  return false;
+}
+
+bool mergeSalesJsonPayloads(const String &sdPayload, const String &fbPayload,
+                            String &mergedOut) {
+  DynamicJsonDocument sdDoc(kSalesMergeCap);
+  DynamicJsonDocument fbDoc(kSalesMergeCap);
+  if (deserializeJson(sdDoc, sdPayload) != DeserializationError::Ok ||
+      !sdDoc.is<JsonArray>()) {
+    mergedOut = fbPayload;
+    return true;
+  }
+  if (deserializeJson(fbDoc, fbPayload) != DeserializationError::Ok ||
+      !fbDoc.is<JsonArray>()) {
+    mergedOut = sdPayload;
+    return true;
+  }
+
+  HeapJsonDocument mergedHeap(kSalesMergeCap);
+  DynamicJsonDocument &mergedDoc = mergedHeap.doc();
+  JsonArray merged = mergedDoc.to<JsonArray>();
+  JsonArray sdArr = sdDoc.as<JsonArray>();
+  JsonArray fbArr = fbDoc.as<JsonArray>();
+  for (JsonVariant v : sdArr) merged.add(v);
+  int appended = 0;
+  for (JsonObjectConst row : fbArr) {
+    const char *id = row["id"] | "";
+    if (!id[0] || saleIdListed(merged, id)) continue;
+    merged.add(row);
+    appended++;
+  }
+  if (mergedDoc.overflowed()) return false;
+  mergedOut = "";
+  serializeJson(merged, mergedOut);
+  if (mergedOut.isEmpty()) return false;
+  Serial.printf(
+      "[storage] Sales merge sd_rows=%u fb_rows=%u merged=%u appended=%d\n",
+      static_cast<unsigned>(sdArr.size()), static_cast<unsigned>(fbArr.size()),
+      static_cast<unsigned>(merged.size()), appended);
+  return true;
+}
+
+bool macAddressEquals(const char *a, const char *b) {
+  if (!a || !b || !a[0] || !b[0]) return false;
+  return strcasecmp(a, b) == 0;
+}
+
+uint32_t portalSessionRevision(JsonObjectConst session) {
+  const uint32_t updated = session["updatedAt"] | 0U;
+  const uint32_t lastSeen = session["lastSeen"] | 0U;
+  const uint32_t generation = session["sessionGeneration"] | 0U;
+  if (updated > 0) return updated;
+  if (lastSeen > 0) return lastSeen;
+  return generation;
+}
+
+bool portalSessionsArrayFromDoc(JsonDocument &doc, JsonArray &out, bool &ok) {
+  ok = false;
+  if (doc.is<JsonArray>()) {
+    out = doc.as<JsonArray>();
+    ok = !out.isNull();
+    return ok;
+  }
+  if (doc["sessions"].is<JsonArray>()) {
+    out = doc["sessions"].as<JsonArray>();
+    ok = !out.isNull();
+    return ok;
+  }
+  return false;
+}
+
+bool mergePortalSessionsJsonPayloads(const String &sdPayload,
+                                     const String &fbPayload,
+                                     String &mergedOut) {
+  DynamicJsonDocument sdDoc(kPortalSessionsMergeCap);
+  DynamicJsonDocument fbDoc(kPortalSessionsMergeCap);
+  const DeserializationError sdErr = deserializeJson(sdDoc, sdPayload);
+  const DeserializationError fbErr = deserializeJson(fbDoc, fbPayload);
+
+  bool sdOk = false;
+  bool fbOk = false;
+  JsonArray sdArr;
+  JsonArray fbArr;
+  portalSessionsArrayFromDoc(sdDoc, sdArr, sdOk);
+  portalSessionsArrayFromDoc(fbDoc, fbArr, fbOk);
+
+  if (!sdOk && !fbOk) return false;
+  if (!sdOk && fbOk) {
+    mergedOut = fbPayload;
+    return !mergedOut.isEmpty();
+  }
+  if (sdOk && !fbOk) {
+    mergedOut = sdPayload;
+    return !mergedOut.isEmpty();
+  }
+
+  HeapJsonDocument mergedHeap(kPortalSessionsMergeCap);
+  DynamicJsonDocument &mergedDoc = mergedHeap.doc();
+  JsonObject root = mergedDoc.to<JsonObject>();
+  JsonArray merged = root["sessions"].to<JsonArray>();
+  for (JsonVariant v : sdArr) merged.add(v);
+
+  int appended = 0;
+  int updated = 0;
+  for (JsonObjectConst fbSession : fbArr) {
+    const char *fbMac = fbSession["macAddress"] | "";
+    if (!fbMac[0]) continue;
+
+    ssize_t matchIdx = -1;
+    for (size_t i = 0; i < merged.size(); ++i) {
+      JsonObjectConst row = merged[i];
+      if (macAddressEquals(row["macAddress"] | "", fbMac)) {
+        matchIdx = static_cast<ssize_t>(i);
+        break;
+      }
+    }
+
+    if (matchIdx < 0) {
+      merged.add(fbSession);
+      appended++;
+      continue;
+    }
+
+    JsonObjectConst sdSession = merged[matchIdx];
+    if (portalSessionRevision(fbSession) > portalSessionRevision(sdSession)) {
+      merged[matchIdx].set(fbSession);
+      updated++;
+    }
+  }
+
+  if (mergedDoc.overflowed()) return false;
+  mergedOut = "";
+  serializeJson(root, mergedOut);
+  if (mergedOut.isEmpty()) return false;
+  Serial.printf(
+      "[storage] Portal sessions merge sd_rows=%u fb_rows=%u merged=%u "
+      "appended=%d updated=%d\n",
+      static_cast<unsigned>(sdArr.size()), static_cast<unsigned>(fbArr.size()),
+      static_cast<unsigned>(merged.size()), appended, updated);
+  return true;
+}
+
+void removeSpiffsFallbackArtifacts(const char *fbPath) {
+  if (!fbPath || !fbPath[0]) return;
+  SPIFFS.remove((String(fbPath) + StoragePaths::TransactionStageSuffix).c_str());
+  SPIFFS.remove((String(fbPath) + StoragePaths::TransactionBackupSuffix).c_str());
+  SPIFFS.remove(fbPath);
+}
 
 uint32_t countSpoolRecords(const char *path) {
   if (!path || !SPIFFS.exists(path)) return 0;
@@ -134,7 +293,17 @@ bool StorageManager::lockStorage() const {
   if (!_storageMutex) return false;
   TickType_t wait = pdMS_TO_TICKS(RenzFiConfig::STORAGE_LOCK_TIMEOUT_MS);
   // Never park AsyncTCP on STORAGE_LOCK for the duration of remount/sync.
-  if (_sdRecoveryInProgress) wait = 0;
+  if (_sdRecoveryInProgress) {
+    wait = 0;
+  } else {
+    // async_tcp shares CPU1 with loopTask. Blocking here for
+    // STORAGE_LOCK_TIMEOUT_MS (== TWDT) while loopTask owns SD I/O is a proven
+    // Guru Meditation path (failed login / dashboard health storm).
+    const char *taskName = pcTaskGetName(nullptr);
+    if (taskName && strcmp(taskName, "async_tcp") == 0) {
+      wait = pdMS_TO_TICKS(RenzFiConfig::STORAGE_LOCK_ASYNC_TCP_WAIT_MS);
+    }
+  }
   const BaseType_t taken = xSemaphoreTakeRecursive(_storageMutex, wait);
   if (taken != pdTRUE) {
     if (!_sdRecoveryInProgress) {
@@ -186,6 +355,21 @@ bool StorageManager::mountSdCard(const char *context, bool reinitBus) {
                   static_cast<unsigned long long>(SD.cardSize()));
     _sdIoFailStreak = 0;
   } else {
+    const uint8_t cardType = SD.cardType();
+    Serial.printf(
+        "[SD] %s: mount failed cardType=%u (CARD_NONE=%u) hw=%s sdCs=GPIO%d\n",
+        context, static_cast<unsigned>(cardType),
+        static_cast<unsigned>(CARD_NONE), RenzFiConfig::HARDWARE_REVISION,
+        RenzFiConfig::PIN_SD_CS);
+#if defined(RENZFI_BOARD_WAVESHARE_ESP32_S3_ETH)
+    Serial.println(
+        "[SD] Waveshare profile: use onboard TF slot (CS=GPIO4). External SD "
+        "modules wired to GPIO18 (Freenove map) will not mount with this build.");
+#else
+    Serial.println(
+        "[SD] Freenove profile: SD CS=GPIO18. Flash env:freenove_esp32_s3_wroom "
+        "or waveshare_esp32_s3_eth to match your PCB.");
+#endif
     setSdLifecycle(SdLifecycle::Failed, "SD.begin failed");
   }
   EthernetManager::logDiagnosticStage("after_sd_begin");
@@ -225,7 +409,7 @@ bool StorageManager::begin() {
     _sdMountFailed = false;
     Serial.printf("[boot] SD card mounted: total=%llu bytes used=%llu bytes\n",
                   SD.totalBytes(), SD.usedBytes());
-    _sdWritable = probeSdWritable();
+      _sdWritable = probeSdWritable();
     if (!_sdWritable &&
         (_diagnosticCause == nullptr ||
          strcmp(_diagnosticCause, "UNKNOWN") == 0 ||
@@ -275,17 +459,17 @@ bool StorageManager::begin() {
     return _healthy;
   } else {
     setSdLifecycle(SdLifecycle::Degraded, "boot mount failed");
-    _sdPresent = SD.cardType() != CARD_NONE;
+  _sdPresent = SD.cardType() != CARD_NONE;
     _sdMounted = false;
     _sdReadable = false;
-    _sdMountFailed = _sdPresent;
-    setError("[ERROR] SD card mount failed");
+  _sdMountFailed = _sdPresent;
+  setError("[ERROR] SD card mount failed");
     setDiagnosticCause(_sdPresent ? "FILESYSTEM_ERROR" : "MEDIA_MISSING");
-    if (_spiffsMounted) {
-      _usingFallback = true;
+  if (_spiffsMounted) {
+    _usingFallback = true;
       Serial.println("[storage] Entering fallback mode");
-      Serial.println("[storage] SD unavailable, using SPIFFS fallback");
-      Serial.println("[storage] Sales storage = SPIFFS fallback");
+    Serial.println("[storage] SD unavailable, using SPIFFS fallback");
+    Serial.println("[storage] Sales storage = SPIFFS fallback");
       Serial.println("[storage] Waiting for SD reinsertion");
       // Seed bounded setup/operational checkpoints so first-boot setup can
       // progress without an SD card (N16R8 resilience contract).
@@ -294,7 +478,7 @@ bool StorageManager::begin() {
         if (SPIFFS.exists(fbPath)) return;
         if (spiffsWriteFile(fbPath, json)) {
           Serial.printf("[storage] SPIFFS fallback seeded %s\n", fbPath);
-        } else {
+      } else {
           Serial.printf("[ERROR] SPIFFS fallback seed failed for %s\n", fbPath);
         }
       };
@@ -315,11 +499,11 @@ bool StorageManager::begin() {
       seedFb(RenzFiConfig::FB_ROUTER, kDefaultRouter);
       seedFb(RenzFiConfig::FB_PORTAL_CONFIG,
              "{\"revision\":0,\"hasBanner\":false,\"hasMusic\":false}");
-    } else {
-      Serial.println("[ERROR] SPIFFS not available — no fallback storage");
-    }
-    refreshRuntimeSnapshot();
-    return false;
+  } else {
+    Serial.println("[ERROR] SPIFFS not available — no fallback storage");
+  }
+  refreshRuntimeSnapshot();
+  return false;
   }
 }
 
@@ -360,6 +544,10 @@ void StorageManager::markDegraded(const String &reason) {
   Serial.printf("[storage] DEGRADED: %s\n", reason.c_str());
 }
 
+void StorageManager::reportSdMediaMissing(const char *reason) {
+  tripSdMediaMissing(reason);
+}
+
 void StorageManager::emitStorageChanged() {
   if (_events) {
     _events->emit("storage.changed");
@@ -369,6 +557,8 @@ void StorageManager::emitStorageChanged() {
 
 void StorageManager::handleSdRemoved(const char *reason) {
   if (!_healthy && _usingFallback && !_sdMounted && !_sdReadable) return;
+
+  snapshotCriticalSdToSpiffs();
 
   Serial.println("[storage] Detected SD removal");
   Serial.printf("[storage] SD removed/failed: %s\n", reason);
@@ -389,6 +579,102 @@ void StorageManager::handleSdRemoved(const char *reason) {
   setError(String("[storage] SD unavailable: ") + reason);
   emitStorageChanged();
   refreshRuntimeSnapshot();
+}
+
+void StorageManager::snapshotCriticalSdToSpiffs() {
+  if (!_sdReadable || !_spiffsMounted) return;
+
+  static const char *kPaths[] = {RenzFiConfig::SALES_FILE,
+                                 RenzFiConfig::PORTAL_SESSIONS_FILE};
+  for (const char *sdPath : kPaths) {
+    if (!isFallbackEligible(sdPath)) continue;
+    const String fbPath = toFallbackPath(sdPath);
+    if (fbPath.isEmpty()) continue;
+    uint32_t ignoredBase = 0;
+    uint32_t ignoredPayload = 0;
+    if (manifestEntry(fbPath, ignoredBase, ignoredPayload)) continue;
+
+    String payload;
+    if (!readSdPayload(sdPath, payload) || !validateJsonPayload(payload)) continue;
+    if (!spiffsWriteFile(fbPath, payload)) continue;
+    Serial.printf(
+        "[storage] SD-out snapshot %s -> %s (%u bytes)\n", sdPath,
+        fbPath.c_str(), static_cast<unsigned>(payload.length()));
+  }
+}
+
+bool StorageManager::consumeSalesSummaryStale() {
+  const bool stale = _salesSummaryStale;
+  _salesSummaryStale = false;
+  return stale;
+}
+
+bool StorageManager::reconcileSalesFallbackToSd(const char *fbPath,
+                                                const char *sdPath,
+                                                const String &fbPayload,
+                                                unsigned &filesSynced,
+                                                size_t &bytesSynced) {
+  if (!fbPath || !sdPath) return false;
+
+  String sdPayload;
+  const bool sdExists = readSdPayload(sdPath, sdPayload);
+  String merged;
+  if (sdExists) {
+    if (!mergeSalesJsonPayloads(sdPayload, fbPayload, merged)) return false;
+  } else {
+    merged = fbPayload;
+  }
+  if (!validateJsonPayload(merged)) return false;
+  if (!writeJsonToSdSerialized(sdPath, merged)) return false;
+  if (!verifySdMatches(sdPath, merged)) return false;
+
+  removeSpiffsFallbackArtifacts(fbPath);
+  removeFromManifest(fbPath);
+  clearConflictForPath(sdPath);
+  filesSynced++;
+  bytesSynced += merged.length();
+  _salesSummaryStale = true;
+  Serial.printf(
+      "[storage] Sales reconciled fallback+SD -> SD (%u bytes sdExists=%s)\n",
+      static_cast<unsigned>(merged.length()), sdExists ? "yes" : "no");
+  return true;
+}
+
+bool StorageManager::consumePortalSessionsStale() {
+  const bool stale = _portalSessionsStale;
+  _portalSessionsStale = false;
+  return stale;
+}
+
+bool StorageManager::reconcilePortalSessionsFallbackToSd(
+    const char *fbPath, const char *sdPath, const String &fbPayload,
+    unsigned &filesSynced, size_t &bytesSynced) {
+  if (!fbPath || !sdPath) return false;
+
+  String sdPayload;
+  const bool sdExists = readSdPayload(sdPath, sdPayload);
+  String merged;
+  if (sdExists) {
+    if (!mergePortalSessionsJsonPayloads(sdPayload, fbPayload, merged))
+      return false;
+  } else {
+    merged = fbPayload;
+  }
+  if (!validateJsonPayload(merged)) return false;
+  if (!writeJsonToSdSerialized(sdPath, merged)) return false;
+  if (!verifySdMatches(sdPath, merged)) return false;
+
+  removeSpiffsFallbackArtifacts(fbPath);
+  removeFromManifest(fbPath);
+  clearConflictForPath(sdPath);
+  filesSynced++;
+  bytesSynced += merged.length();
+  _portalSessionsStale = true;
+  Serial.printf(
+      "[storage] Portal sessions reconciled fallback+SD -> SD (%u bytes "
+      "sdExists=%s)\n",
+      static_cast<unsigned>(merged.length()), sdExists ? "yes" : "no");
+  return true;
 }
 
 bool StorageManager::verifySdHealthy() {
@@ -446,6 +732,24 @@ void StorageManager::clearConflicts() {
   _conflictCount = 0;
   for (uint8_t i = 0; i < RenzFiConfig::STORAGE_CONFLICT_CAP; ++i) {
     _conflicts[i] = ConflictRecord{};
+  }
+}
+
+void StorageManager::clearConflictForPath(const char *sdPath) {
+  if (!sdPath || !sdPath[0]) return;
+  for (uint8_t i = 0; i < _conflictCount;) {
+    if (strncmp(_conflicts[i].path, sdPath, sizeof(_conflicts[i].path) - 1) ==
+        0) {
+      for (uint8_t j = i + 1; j < _conflictCount; ++j) {
+        _conflicts[j - 1] = _conflicts[j];
+      }
+      _conflicts[--_conflictCount] = ConflictRecord{};
+      Serial.printf(
+          "[storage] Conflict cleared path=%s (SD authoritative read)\n",
+          sdPath);
+    } else {
+      ++i;
+    }
   }
 }
 
@@ -671,7 +975,7 @@ void StorageManager::pollStorageHealth() {
   Serial.println("[storage-recovery] worker started");
   attemptSdRecovery();
   if (tryLockStorage()) {
-    refreshRuntimeSnapshot();
+  refreshRuntimeSnapshot();
     unlockStorage();
   }
   _sdRecoveryInProgress = false;
@@ -753,6 +1057,7 @@ bool StorageManager::isFallbackEligible(const char *path) const {
          strcmp(path, StoragePaths::ProvisioningFile) == 0 ||
          strcmp(path, StoragePaths::RouterConnectionFile) == 0 ||
          strcmp(path, StoragePaths::RouterProvisioningFile) == 0 ||
+         strcmp(path, StoragePaths::RouterCacheFile) == 0 ||
          strcmp(path, StoragePaths::SetupWizardFile) == 0;
 }
 
@@ -932,9 +1237,10 @@ bool StorageManager::seedFallbackDefaults(const char *sdPath,
 
 // ── Transactional SD I/O ─────────────────────────────────────────────────────
 
-uint32_t StorageManager::payloadCrc(const String &payload) const {
+uint32_t StorageManager::payloadCrc(const char *payload, size_t len) const {
   uint32_t crc = 0xFFFFFFFFUL;
-  for (size_t i = 0; i < payload.length(); ++i) {
+  if (!payload) return ~crc;
+  for (size_t i = 0; i < len; ++i) {
     crc ^= static_cast<uint8_t>(payload[i]);
     for (uint8_t bit = 0; bit < 8; ++bit) {
       crc = (crc >> 1) ^ (0xEDB88320UL & (0U - (crc & 1U)));
@@ -943,10 +1249,18 @@ uint32_t StorageManager::payloadCrc(const String &payload) const {
   return ~crc;
 }
 
-bool StorageManager::validateJsonPayload(const String &payload) const {
-  if (payload.isEmpty()) return false;
+uint32_t StorageManager::payloadCrc(const String &payload) const {
+  return payloadCrc(payload.c_str(), payload.length());
+}
+
+bool StorageManager::validateJsonPayload(const char *payload, size_t len) const {
+  if (!payload || len == 0) return false;
   PsramJsonDocument verify;
-  return !deserializeJson(verify.doc(), payload);
+  return !deserializeJson(verify.doc(), payload, len);
+}
+
+bool StorageManager::validateJsonPayload(const String &payload) const {
+  return validateJsonPayload(payload.c_str(), payload.length());
 }
 
 bool StorageManager::readSdPayload(const char *path, String &payload) const {
@@ -1078,6 +1392,13 @@ bool StorageManager::recoverSdTransaction(const char *path) {
 bool StorageManager::writeJsonToSdOnce(const char *path,
                                        const String &serialized,
                                        const char **failReasonOut) {
+  return writeJsonToSdOnce(path, serialized.c_str(), serialized.length(),
+                           failReasonOut);
+}
+
+bool StorageManager::writeJsonToSdOnce(const char *path,
+                                       const char *serialized, size_t len,
+                                       const char **failReasonOut) {
   DmaMemoryMonitor::ScopedProbe dmaProbe(
       (path && strstr(path, "sales") != nullptr) ? "sales-sd-write"
       : (path && strstr(path, "voucher") != nullptr)
@@ -1088,6 +1409,11 @@ bool StorageManager::writeJsonToSdOnce(const char *path,
   };
   const bool voucherDiag =
       path != nullptr && strstr(path, "vouchers") != nullptr;
+
+  if (!serialized || len == 0) {
+    setReason("EMPTY_PAYLOAD");
+    return false;
+  }
 
   // Resolve any prior interrupted replace first so the retained backup is
   // always the immediately preceding valid committed value.
@@ -1102,10 +1428,11 @@ bool StorageManager::writeJsonToSdOnce(const char *path,
     return false;
   }
   const uint32_t tStage = millis();
-  const size_t written = file.print(serialized);
+  const size_t written = file.write(reinterpret_cast<const uint8_t *>(serialized),
+                                    len);
   file.flush();
   file.close();
-  if (written != serialized.length()) {
+  if (written != len) {
     SD.remove(stage);
     setReason("WRITE_FAILED");
     return false;
@@ -1114,15 +1441,14 @@ bool StorageManager::writeJsonToSdOnce(const char *path,
     Serial.printf("[voucher-job] stage write elapsed=%lu\n",
                   static_cast<unsigned long>(millis() - tStage));
   }
-  String staged;
   if (voucherDiag) Serial.println("[voucher-job] verify start");
   const uint32_t tVerify = millis();
-  if (!readSdPayload(stage.c_str(), staged) || staged != serialized) {
+  if (!verifySdMatches(stage.c_str(), serialized, len)) {
     SD.remove(stage);
     setReason("READBACK_FAILED");
     return false;
   }
-  if (!validateJsonPayload(staged)) {
+  if (!validateJsonPayload(serialized, len)) {
     SD.remove(stage);
     setReason("JSON_VALIDATE_FAILED");
     return false;
@@ -1154,7 +1480,7 @@ bool StorageManager::writeJsonToSdOnce(const char *path,
   if (voucherDiag) Serial.println("[voucher-job] final rename ok");
   if (voucherDiag) Serial.println("[voucher-job] final verify start");
   const uint32_t tFinal = millis();
-  if (!verifySdMatches(path, serialized)) {
+  if (!verifySdMatches(path, serialized, len)) {
     SD.remove(path);
     if (SD.exists(backup)) SD.rename(backup, path);
     SD.remove(stage);
@@ -1182,16 +1508,30 @@ bool StorageManager::readJsonFromSd(const char *path, JsonDocument &doc) {
 
   File file = SD.open(path, FILE_READ);
   if (!file) {
-    // Missing path ≠ media removal (same classification contract as readSdPayload).
-    if (SD.cardType() == CARD_NONE) {
-      tripSdMediaMissing("readJson open failed");
-    } else if (SD.exists(path)) {
-      tripSdMediaMissing("readJson open failed");
+    // Hot-unplug often leaves cardType stale and exists() also failing, which
+    // previously logged path_absent and never entered degraded mode — Sync /
+    // Refresh then blocked on dead SD SPI (see serial Card Failed storm).
+    const uint8_t cardType = SD.cardType();
+    const bool pathPresent = (cardType != CARD_NONE) && SD.exists(path);
+    if (cardType == CARD_NONE) {
+      tripSdMediaMissing("readJson card absent");
+    } else if (pathPresent) {
+      _sdIoFailStreak++;
+      if (_sdIoFailStreak >= 2) {
+        tripSdMediaMissing("readJson open fail streak");
+      }
     } else {
-      Serial.printf(
-          "[sd-forensic] operation=readJsonFromSd path=%s open=FAIL "
-          "reason=path_absent\n",
-          path ? path : "(null)");
+      _sdIoFailStreak++;
+      if (_sdIoFailStreak >= 3) {
+        // Repeated open+exists failure while cardType still non-NONE = dead media.
+        tripSdMediaMissing("readJson card unresponsive");
+      } else {
+        Serial.printf(
+            "[sd-forensic] operation=readJsonFromSd path=%s open=FAIL "
+            "reason=path_or_media cardType=%u streak=%u\n",
+            path ? path : "(null)", static_cast<unsigned>(cardType),
+            static_cast<unsigned>(_sdIoFailStreak));
+      }
     }
     setError(String("Unable to open ") + path);
     return false;
@@ -1210,8 +1550,9 @@ bool StorageManager::readJsonFromSd(const char *path, JsonDocument &doc) {
         recovered.close();
         if (!recoveredErr) {
           _sdIoFailStreak = 0;
-          return true;
-        }
+          clearConflictForPath(path);
+    return true;
+  }
       } else {
         tripSdMediaMissing("readJson recover open failed");
       }
@@ -1219,17 +1560,27 @@ bool StorageManager::readJsonFromSd(const char *path, JsonDocument &doc) {
     return false;
   }
   _sdIoFailStreak = 0;
+  clearConflictForPath(path);
   return true;
 }
 
 bool StorageManager::writeJsonToSd(const char *path, JsonDocument &doc) {
-  String serialized;
-  serializeJson(doc, serialized);
-  return writeJsonToSdSerialized(path, serialized);
+  // Never serialize into Arduino String — that allocates INTERNAL/DMA SRAM and
+  // was proven to collapse dma_largest during RecordSale (sales-sd-read/write
+  // deltas of ~8 KB) → W5500 setup_dma_priv_buffer fail → Guru.
+  PsramBuffer serialized;
+  if (!serializeJsonToPsram(doc, serialized) || !serialized.buf) return false;
+  return writeJsonToSdSerialized(path, serialized.buf, serialized.len);
 }
 
 bool StorageManager::writeJsonToSdSerialized(const char *path,
                                              const String &serialized) {
+  return writeJsonToSdSerialized(path, serialized.c_str(), serialized.length());
+}
+
+bool StorageManager::writeJsonToSdSerialized(const char *path,
+                                             const char *serialized,
+                                             size_t len) {
   FinishTrace::BlockingOpScope ioScope(
       FinishTrace::pipelineActive()
           ? FinishTrace::storageWriteOp(path, "SD card write")
@@ -1238,7 +1589,7 @@ bool StorageManager::writeJsonToSdSerialized(const char *path,
   for (uint8_t attempt = 0;
        attempt < RenzFiConfig::STORAGE_WRITE_ATTEMPTS; ++attempt) {
     const char *failReason = "UNKNOWN";
-    if (writeJsonToSdOnce(path, serialized, &failReason)) return true;
+    if (writeJsonToSdOnce(path, serialized, len, &failReason)) return true;
     Serial.printf("[storage] SD write attempt %u/%u failed for %s reason=%s\n",
                   static_cast<unsigned>(attempt + 1),
                   static_cast<unsigned>(RenzFiConfig::STORAGE_WRITE_ATTEMPTS),
@@ -1256,7 +1607,7 @@ bool StorageManager::writeJsonToSdSerialized(const char *path,
   setDiagnosticCause("TRANSACTION_FAILED");
   emitStorageChanged();
   refreshRuntimeSnapshot();
-  return false;
+    return false;
 }
 
 // ── SPIFFS fallback I/O ─────────────────────────────────────────────────────
@@ -1515,9 +1866,44 @@ bool StorageManager::readJson(const char *path, JsonDocument &doc) {
         // and holds valid JSON for this path, clear the stale dirty entry and
         // prefer SD (RESET must not resurrect pre-SD-write fallback).
         if (_sdWritable) {
+          if (strcmp(path, RenzFiConfig::SALES_FILE) == 0) {
+            String sdPayload;
+            String fbPayload;
+            if (readSdPayload(path, sdPayload) &&
+                validateJsonPayload(sdPayload) &&
+                readSpiffsPayload(toFallbackPath(path), fbPayload) &&
+                validateJsonPayload(fbPayload)) {
+              String merged;
+              if (mergeSalesJsonPayloads(sdPayload, fbPayload, merged) &&
+                  validateJsonPayload(merged)) {
+                if (deserializeJson(doc, merged) == DeserializationError::Ok &&
+                    doc.is<JsonArray>()) {
+                  return true;
+                }
+              }
+            }
+          } else if (strcmp(path, RenzFiConfig::PORTAL_SESSIONS_FILE) == 0) {
+            String sdPayload;
+            String fbPayload;
+            if (readSdPayload(path, sdPayload) &&
+                validateJsonPayload(sdPayload) &&
+                readSpiffsPayload(toFallbackPath(path), fbPayload) &&
+                validateJsonPayload(fbPayload)) {
+              String merged;
+              if (mergePortalSessionsJsonPayloads(sdPayload, fbPayload,
+                                                    merged) &&
+                  validateJsonPayload(merged)) {
+                if (deserializeJson(doc, merged) == DeserializationError::Ok &&
+                    doc["sessions"].is<JsonArray>()) {
+                  return true;
+                }
+              }
+            }
+          }
           String sdPayload;
           if (readSdPayload(path, sdPayload) && validateJsonPayload(sdPayload)) {
             removeFromManifest(toFallbackPath(path));
+            clearConflictForPath(path);
             if (readJsonFromSd(path, doc)) return true;
           }
         }
@@ -1558,9 +1944,8 @@ bool StorageManager::writeJson(const char *path, const JsonDocument &doc,
     Serial.println("[voucher-job] serialize start");
   }
   const uint32_t tSer = millis();
-  String serialized;
-  serializeJson(doc, serialized);
-  if (serialized.length() == 0) {
+  PsramBuffer serialized;
+  if (!serializeJsonToPsram(doc, serialized) || serialized.len == 0) {
     setError(String("JSON serialize failed for ") + path);
     if (voucherDiag) {
       Serial.printf(
@@ -1573,9 +1958,10 @@ bool StorageManager::writeJson(const char *path, const JsonDocument &doc,
     Serial.printf(
         "[voucher-job] serialize complete elapsed=%lu bytes=%u\n",
         static_cast<unsigned long>(millis() - tSer),
-        static_cast<unsigned>(serialized.length()));
+        static_cast<unsigned>(serialized.len));
   }
-  const uint32_t originalPayloadCrc = payloadCrc(serialized);
+  const uint32_t originalPayloadCrc =
+      payloadCrc(serialized.buf, serialized.len);
 
   // Defer baseCrc SD read until SD write fails and SPIFFS fallback is needed.
   // On the success path this avoided a full vouchers.json read (~hundreds ms).
@@ -1585,7 +1971,7 @@ bool StorageManager::writeJson(const char *path, const JsonDocument &doc,
   if (_sdWritable) {
     if (voucherDiag) Serial.println("[voucher-job] write start");
     const uint32_t tWrite = millis();
-    if (writeJsonToSdSerialized(path, serialized)) {
+    if (writeJsonToSdSerialized(path, serialized.buf, serialized.len)) {
       if (voucherDiag) {
         Serial.printf("[voucher-job] write complete elapsed=%lu\n",
                       static_cast<unsigned long>(millis() - tWrite));
@@ -1609,7 +1995,11 @@ bool StorageManager::writeJson(const char *path, const JsonDocument &doc,
         Serial.println("[voucher-job] checkpoint phase=spiffs_mirror start");
       }
       const uint32_t tMirror = millis();
-      const bool mirrored = checkpointToSpiffs(path, serialized);
+      // SPIFFS mirror is after the SD write; a short-lived String here is
+      // outside the SoftAP 1624-byte DMA overlap window.
+      String checkpointCopy;
+      checkpointCopy.concat(serialized.buf, serialized.len);
+      const bool mirrored = checkpointToSpiffs(path, checkpointCopy);
       if (voucherDiag) {
         Serial.printf(
             "[voucher-job] checkpoint phase=spiffs_mirror complete "
@@ -1643,15 +2033,17 @@ bool StorageManager::writeJson(const char *path, const JsonDocument &doc,
 
   // The exact immutable serialization attempted on SD is the fallback payload.
   // Detect any accidental future mutation before committing degraded storage.
-  if (payloadCrc(serialized) != originalPayloadCrc) {
+  if (payloadCrc(serialized.buf, serialized.len) != originalPayloadCrc) {
     setError(String("Fallback payload changed after SD failure for ") + path);
     return false;
   }
   _usingFallback = true;
   if (voucherDiag) Serial.println("[voucher-job] fallback write start");
   const uint32_t tFb = millis();
+  String fallbackCopy;
+  fallbackCopy.concat(serialized.buf, serialized.len);
   const bool written =
-      writeJsonToSpiffs(path, serialized, forcePortalWrite, baseCrc);
+      writeJsonToSpiffs(path, fallbackCopy, forcePortalWrite, baseCrc);
   if (voucherDiag) {
     Serial.printf(
         "[voucher-job] fallback write %s elapsed=%lu\n",
@@ -1773,6 +2165,7 @@ bool StorageManager::replayHistorySpools() {
       StoragePaths::Spiffs::SalesHistorySpool,
       StoragePaths::Spiffs::SessionsHistorySpool,
       StoragePaths::Spiffs::VouchersHistorySpool,
+      StoragePaths::Spiffs::LogsHistorySpool,
   };
   for (const char *spool : spools) before += countSpoolRecords(spool);
 
@@ -1836,10 +2229,10 @@ size_t StorageManager::fileSizeBytes(const char *path) const {
             "fileSize card absent");
       }
     } else {
-      size_t bytes = file.size();
-      file.close();
+    size_t bytes = file.size();
+    file.close();
       const_cast<StorageManager *>(this)->_sdIoFailStreak = 0;
-      return bytes;
+    return bytes;
     }
   }
   if (!_usingFallback || !_spiffsMounted || !isFallbackEligible(path)) return 0;
@@ -1951,18 +2344,24 @@ void StorageManager::removeFromManifest(const String &fbPath) {
 
 bool StorageManager::verifySdMatches(const char *sdPath,
                                      const String &expected) {
+  return verifySdMatches(sdPath, expected.c_str(), expected.length());
+}
+
+bool StorageManager::verifySdMatches(const char *sdPath, const char *expected,
+                                     size_t expectedLen) {
+  if (!expected) return false;
   File file = SD.open(sdPath, FILE_READ);
   if (!file) return false;
-  if (file.size() != expected.length()) {
-    file.close();
+  if (file.size() != expectedLen) {
+  file.close();
     return false;
   }
   // Buffered compare — same byte-equality guarantee as before.
   constexpr size_t kChunk = 512;
   uint8_t buf[kChunk];
   size_t offset = 0;
-  while (offset < expected.length()) {
-    const size_t want = expected.length() - offset;
+  while (offset < expectedLen) {
+    const size_t want = expectedLen - offset;
     const size_t n = file.read(buf, want > kChunk ? kChunk : want);
     if (n == 0) {
       file.close();
@@ -2045,6 +2444,22 @@ bool StorageManager::syncFallbackToSd() {
     }
     const uint32_t fallbackCrc = payloadCrc(payload);
     if (expectedCrc != 0 && expectedCrc != fallbackCrc) {
+      if (strcmp(sdPath, RenzFiConfig::SALES_FILE) == 0 &&
+          reconcileSalesFallbackToSd(fbPath, sdPath, payload, filesSynced,
+                                     bytesSynced)) {
+        if (summary.fileCount < RenzFiConfig::STORAGE_REPLAY_FILE_CAP) {
+          summary.files[summary.fileCount++] = fallbackFileLabel(fbPath);
+        }
+        continue;
+      }
+      if (strcmp(sdPath, RenzFiConfig::PORTAL_SESSIONS_FILE) == 0 &&
+          reconcilePortalSessionsFallbackToSd(fbPath, sdPath, payload,
+                                              filesSynced, bytesSynced)) {
+        if (summary.fileCount < RenzFiConfig::STORAGE_REPLAY_FILE_CAP) {
+          summary.files[summary.fileCount++] = fallbackFileLabel(fbPath);
+        }
+        continue;
+      }
       allOk = false;
       _snapshotCrcHealthKnown = true;
       _snapshotCrcHealthy = false;
@@ -2060,10 +2475,7 @@ bool StorageManager::syncFallbackToSd() {
     if (sdExists) {
       const uint32_t currentCrc = payloadCrc(current);
       if (currentCrc == fallbackCrc) {
-        SPIFFS.remove((String(fbPath) +
-                       StoragePaths::TransactionStageSuffix).c_str());
-        SPIFFS.remove((String(fbPath) +
-                       StoragePaths::TransactionBackupSuffix).c_str());
+        removeSpiffsFallbackArtifacts(fbPath);
         removeFromManifest(fbPath);
         filesSynced++;
         bytesSynced += payload.length();
@@ -2073,6 +2485,22 @@ bool StorageManager::syncFallbackToSd() {
         continue;
       }
       if (baseCrc == 0 || currentCrc != baseCrc) {
+        if (strcmp(sdPath, RenzFiConfig::SALES_FILE) == 0 &&
+            reconcileSalesFallbackToSd(fbPath, sdPath, payload, filesSynced,
+                                       bytesSynced)) {
+          if (summary.fileCount < RenzFiConfig::STORAGE_REPLAY_FILE_CAP) {
+            summary.files[summary.fileCount++] = fallbackFileLabel(fbPath);
+          }
+          continue;
+        }
+        if (strcmp(sdPath, RenzFiConfig::PORTAL_SESSIONS_FILE) == 0 &&
+            reconcilePortalSessionsFallbackToSd(fbPath, sdPath, payload,
+                                                filesSynced, bytesSynced)) {
+          if (summary.fileCount < RenzFiConfig::STORAGE_REPLAY_FILE_CAP) {
+            summary.files[summary.fileCount++] = fallbackFileLabel(fbPath);
+          }
+          continue;
+        }
         allOk = false;
         _snapshotCrcHealthKnown = true;
         _snapshotCrcHealthy = false;
@@ -2103,6 +2531,7 @@ bool StorageManager::syncFallbackToSd() {
                    StoragePaths::TransactionStageSuffix).c_str());
     SPIFFS.remove((String(fbPath) +
                    StoragePaths::TransactionBackupSuffix).c_str());
+    SPIFFS.remove(fbPath);
     removeFromManifest(fbPath);
     filesSynced++;
     bytesSynced += payload.length();
@@ -2242,6 +2671,67 @@ bool StorageManager::writeBinary(const char *sdPath, const uint8_t *data,
     return false;
   }
   noteSuccessfulWrite();
+  return true;
+}
+
+bool StorageManager::mirrorSdFileToSpiffs(const char *sdPath,
+                                          const char *spiffsPath) {
+  if (!sdPath || !spiffsPath || !spiffsPath[0]) return false;
+  ScopedStorageLock lock(*this);
+  if (!lock || !_spiffsMounted || !_sdMounted || !_sdReadable) return false;
+
+  File in = SD.open(sdPath, FILE_READ);
+  if (!in) return false;
+  const size_t total = in.size();
+  if (total == 0) {
+    in.close();
+    return false;
+  }
+
+  const String stage =
+      String(spiffsPath) + StoragePaths::TransactionStageSuffix;
+  const String backup =
+      String(spiffsPath) + StoragePaths::TransactionBackupSuffix;
+  SPIFFS.remove(stage);
+  File out = SPIFFS.open(stage, "w");
+  if (!out) {
+    in.close();
+    return false;
+  }
+
+  uint8_t buf[1024];
+  size_t copied = 0;
+  while (in.available()) {
+    const size_t n = in.read(buf, sizeof(buf));
+    if (n == 0) break;
+    if (out.write(buf, n) != n) {
+      out.close();
+      in.close();
+      SPIFFS.remove(stage);
+      return false;
+    }
+    copied += n;
+  }
+  out.flush();
+  out.close();
+  in.close();
+  if (copied != total) {
+    SPIFFS.remove(stage);
+    return false;
+  }
+
+  if (SPIFFS.exists(spiffsPath)) {
+    SPIFFS.remove(backup);
+    SPIFFS.rename(spiffsPath, backup);
+  }
+  if (!SPIFFS.rename(stage, spiffsPath)) {
+    SPIFFS.remove(stage);
+    if (SPIFFS.exists(backup)) SPIFFS.rename(backup, spiffsPath);
+    return false;
+  }
+  SPIFFS.remove(backup);
+  Serial.printf("[storage] Mirrored SD→SPIFFS sd=%s spiffs=%s bytes=%u\n",
+                sdPath, spiffsPath, static_cast<unsigned>(total));
   return true;
 }
 
@@ -2556,9 +3046,9 @@ void StorageManager::fillDashboardStatus(JsonObject storage, JsonObject sd,
     sd["freeMb"] = snap.freeMb;
     sd["status"] = jsonCString(snap.sdStatus);
   } else {
-    sd["usedMb"] = 0;
-    sd["totalMb"] = 0;
-    sd["freeMb"] = 0;
+  sd["usedMb"] = 0;
+  sd["totalMb"] = 0;
+  sd["freeMb"] = 0;
     sd["status"] = jsonCString(snap.sdStatus);
   }
 
@@ -2683,25 +3173,39 @@ void StorageManager::refreshRuntimeSnapshot() {
   _snapshotStorageMode =
       mounted && !_usingFallback ? String("SD") : String("SPIFFS");
 
-  if (mounted && _sdReadable && !_usingFallback) {
-    _snapshotTotalBytes = SD.totalBytes();
-    _snapshotUsedBytes = SD.usedBytes();
+  const uint32_t nowMs = millis();
+  // Capacity probes (SD.totalBytes/usedBytes, SPIFFS used/total) hold the
+  // storage lock on SPI. Refreshing them every 2s health cycle starves
+  // async_tcp on CPU1 during login/dashboard HTTP storms.
+  const bool refreshCapacity =
+      _lastSnapshotCapacityMs == 0 ||
+      nowMs - _lastSnapshotCapacityMs >=
+          RenzFiConfig::STORAGE_SNAPSHOT_CAPACITY_INTERVAL_MS;
+  if (refreshCapacity) {
+    _lastSnapshotCapacityMs = nowMs;
+    if (mounted && _sdReadable && !_usingFallback) {
+      _snapshotTotalBytes = SD.totalBytes();
+      _snapshotUsedBytes = SD.usedBytes();
+      _snapshotFilesystemMount = "SD";
+  } else {
+      _snapshotTotalBytes = getSpiffsTotalBytes();
+      _snapshotUsedBytes = getSpiffsUsedBytes();
+      _snapshotFilesystemMount = _spiffsMounted ? "SPIFFS" : "NONE";
+    }
+    _snapshotFreeBytes =
+        _snapshotTotalBytes > _snapshotUsedBytes
+            ? _snapshotTotalBytes - _snapshotUsedBytes
+            : 0;
+    _snapshotCapacityMb = bytesToMb(_snapshotTotalBytes);
+    _snapshotUsedMb = bytesToMb(_snapshotUsedBytes);
+
+    _snapshotSpiffsUsedBytes = _spiffsMounted ? SPIFFS.usedBytes() : 0;
+    _snapshotSpiffsTotalBytes = _spiffsMounted ? SPIFFS.totalBytes() : 0;
+  } else if (mounted && _sdReadable && !_usingFallback) {
     _snapshotFilesystemMount = "SD";
   } else {
-    _snapshotTotalBytes = getSpiffsTotalBytes();
-    _snapshotUsedBytes = getSpiffsUsedBytes();
     _snapshotFilesystemMount = _spiffsMounted ? "SPIFFS" : "NONE";
   }
-  _snapshotFreeBytes =
-      _snapshotTotalBytes > _snapshotUsedBytes
-          ? _snapshotTotalBytes - _snapshotUsedBytes
-          : 0;
-  _snapshotCapacityMb = bytesToMb(_snapshotTotalBytes);
-  _snapshotUsedMb = bytesToMb(_snapshotUsedBytes);
-
-  _snapshotSpiffsUsedBytes = _spiffsMounted ? SPIFFS.usedBytes() : 0;
-  _snapshotSpiffsTotalBytes = _spiffsMounted ? SPIFFS.totalBytes() : 0;
-  const uint32_t nowMs = millis();
   // Heavy FS walks (fallbackTotalBytes, spool counts, manifest) starve
   // async_tcp on shared CPU1 if run every 2s health refresh. Keep last
   // values between intervals (ADMIN_LOGIN_TWDT_ROOT_CAUSE.md).
@@ -3139,16 +3643,16 @@ bool StorageManager::probeSdWritable() {
 
   static const char kPayload[] = "ok";
   {
-    File file = SD.open(probePath, FILE_WRITE);
+  File file = SD.open(probePath, FILE_WRITE);
     if (!file) {
       setDiagnosticCause("WRITE_PROBE_FAILED");
       return false;
     }
     const size_t written = file.print(kPayload);
     file.flush();
-    file.close();
+  file.close();
     if (written != strlen(kPayload)) {
-      if (SD.exists(probePath)) SD.remove(probePath);
+  if (SD.exists(probePath)) SD.remove(probePath);
       setDiagnosticCause("WRITE_PROBE_FAILED");
       return false;
     }

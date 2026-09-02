@@ -213,6 +213,17 @@ export default function SalesReportsPage() {
         <div className="flex flex-nowrap items-center gap-2.5 overflow-x-auto">
           <Button
             size="sm"
+            variant="secondary"
+            className="h-9 shrink-0 px-4"
+            onClick={() => {
+              void queryClient.invalidateQueries({ queryKey: ["sales"] });
+              void queryClient.invalidateQueries({ queryKey: ["system", "status"] });
+            }}
+          >
+            Reload Sales
+          </Button>
+          <Button
+            size="sm"
             variant="outline"
             className="h-9 shrink-0 px-4 border-red-500/40 bg-red-500/10 text-red-600 hover:bg-red-500/20 dark:text-red-400"
             disabled={resetMutation.isPending}
@@ -239,10 +250,8 @@ export default function SalesReportsPage() {
       </div>
       {(today?.undatedAmount || 0) > 0 || (weekly?.undatedAmount || 0) > 0 ? (
         <p className="text-xs text-muted-foreground">
-          Includes offline/undated COIN sales
-          {today?.clockReady === false
-            ? " (device clock not ready — totals use unclocked transactions)."
-            : " attributed to the current local business day once the clock is ready."}
+          Some COIN sales were recorded before the wall clock was ready and are listed as undated
+          until a session timestamp can be resolved — they are not added to Today automatically.
         </p>
       ) : null}
 

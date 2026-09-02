@@ -12,8 +12,9 @@ import {
   StatusBadge,
   StatusRow,
 } from "@/components/dashboard/DashboardPrimitives";
+import { StorageBar } from "@/components/dashboard/OpsCards";
 import { coinHardwareTone, type StatusTone } from "@/lib/dashboardDisplay";
-import { formatTimeOfDay } from "@/lib/dashboardFormat";
+import { formatMb, formatStorageFromMb, formatTimeOfDay } from "@/lib/dashboardFormat";
 import type { CoinState } from "@/types/api";
 
 export type DashboardStatusRow = {
@@ -76,7 +77,7 @@ export function SystemStatusCard({
               <StatusRow key={row.label} {...row} />
             ))}
           </div>
-          <CardLink to="/system-configuration">Open System Configuration</CardLink>
+          <CardLink to="/router-status">Open Router Status</CardLink>
         </DialogContent>
       </Dialog>
     </DashboardCard>
@@ -157,6 +158,18 @@ export function SdCardHealthCard({
   capacityLabel,
   uptimeLabel,
   mounted,
+  flashUsed,
+  flashTotal,
+  flashPct,
+  logsUsed,
+  logsTotal,
+  logsPct,
+  sdReady,
+  sdUsed,
+  sdTotal,
+  sdFree,
+  sdPct,
+  sdStatus,
 }: {
   loading: boolean;
   error: boolean;
@@ -167,6 +180,18 @@ export function SdCardHealthCard({
   capacityLabel: string;
   uptimeLabel: string;
   mounted: boolean;
+  flashUsed?: number;
+  flashTotal?: number;
+  flashPct: number;
+  logsUsed?: number;
+  logsTotal?: number;
+  logsPct: number;
+  sdReady: boolean;
+  sdUsed?: number;
+  sdTotal?: number;
+  sdFree?: number;
+  sdPct: number;
+  sdStatus: string;
 }) {
   const [open, setOpen] = useState(false);
   if (loading && capacityLabel === "N/A") return <CardSkeleton rows={5} />;
@@ -204,6 +229,42 @@ export function SdCardHealthCard({
         <RingStat value={capacityLabel} label="capacity" />
         <RingStat value="N/A" label="wear level" />
         <RingStat value={uptimeLabel} label="uptime" />
+      </div>
+      <div className="mt-4 space-y-2.5 border-t pt-3">
+        <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+          Storage usage
+        </p>
+        <StorageBar
+          label="Flash (SPIFFS)"
+          value={
+            flashUsed === undefined ? "N/A" : `${formatMb(flashUsed)} / ${formatMb(flashTotal)} MB`
+          }
+          percent={flashPct}
+          colorClass="bg-[#2FE0C4]"
+        />
+        <StorageBar
+          label="Logs"
+          value={logsUsed === undefined ? "N/A" : `${logsUsed} / ${logsTotal} KB`}
+          percent={logsPct}
+          colorClass="bg-[#F59E0B]"
+        />
+        <StorageBar
+          label="SD Card"
+          value={
+            sdReady
+              ? `${formatStorageFromMb(sdUsed)} / ${formatStorageFromMb(sdTotal)}`
+              : sdStatus || "N/A"
+          }
+          percent={sdReady ? sdPct : 0}
+          colorClass="bg-[#F59E0B]"
+        />
+        {sdReady ? (
+          <p className="text-[11px] text-muted-foreground">
+            Status: {sdStatus || "N/A"} • Free: {formatStorageFromMb(sdFree)}
+          </p>
+        ) : (
+          <p className="text-[11px] text-muted-foreground">Status: {sdStatus || "N/A"}</p>
+        )}
       </div>
       <div className="mt-3 text-right">
         <button

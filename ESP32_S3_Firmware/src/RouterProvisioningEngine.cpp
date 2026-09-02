@@ -24,6 +24,35 @@
 #include "ProductionNetworkTrace.h"
 #include "DmaMemoryMonitor.h"
 #include "RouterApiTransportGate.h"
+#include "RenzFiDebug.h"
+
+#if RENZFI_DEBUG_ROUTER
+#define HS_VERIFY_LOG(...) Serial.printf(__VA_ARGS__)
+#define HS_VERIFY_LN(msg)  Serial.println(msg)
+#else
+#define HS_VERIFY_LOG(...) ((void)0)
+#define HS_VERIFY_LN(msg)  ((void)0)
+#endif
+
+#if RENZFI_DEBUG_FINISH
+#define FINISH_STAGE_LOG(...) Serial.printf(__VA_ARGS__)
+#define FINISH_STAGE_LN(msg)  Serial.println(msg)
+#else
+#define FINISH_STAGE_LOG(...) ((void)0)
+#define FINISH_STAGE_LN(msg)  ((void)0)
+#endif
+
+#if RENZFI_DEBUG_ROUTER
+#define PORTAL_VERIFY_LOG(...) Serial.printf(__VA_ARGS__)
+#define PORTAL_VERIFY_LN(msg)  Serial.println(msg)
+#define ROUTER_CFG_LOG(...) Serial.printf(__VA_ARGS__)
+#define ROUTER_CFG_LN(msg) Serial.println(msg)
+#else
+#define PORTAL_VERIFY_LOG(...) ((void)0)
+#define PORTAL_VERIFY_LN(msg)  ((void)0)
+#define ROUTER_CFG_LOG(...) ((void)0)
+#define ROUTER_CFG_LN(msg) ((void)0)
+#endif
 
 namespace {
 
@@ -188,32 +217,33 @@ bool hotspotOnInterface(RouterOsClient &client, const String &ifaceName,
 }
 
 void hotspotVerifyLog(const char *key, const char *value) {
-  Serial.printf("[hotspot-verify] %s=%s\n", key, value ? value : "");
+  HS_VERIFY_LOG("[hotspot-verify] %s=%s\n", key, value ? value : "");
 }
 
 void hotspotVerifyLogBool(const char *key, bool value) {
-  Serial.printf("[hotspot-verify] %s=%s\n", key, value ? "true" : "false");
+  HS_VERIFY_LOG("[hotspot-verify] %s=%s\n", key, value ? "true" : "false");
 }
 
 void hotspotVerifyFail(const char *reason, const char *expected = nullptr,
                        const char *actual = nullptr) {
-  Serial.println(F("[hotspot-verify] RESULT=FAIL"));
-  Serial.printf("[hotspot-verify] FAILURE_REASON=%s\n",
+  HS_VERIFY_LN(F("[hotspot-verify] RESULT=FAIL"));
+  HS_VERIFY_LOG("[hotspot-verify] FAILURE_REASON=%s\n",
                 reason ? reason : "UNKNOWN");
   if (expected && expected[0]) {
-    Serial.printf("[hotspot-verify] expected=%s\n", expected);
+    HS_VERIFY_LOG("[hotspot-verify] expected=%s\n", expected);
   }
   if (actual && actual[0]) {
-    Serial.printf("[hotspot-verify] actual=%s\n", actual);
+    HS_VERIFY_LOG("[hotspot-verify] actual=%s\n", actual);
   }
 }
 
-void hotspotVerifyPass() { Serial.println(F("[hotspot-verify] RESULT=PASS")); }
+void hotspotVerifyPass() { HS_VERIFY_LN(F("[hotspot-verify] RESULT=PASS")); }
 
-// Finish-pipeline hotspot check — wireless direct, then bridged fallback.
+// Finish-pipeline hotspot check — wireless direct, bridged fallback, or bridge-only (hEX).
 bool verifyFinishHotspot(RouterOsClient &client, const String &wirelessIface,
                          const String &bridgeName, String &hotspotIdOut,
-                         String &profileOut, String &errorOut) {
+                         String &profileOut, String &errorOut,
+                         bool externalApBridgeOnly = false) {
   hotspotIdOut = "";
   profileOut   = "";
   errorOut.clear();
@@ -230,7 +260,7 @@ bool verifyFinishHotspot(RouterOsClient &client, const String &wirelessIface,
     return false;
   }
 
-  Serial.printf("[hotspot-verify] hotspotCount=%u\n",
+  HS_VERIFY_LOG("[hotspot-verify] hotspotCount=%u\n",
                 static_cast<unsigned>(hs.replyCount));
 
   bool foundOnWireless = false;
@@ -249,7 +279,7 @@ bool verifyFinishHotspot(RouterOsClient &client, const String &wirelessIface,
     replyAttr(hs, i, ".id", id);
     replyAttr(hs, i, "profile", profile);
 
-    Serial.printf("[hotspot-verify] hotspot[%u] name=%s interface=%s disabled=%s "
+    HS_VERIFY_LOG("[hotspot-verify] hotspot[%u] name=%s interface=%s disabled=%s "
                   "profile=%s id=%s\n",
                   static_cast<unsigned>(i), name.c_str(), iface.c_str(),
                   disabled.c_str(), profile.c_str(), id.c_str());
@@ -308,6 +338,18 @@ bool verifyFinishHotspot(RouterOsClient &client, const String &wirelessIface,
   }
 
   if (!bridgeName.isEmpty() && foundOnBridge) {
+    if (externalApBridgeOnly) {
+      if (bridgeHotspotProfile.isEmpty()) {
+        hotspotVerifyFail("MISSING_HOTSPOT_PROFILE", "profile", "(empty)");
+        errorOut = "Hotspot on guest bridge has no profile";
+        return false;
+      }
+      hotspotIdOut = bridgeHotspotId;
+      profileOut   = bridgeHotspotProfile;
+      hotspotVerifyLog("Validation Mode", "BRIDGE_ONLY");
+      hotspotVerifyPass();
+      return true;
+    }
     hotspotVerifyLog("Validation Mode", "BRIDGE_FALLBACK");
     if (wirelessIface.isEmpty()) {
       hotspotVerifyFail("WIRELESS_INTERFACE_MISSING", "selectedWirelessInterface",
@@ -331,7 +373,7 @@ bool verifyFinishHotspot(RouterOsClient &client, const String &wirelessIface,
     }
     hotspotIdOut = bridgeHotspotId;
     profileOut   = bridgeHotspotProfile;
-    Serial.println(F("[hotspot-verify] Bridge fallback accepted."));
+    HS_VERIFY_LN(F("[hotspot-verify] Bridge fallback accepted."));
     hotspotVerifyLog("wireless", wirelessIface.c_str());
     hotspotVerifyLog("bridge", bridgeName.c_str());
     hotspotVerifyLog("hotspotInterface", bridgeName.c_str());
@@ -406,15 +448,15 @@ PortalVerifyReport verifyMikroTikCaptivePortal(
   PortalVerifyReport report;
   report.blocking = false;
   const char *modeLabel = portalDeploymentModeLabel(mode);
-  Serial.printf("[portal-verify] mode=%s\n", modeLabel);
-  Serial.printf("[portal-verify] profile=%s\n",
+  PORTAL_VERIFY_LOG("[portal-verify] mode=%s\n", modeLabel);
+  PORTAL_VERIFY_LOG("[portal-verify] profile=%s\n",
                 profileName.isEmpty() ? "(unknown)" : profileName.c_str());
 
   if (mode == RouterProvisioningEngine::PortalDeploymentMode::Skipped) {
     report.status = "skipped";
     report.detail = "Portal verification skipped by installer";
-    Serial.println(F("[portal-verify] result=SKIPPED"));
-    Serial.println(F("[portal-verify] blocking=false"));
+    PORTAL_VERIFY_LN(F("[portal-verify] result=SKIPPED"));
+    PORTAL_VERIFY_LN(F("[portal-verify] blocking=false"));
     return report;
   }
 
@@ -425,36 +467,36 @@ PortalVerifyReport verifyMikroTikCaptivePortal(
     DmaMemoryMonitor::logSnapshot("after portal-profile");
     report.status = "unverified";
     report.detail = resolveError;
-    Serial.printf("[portal-verify] htmlDirectory=(unresolved) error=%s\n",
+    PORTAL_VERIFY_LOG("[portal-verify] htmlDirectory=(unresolved) error=%s\n",
                   resolveError.c_str());
     if (mode == RouterProvisioningEngine::PortalDeploymentMode::Managed) {
       report.success  = false;
       report.blocking = true;
-      Serial.println(F("[portal-verify] result=FAILED"));
-      Serial.println(F("[portal-verify] blocking=true"));
+      PORTAL_VERIFY_LN(F("[portal-verify] result=FAILED"));
+      PORTAL_VERIFY_LN(F("[portal-verify] blocking=true"));
     } else {
-      Serial.println(F("[portal-verify] result=UNVERIFIED"));
-      Serial.println(F("[portal-verify] blocking=false"));
+      PORTAL_VERIFY_LN(F("[portal-verify] result=UNVERIFIED"));
+      PORTAL_VERIFY_LN(F("[portal-verify] blocking=false"));
     }
     return report;
   }
   DmaMemoryMonitor::logSnapshot("after portal-profile");
   report.htmlDirectory = htmlDir;
-  Serial.printf("[portal-verify] htmlDirectory=%s\n", htmlDir.c_str());
+  PORTAL_VERIFY_LOG("[portal-verify] htmlDirectory=%s\n", htmlDir.c_str());
 
   if (!DmaMemoryMonitor::hasEthTransmitHeadroom()) {
     DmaMemoryMonitor::logSnapshot("before portal-file-query");
     report.status = "unverified";
     report.detail = "SPI DMA memory low — portal file query deferred";
-    Serial.println(F("[portal-verify] SPI_DMA_ALLOCATION_FAILED (precheck)"));
+    PORTAL_VERIFY_LN(F("[portal-verify] SPI_DMA_ALLOCATION_FAILED (precheck)"));
     if (mode == RouterProvisioningEngine::PortalDeploymentMode::Managed) {
       report.success  = false;
       report.blocking = true;
-      Serial.println(F("[portal-verify] result=FAILED"));
-      Serial.println(F("[portal-verify] blocking=true"));
+      PORTAL_VERIFY_LN(F("[portal-verify] result=FAILED"));
+      PORTAL_VERIFY_LN(F("[portal-verify] blocking=true"));
     } else {
-      Serial.println(F("[portal-verify] result=UNVERIFIED"));
-      Serial.println(F("[portal-verify] blocking=false"));
+      PORTAL_VERIFY_LN(F("[portal-verify] result=UNVERIFIED"));
+      PORTAL_VERIFY_LN(F("[portal-verify] blocking=false"));
     }
     return report;
   }
@@ -481,42 +523,42 @@ PortalVerifyReport verifyMikroTikCaptivePortal(
         client.lastErrorCode() == "ETH_DMA_LOW") {
       report.detail = "SPI_DMA_ALLOCATION_FAILED";
     }
-    Serial.printf("[portal-verify] file query failed: %s\n", report.detail.c_str());
+    PORTAL_VERIFY_LOG("[portal-verify] file query failed: %s\n", report.detail.c_str());
     if (mode == RouterProvisioningEngine::PortalDeploymentMode::Managed) {
       report.success  = false;
       report.blocking = true;
-      Serial.println(F("[portal-verify] result=FAILED"));
-      Serial.println(F("[portal-verify] blocking=true"));
+      PORTAL_VERIFY_LN(F("[portal-verify] result=FAILED"));
+      PORTAL_VERIFY_LN(F("[portal-verify] blocking=true"));
     } else {
-      Serial.println(F("[portal-verify] result=UNVERIFIED"));
-      Serial.println(F("[portal-verify] blocking=false"));
+      PORTAL_VERIFY_LN(F("[portal-verify] result=UNVERIFIED"));
+      PORTAL_VERIFY_LN(F("[portal-verify] blocking=false"));
     }
     return report;
   }
 
   report.loginHtmlPresent = files.replyCount > 0;
-  Serial.printf("[portal-verify] inventoryQueryCount=1\n");
-  Serial.printf("[portal-verify] loginHtml=%s\n",
+  PORTAL_VERIFY_LOG("[portal-verify] inventoryQueryCount=1\n");
+  PORTAL_VERIFY_LOG("[portal-verify] loginHtml=%s\n",
                 report.loginHtmlPresent ? "yes" : "no");
 
   if (report.loginHtmlPresent) {
     report.status = "verified";
-    Serial.println(F("[portal-verify] result=VERIFIED"));
-    Serial.println(F("[portal-verify] blocking=false"));
+    PORTAL_VERIFY_LN(F("[portal-verify] result=VERIFIED"));
+    PORTAL_VERIFY_LN(F("[portal-verify] blocking=false"));
     return report;
   }
 
   report.status = "unverified";
   report.detail = "Missing captive portal file: " + loginPath;
-  Serial.printf("[portal-verify] missing=%s\n", loginPath.c_str());
+  PORTAL_VERIFY_LOG("[portal-verify] missing=%s\n", loginPath.c_str());
   if (mode == RouterProvisioningEngine::PortalDeploymentMode::Managed) {
     report.success  = false;
     report.blocking = true;
-    Serial.println(F("[portal-verify] result=FAILED"));
-    Serial.println(F("[portal-verify] blocking=true"));
+    PORTAL_VERIFY_LN(F("[portal-verify] result=FAILED"));
+    PORTAL_VERIFY_LN(F("[portal-verify] blocking=true"));
   } else {
-    Serial.println(F("[portal-verify] result=UNVERIFIED"));
-    Serial.println(F("[portal-verify] blocking=false"));
+    PORTAL_VERIFY_LN(F("[portal-verify] result=UNVERIFIED"));
+    PORTAL_VERIFY_LN(F("[portal-verify] blocking=false"));
   }
   return report;
 }
@@ -542,7 +584,7 @@ bool ensureHotspotProfileHtmlDirectory(RouterOsClient &client,
   replyAttr(result, static_cast<uint8_t>(idx), ".id", id);
   replyAttr(result, static_cast<uint8_t>(idx), "html-directory", htmlDir);
   if (!mutateDirectory) {
-    Serial.printf("[finish-stage] hotspot-profile leave html-directory=%s\n",
+    FINISH_STAGE_LOG("[finish-stage] hotspot-profile leave html-directory=%s\n",
                   htmlDir.isEmpty() ? "(empty)" : htmlDir.c_str());
     return true;
   }
@@ -566,7 +608,7 @@ bool fetchPortalFile(RouterOsClient &client, const String &url,
       FinishTrace::pipelineActive()
           ? FinishTrace::portalFetchOp("RouterOS /tool/fetch")
           : FinishTrace::BlockingOpConfig{""});
-  Serial.printf("[finish-op] fetch url=%s dst=%s\n", url.c_str(), dstPath.c_str());
+  FINISH_STAGE_LOG("[finish-op] fetch url=%s dst=%s\n", url.c_str(), dstPath.c_str());
   if (fileExistsOnRouter(client, dstPath)) {
     FinishTrace::opEvent("RouterOS fetch skipped — file already on router");
     FinishTrace::opReturn("fetchPortalFile", true);
@@ -992,7 +1034,7 @@ bool RouterProvisioningEngine::syncProductionRouterCredentials(String &errorOut)
   _productionCredentialsOk = !credentials.host.isEmpty() &&
                              !credentials.username.isEmpty() &&
                              !credentials.password.isEmpty();
-  Serial.printf(
+  ROUTER_CFG_LOG(
       "[router-config] host=%s port=%u usernameConfigured=%s "
       "usernameLength=%u passwordConfigured=%s passwordLength=%u "
       "source=reconciled-from-setup\n",
@@ -1023,7 +1065,7 @@ bool RouterProvisioningEngine::ensureProductionRouterCredentials(
       const String host     = stored["host"] | "";
       const String username = stored["username"] | "";
       const String password = stored["password"] | "";
-      Serial.printf(
+      ROUTER_CFG_LOG(
           "[router-config] host=%s port=%u usernameConfigured=%s "
           "usernameLength=%u passwordConfigured=%s passwordLength=%u "
           "source=router.json\n",
@@ -1037,7 +1079,7 @@ bool RouterProvisioningEngine::ensureProductionRouterCredentials(
         return true;
       }
     } else {
-      Serial.println("[router-config] source=router.json readable=no");
+      ROUTER_CFG_LN("[router-config] source=router.json readable=no");
     }
   }
 
@@ -1046,15 +1088,26 @@ bool RouterProvisioningEngine::ensureProductionRouterCredentials(
     return false;
   }
 
-  Serial.println(
+  ROUTER_CFG_LN(
       "[router-credentials] production router.json incomplete — reconciling "
       "from setup-verified connection");
   if (!syncProductionRouterCredentials(errorOut)) {
-    Serial.printf("[router-credentials] reconcile failed: %s\n",
+    // Hot-unplug may still report SD_READY while SPI is dead. Force degraded
+    // mode then retry SPIFFS write so loadRouterCredentials can succeed.
+    if (_storage && _storage->isSdMounted() && !_storage->usingFallback()) {
+      _storage->reportSdMediaMissing("router credentials while SD unreadable");
+      errorOut = "";
+      if (syncProductionRouterCredentials(errorOut)) {
+        ROUTER_CFG_LN(
+            "[router-credentials] production router.json reconciled via SPIFFS");
+        return _productionCredentialsOk;
+      }
+    }
+    ROUTER_CFG_LOG("[router-credentials] reconcile failed: %s\n",
                   errorOut.c_str());
     return false;
   }
-  Serial.println("[router-credentials] production router.json reconciled");
+  ROUTER_CFG_LN("[router-credentials] production router.json reconciled");
   return _productionCredentialsOk;
 }
 
@@ -1084,26 +1137,30 @@ RouterProvisioningEngine::persistLocalState() {
   }
 
   String iface, policy, ssid;
-  {
-    FinishTrace::OpScope op("resolveWirelessSelection");
-    const OperationResult wireless = resolveWirelessSelection(iface, policy, ssid);
-    if (!wireless.success) {
-      op.fail();
-      fn.fail();
-      FinishTrace::opReturn("persistLocalState", false);
-      return wireless;
+  const bool externalApOnly =
+      _routerProvisioning && _routerProvisioning->externalApOnly();
+  if (!externalApOnly) {
+    {
+      FinishTrace::OpScope op("resolveWirelessSelection");
+      const OperationResult wireless = resolveWirelessSelection(iface, policy, ssid);
+      if (!wireless.success) {
+        op.fail();
+        fn.fail();
+        FinishTrace::opReturn("persistLocalState", false);
+        return wireless;
+      }
     }
-  }
 
-  {
-    FinishTrace::OpScope op("persistWirelessSelection");
-    if (!persistWirelessSelection(iface, policy, ssid)) {
-      op.fail();
-      fn.fail();
-      result.errorCode    = "PERSIST_FAILED";
-      result.errorMessage = "Unable to persist wireless interface selection";
-      FinishTrace::opReturn("persistLocalState", false);
-      return result;
+    {
+      FinishTrace::OpScope op("persistWirelessSelection");
+      if (!persistWirelessSelection(iface, policy, ssid)) {
+        op.fail();
+        fn.fail();
+        result.errorCode    = "PERSIST_FAILED";
+        result.errorMessage = "Unable to persist wireless interface selection";
+        FinishTrace::opReturn("persistLocalState", false);
+        return result;
+      }
     }
   }
 
@@ -1118,6 +1175,15 @@ RouterProvisioningEngine::resolveWirelessSelection(String &interfaceOut,
                                                    String &targetSsidOut) {
   OperationResult result;
   result.stage = "resolve-wireless";
+
+  if (_routerProvisioning && _routerProvisioning->externalApOnly()) {
+    interfaceOut   = "";
+    ssidPolicyOut  = kSsidPolicyKeep;
+    targetSsidOut  = "";
+    result.success = true;
+    FinishTrace::opReturn("resolveWirelessSelection", true);
+    return result;
+  }
 
   if (!_selectedWirelessInterface.isEmpty()) {
     FinishTrace::opEvent("cached wireless interface — skip RouterOS probe");
@@ -1377,7 +1443,9 @@ RouterProvisioningEngine::runFinishPipeline(ProgressFn progressFn,
     }
   }
 
-  if (ssidPolicy == kSsidPolicyRename && !targetSsid.isEmpty()) {
+  if (!(_routerProvisioning && _routerProvisioning->externalApOnly()) &&
+      ssidPolicy == kSsidPolicyRename && !targetSsid.isEmpty() &&
+      !wirelessIface.isEmpty()) {
     FinishTrace::StageScope stage("wireless-ssid");
     reportProgress(progressFn, progressCtx, "wireless-ssid",
                    "Updating guest SSID...");
@@ -1432,8 +1500,11 @@ RouterProvisioningEngine::runFinishPipeline(ProgressFn progressFn,
     FinishTrace::StageScope stage("hotspot-verify");
     reportProgress(progressFn, progressCtx, "hotspot-verify", "Verifying hotspot...");
     const String bridgeName = _routerProvisioning->guestBridgeName();
+    const bool externalApBridgeOnly =
+        _routerProvisioning && _routerProvisioning->externalApOnly();
     if (!verifyFinishHotspot(session.client(), wirelessIface, bridgeName,
-                               hotspotId, profileName, sessionError)) {
+                               hotspotId, profileName, sessionError,
+                               externalApBridgeOnly)) {
       stage.fail();
       session.close();
       _running = false;
@@ -1453,20 +1524,20 @@ RouterProvisioningEngine::runFinishPipeline(ProgressFn progressFn,
     reportProgress(progressFn, progressCtx, "portal-verify",
                    "Verifying captive portal files...");
     const auto mode = _portalDeploymentMode;
-    Serial.printf("[finish-stage] portal mode=%s\n",
+    FINISH_STAGE_LOG("[finish-stage] portal mode=%s\n",
                   portalDeploymentModeLabel(mode));
     const PortalVerifyReport portal =
         verifyMikroTikCaptivePortal(session.client(), profileName, mode);
     result.portalDeploymentMode = portalDeploymentModeLabel(mode);
     result.portalStatus         = portal.status;
     result.portalBlocking       = portal.blocking;
-    Serial.printf("[finish-stage] portal verification=%s\n",
+    FINISH_STAGE_LOG("[finish-stage] portal verification=%s\n",
                   (strcmp(portal.status, "skipped") == 0)
                       ? "SKIPPED"
                       : ((strcmp(portal.status, "verified") == 0)
                              ? "VERIFIED"
                              : "UNVERIFIED"));
-    Serial.printf("[finish-stage] portal gate blocking=%s\n",
+    FINISH_STAGE_LOG("[finish-stage] portal gate blocking=%s\n",
                   portal.blocking ? "true" : "false");
     if (!portal.success && portal.blocking) {
       stage.fail();
@@ -1482,8 +1553,8 @@ RouterProvisioningEngine::runFinishPipeline(ProgressFn progressFn,
       return result;
     }
     // Non-blocking MANUAL_EXTERNAL / SKIPPED: continue even when unverified.
-    Serial.println(F("[finish-stage] portal gate blocking=false"));
-    Serial.println(F("[finish-stage] required gates PASS"));
+    FINISH_STAGE_LN(F("[finish-stage] portal gate blocking=false"));
+    FINISH_STAGE_LN(F("[finish-stage] required gates PASS"));
   }
 
   {
@@ -1530,23 +1601,23 @@ RouterProvisioningEngine::runFinishPipeline(ProgressFn progressFn,
     // skip and continue — same pattern as non-blocking portal-verify.
     bool scriptsOk = false;
     if (RouterApiTransportGate::cpuUnderPressure()) {
-      Serial.println(F("[finish-stage] OPTIONAL stage scripts unavailable"));
-      Serial.println(F("[finish-stage] scripts skipped reason=router_cpu_high"));
-      Serial.println(F("[finish-stage] scripts blocking=false"));
-      Serial.println(F("[finish-stage] continuing finish"));
+      FINISH_STAGE_LN(F("[finish-stage] OPTIONAL stage scripts unavailable"));
+      FINISH_STAGE_LN(F("[finish-stage] scripts skipped reason=router_cpu_high"));
+      FINISH_STAGE_LN(F("[finish-stage] scripts blocking=false"));
+      FINISH_STAGE_LN(F("[finish-stage] continuing finish"));
     } else if (!ensureManagedScript(session.client(), "renzfi-hotspot-ready",
                                     ":log info \"RENZFI: hotspot provisioning marker\"",
                                     sessionError)) {
-      Serial.printf("[finish-stage] OPTIONAL stage scripts unavailable detail=%s\n",
+      FINISH_STAGE_LOG("[finish-stage] OPTIONAL stage scripts unavailable detail=%s\n",
                     sessionError.c_str());
-      Serial.println(
+      FINISH_STAGE_LN(
           F("[finish-stage] scripts skipped reason=router_read_failed"));
-      Serial.println(F("[finish-stage] scripts blocking=false"));
-      Serial.println(F("[finish-stage] continuing finish"));
+      FINISH_STAGE_LN(F("[finish-stage] scripts blocking=false"));
+      FINISH_STAGE_LN(F("[finish-stage] continuing finish"));
     } else {
       scriptsOk = true;
-      Serial.println(F("[finish-stage] scripts result=PASS"));
-      Serial.println(F("[finish-stage] scripts blocking=false"));
+      FINISH_STAGE_LN(F("[finish-stage] scripts result=PASS"));
+      FINISH_STAGE_LN(F("[finish-stage] scripts blocking=false"));
     }
     (void)scriptsOk;
   }
@@ -1664,7 +1735,7 @@ RouterProvisioningEngine::runFinishPipeline(ProgressFn progressFn,
     if (!_router || !_router->persistFinishRouterCache(
                         verifyActiveResult.as<JsonObjectConst>())) {
       cacheStage.fail();
-      Serial.println(
+      FINISH_STAGE_LN(
           "[finish] WARNING router-cache persist failed after production "
           "activation — continuing (cache is non-blocking for Finish)");
       // Non-fatal: do not return. commitFinishInstallationState still runs.

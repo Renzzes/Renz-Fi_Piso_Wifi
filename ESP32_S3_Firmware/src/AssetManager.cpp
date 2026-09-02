@@ -143,7 +143,8 @@ bool AssetManager::extensionAllowed(AssetType type,
       return endsWithIgnoreCase(filename, ".webp") ||
              endsWithIgnoreCase(filename, ".png") ||
              endsWithIgnoreCase(filename, ".jpg") ||
-             endsWithIgnoreCase(filename, ".jpeg");
+             endsWithIgnoreCase(filename, ".jpeg") ||
+             endsWithIgnoreCase(filename, ".mp4");
     case AssetType::Music:
       return endsWithIgnoreCase(filename, ".mp3");
     case AssetType::Video:
@@ -179,8 +180,9 @@ bool AssetManager::magicBytesMatch(AssetType type, const uint8_t *data,
           endsWithIgnoreCase(filename, ".jpeg")) {
         return isJpegMagic(data, len);
       }
+      if (endsWithIgnoreCase(filename, ".mp4")) return isMp4Magic(data, len);
       return isWebpMagic(data, len) || isPngMagic(data, len) ||
-             isJpegMagic(data, len);
+             isJpegMagic(data, len) || isMp4Magic(data, len);
     case AssetType::Music:
       return isMp3Magic(data, len);
     case AssetType::Video:
@@ -496,6 +498,22 @@ AssetOperationResult AssetManager::commitAsset(
   return commitStagedAsset(type, slot, uploadFilename, stagingPath, len);
 }
 
+namespace {
+
+String mimeForUploadFilename(const String &filename, AssetType type) {
+  if (endsWithIgnoreCase(filename, ".mp4")) return "video/mp4";
+  if (endsWithIgnoreCase(filename, ".png")) return "image/png";
+  if (endsWithIgnoreCase(filename, ".jpg") ||
+      endsWithIgnoreCase(filename, ".jpeg")) {
+    return "image/jpeg";
+  }
+  if (endsWithIgnoreCase(filename, ".webp")) return "image/webp";
+  if (type == AssetType::Music) return "audio/mpeg";
+  return assetCanonicalMimeType(type);
+}
+
+}  // namespace
+
 AssetOperationResult AssetManager::commitStagedAsset(
     AssetType type, uint8_t slot, const String &uploadFilename,
     const String &stagingPath, size_t len) {
@@ -542,9 +560,13 @@ AssetOperationResult AssetManager::commitStagedAsset(
                                       "Unable to promote staged asset");
   }
 
-  const AssetInfo info =
-      buildAssetInfo(type, slot, sdPath, spiffsPath, canonicalFilename, len,
-                     AssetStorageLocation::Sd, checksum);
+  const AssetInfo info = [&]() {
+    AssetInfo built =
+        buildAssetInfo(type, slot, sdPath, spiffsPath, canonicalFilename, len,
+                       AssetStorageLocation::Sd, checksum);
+    built.mimeType = mimeForUploadFilename(uploadFilename, type);
+    return built;
+  }();
 
   CachedAsset *cache = cacheFor(type, slot);
   const CachedAsset previousCache = cache ? *cache : CachedAsset();
@@ -565,8 +587,12 @@ AssetOperationResult AssetManager::commitStagedAsset(
                                       "Unable to persist metadata");
   }
   SD.remove(backupPath);
-  if (spiffsPath.length() > 0) {
-    _storage->removeBinary(nullptr, spiffsPath.c_str());
+  if (spiffsPath.length() > 0 && _storage) {
+    if (!_storage->mirrorSdFileToSpiffs(sdPath.c_str(), spiffsPath.c_str())) {
+      Serial.printf(
+          "[assets] SPIFFS mirror skipped/failed type=%s sd=%s spiffs=%s\n",
+          assetTypeLabel(type), sdPath.c_str(), spiffsPath.c_str());
+    }
   }
   if (type == AssetType::Banner) {
     SD.remove(StoragePaths::LegacyPortalBanner);
@@ -698,6 +724,11 @@ AssetOperationResult AssetManager::appendSaveChunk(const uint8_t *data,
     if (!_upload.stagingFile ||
         _upload.stagingFile.write(data, len) != len) {
       const AssetType type = _upload.type;
+      Serial.printf(
+          "[assets] staging write failed type=%u received=%u chunk=%u "
+          "dma_free≈check serial dma lines\n",
+          static_cast<unsigned>(type), (unsigned)_upload.received,
+          (unsigned)len);
       abortSaveAsset();
       return AssetOperationResult::fail(type, AssetErrorCode::StorageError,
                                         "Unable to write upload staging file");

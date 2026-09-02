@@ -1,13 +1,10 @@
 import { api, ApiError, isApiError, isNetworkError } from "./api";
 import { embeddedApi } from "./embeddedApi";
 
-export const ACCESS_POINT_VENDORS = [
-  "generic",
-  "tp-link",
-  "ruijie",
-  "tenda",
-  "other",
-] as const;
+/** Shared React Query key — Dashboard and Access Points page must use the same cache. */
+export const ACCESS_POINTS_QUERY_KEY = ["access-points"] as const;
+
+export const ACCESS_POINT_VENDORS = ["generic", "tp-link", "ruijie", "tenda", "other"] as const;
 
 export type AccessPointVendor = (typeof ACCESS_POINT_VENDORS)[number];
 
@@ -102,6 +99,7 @@ export type AccessPointDetectPayload = {
   message?: string;
   data?: {
     devices?: AccessPointDetectDevice[];
+    registeredDevices?: AccessPointDetectDevice[];
     source?: string;
     oneTime?: boolean;
     arpRows?: number;
@@ -154,11 +152,7 @@ export function accessPointJobSucceeded(job: AccessPointJob): boolean {
   if (job.online === true) return true;
   if (job.online === false) return false;
   const status = (job.status ?? "").trim().toLowerCase();
-  return (
-    status === "online" ||
-    status === "network_reachable" ||
-    status === "management_reachable"
-  );
+  return status === "online" || status === "network_reachable" || status === "management_reachable";
 }
 
 function parseIpv4Octets(ip: string): number[] | null {
@@ -183,15 +177,72 @@ export function isDetectCandidateIp(ip: string): boolean {
   // ESP32 SoftAP / appliance management exclusions
   if (a === 192 && b === 168 && c === 4) return false;
   if (ip === "10.10.10.1" || ip === "10.10.10.2" || ip === "10.20.0.1") return false;
-  const privateRfc1918 =
-    a === 10 ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168);
+  const privateRfc1918 = a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
   return privateRfc1918;
 }
 
-export function parseDetectDevices(
+export function parseDetectFailureMessage(job: AccessPointDetectJob): string {
+  let payload: unknown = job.result;
+  if (typeof payload === "string") {
+    try {
+      payload = JSON.parse(payload);
+    } catch {
+      payload = null;
+    }
+  }
+  if (payload && typeof payload === "object") {
+    const row = payload as {
+      error?: string;
+      code?: string;
+      message?: string;
+      data?: { error?: string; code?: string } | string;
+    };
+    const nested =
+      typeof row.data === "string"
+        ? (() => {
+            try {
+              return JSON.parse(row.data) as {
+                error?: string;
+                code?: string;
+              };
+            } catch {
+              return null;
+            }
+          })()
+        : row.data && typeof row.data === "object"
+          ? row.data
+          : null;
+    const error =
+      (typeof row.error === "string" && row.error) ||
+      (typeof nested?.error === "string" && nested.error) ||
+      (typeof row.message === "string" && row.message) ||
+      "";
+    const code =
+      (typeof row.code === "string" && row.code) ||
+      (typeof nested?.code === "string" && nested.code) ||
+      "";
+    if (error && code) return `${error} (${code})`;
+    if (error) return error;
+    if (code) return code;
+  }
+  if (typeof job.httpStatus === "number" && job.httpStatus >= 400) {
+    return `Detect failed (HTTP ${job.httpStatus})`;
+  }
+  return "Detect failed — confirm MikroTik credentials and Router Worker are healthy.";
+}
+
+export function parseDetectDevices(job: AccessPointDetectJob): AccessPointDetectDevice[] {
+  return parseDetectDeviceRows(job, "devices");
+}
+
+/** Bridge ports for already-registered AP IPs (filtered out of candidate list). */
+export function parseDetectRegisteredDevices(job: AccessPointDetectJob): AccessPointDetectDevice[] {
+  return parseDetectDeviceRows(job, "registeredDevices");
+}
+
+function parseDetectDeviceRows(
   job: AccessPointDetectJob,
+  key: "devices" | "registeredDevices",
 ): AccessPointDetectDevice[] {
   let payload = job.result;
   if (typeof payload === "string") {
@@ -202,7 +253,7 @@ export function parseDetectDevices(
     }
   }
   if (!payload || typeof payload !== "object") return [];
-  const devices = payload.data?.devices;
+  const devices = payload.data?.[key];
   if (!Array.isArray(devices)) return [];
   return devices.filter(
     (row): row is AccessPointDetectDevice =>
@@ -210,8 +261,56 @@ export function parseDetectDevices(
       typeof row?.mac === "string" &&
       row.ip.length > 0 &&
       row.mac.length > 0 &&
-      isDetectCandidateIp(row.ip),
+      (key === "registeredDevices" || isDetectCandidateIp(row.ip)),
   );
+}
+
+const DETECT_BRIDGE_PORT_KEY = "renzfi-ap-bridge-ports";
+
+export function loadPersistedDetectBridgePorts(): Record<string, string> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = sessionStorage.getItem(DETECT_BRIDGE_PORT_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return {};
+    const out: Record<string, string> = {};
+    for (const [ip, port] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof ip === "string" && typeof port === "string" && port.trim()) {
+        out[ip.trim()] = port.trim();
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function persistDetectBridgePorts(
+  devices: AccessPointDetectDevice[],
+): Record<string, string> {
+  const existing = loadPersistedDetectBridgePorts();
+  for (const device of devices) {
+    const ip = device.ip?.trim();
+    const port = device.bridgePort?.trim();
+    if (ip && port) existing[ip] = port;
+  }
+  if (typeof window !== "undefined") {
+    sessionStorage.setItem(DETECT_BRIDGE_PORT_KEY, JSON.stringify(existing));
+  }
+  return existing;
+}
+
+export function resolveDetectBridgePort(
+  managementIp: string | undefined,
+  devices: AccessPointDetectDevice[],
+): string | undefined {
+  const ip = managementIp?.trim();
+  if (!ip) return undefined;
+  const match = devices.find((device) => device.ip.trim() === ip);
+  if (match?.bridgePort?.trim()) return match.bridgePort.trim();
+  const persisted = loadPersistedDetectBridgePorts()[ip];
+  return persisted?.trim() || undefined;
 }
 
 async function pollAccessPointJobOnce(jobId: number): Promise<AccessPointJob> {
@@ -222,10 +321,9 @@ async function pollAccessPointJobOnce(jobId: number): Promise<AccessPointJob> {
   while (Date.now() - startedAt < POLL_DEADLINE_MS) {
     let job: AccessPointJob;
     try {
-      job = await api.get<AccessPointJob>(
-        `${embeddedApi.accessPoints}/jobs/${jobId}`,
-        { timeoutMs: 15_000 },
-      );
+      job = await api.get<AccessPointJob>(`${embeddedApi.accessPoints}/jobs/${jobId}`, {
+        timeoutMs: 15_000,
+      });
       networkFailures = 0;
     } catch (err) {
       if (isNetworkError(err) && networkFailures < NETWORK_RETRY_LIMIT) {
@@ -282,10 +380,7 @@ export const accessPointsApi = {
   create: (payload: AccessPointWritePayload) =>
     api.post<AccessPointRecord>(embeddedApi.accessPoints, payload),
   update: (id: string, payload: AccessPointWritePayload) =>
-    api.put<AccessPointRecord>(
-      `${embeddedApi.accessPoints}/${encodeURIComponent(id)}`,
-      payload,
-    ),
+    api.put<AccessPointRecord>(`${embeddedApi.accessPoints}/${encodeURIComponent(id)}`, payload),
   remove: (id: string) =>
     api.delete<{ ok: boolean; id: string }>(
       `${embeddedApi.accessPoints}/${encodeURIComponent(id)}`,
@@ -303,21 +398,12 @@ export const accessPointsApi = {
   getAccessPointJob: (jobId: number) =>
     api.get<AccessPointJob>(`${embeddedApi.accessPoints}/jobs/${jobId}`),
   checkAndWait: (id: string) =>
-    queueAndWait(
-      () => accessPointsApi.checkAccessPoint(id),
-      "Check did not return a job id",
-    ),
+    queueAndWait(() => accessPointsApi.checkAccessPoint(id), "Check did not return a job id"),
   syncAndWait: (id: string) =>
-    queueAndWait(
-      () => accessPointsApi.syncAccessPoint(id),
-      "Sync did not return a job id",
-    ),
-  queueDetect: () =>
-    api.post<AccessPointDetectQueued>(`${embeddedApi.accessPoints}/detect`, {}),
+    queueAndWait(() => accessPointsApi.syncAccessPoint(id), "Sync did not return a job id"),
+  queueDetect: () => api.post<AccessPointDetectQueued>(`${embeddedApi.accessPoints}/detect`, {}),
   getDetectJob: (jobId: number) =>
-    api.get<AccessPointDetectJob>(
-      `${embeddedApi.accessPoints}/detect/jobs/${jobId}`,
-    ),
+    api.get<AccessPointDetectJob>(`${embeddedApi.accessPoints}/detect/jobs/${jobId}`),
   detectAndWait: async (): Promise<AccessPointDetectJob> => {
     const queued = await accessPointsApi.queueDetect();
     const jobId = queued.jobId;
@@ -355,9 +441,7 @@ export const accessPointsApi = {
         if (isTerminalState(state)) return job;
         await sleep(POLL_MS);
       }
-      throw new Error(
-        "Access point detect timed out waiting for MikroTik ARP results.",
-      );
+      throw new Error("Access point detect timed out waiting for MikroTik ARP results.");
     })().finally(() => {
       activeDetectPollers.delete(jobId);
     });

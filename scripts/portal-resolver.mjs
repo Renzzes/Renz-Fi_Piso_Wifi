@@ -76,7 +76,7 @@ export function validateStatusHtml(html) {
   if (!html.includes('id="macAddress">$(mac)</strong>') && !html.includes("$(mac)")) {
     errors.push("status.html must expose MikroTik $(mac)");
   }
-  if (!html.includes('src="renzfi-app.js"')) {
+  if (!/src=["']\/?renzfi-app\.js/.test(html)) {
     errors.push("status.html must load the same renzfi-app.js as login.html");
   }
   if (!html.includes("renzfi-style.css")) {

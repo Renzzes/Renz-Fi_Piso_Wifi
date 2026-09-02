@@ -11,6 +11,14 @@ class WebResponse {
   static void addCorsHeaders(AsyncWebServerResponse *res);
   static void addSecurityHeaders(AsyncWebServerResponse *res);
 
+  // Shared DMA safety gate for every response that will transmit over
+  // Ethernet (W5500 SPI). Sends 503 ETH_DMA_LOW + Retry-After (or closes the
+  // client when DMA is already below the W5500 RX survival floor) and returns
+  // false when dma_largest is below the HTTP-admit threshold. Callers must
+  // return immediately when this returns false.
+  static bool ensureEthTransmitHeadroom(AsyncWebServerRequest *req,
+                                        const char *reason);
+
   static void serveFile(AsyncWebServerRequest *req, fs::FS &fs,
                         const String &fsPath, const String &mimePath,
                         CachePolicy cache = CachePolicy::NoCache,

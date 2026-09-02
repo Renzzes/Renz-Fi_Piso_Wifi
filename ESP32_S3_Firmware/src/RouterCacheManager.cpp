@@ -27,6 +27,36 @@ bool copyOptionalStringField(JsonObjectConst src, const char *key, JsonObject ds
   return true;
 }
 
+bool shouldPreserveHotspotStatus(const char *existing, const char *incoming) {
+  if (!incoming || strlen(incoming) == 0) return true;
+  if (!existing || strlen(existing) == 0) return false;
+  return strcmp(existing, "available") == 0 &&
+         (strcmp(incoming, "unavailable") == 0 || strcmp(incoming, "unknown") == 0);
+}
+
+bool shouldPreserveWanInternet(const char *existing, const char *incoming,
+                               const char *incomingNote) {
+  if (!existing || strcmp(existing, "online") != 0) return false;
+  if (!incoming || strcmp(incoming, "unknown") != 0) return false;
+  if (!incomingNote || strstr(incomingNote, "insufficient sync budget") == nullptr) {
+    return false;
+  }
+  return true;
+}
+
+void mergeWanObservation(JsonObjectConst incomingWan, JsonObject dstWan) {
+  if (incomingWan.isNull()) return;
+
+  const char *prevInternet = dstWan["internet"] | "";
+  const char *newInternet  = incomingWan["internet"] | "";
+  const char *newNote      = incomingWan["note"] | "";
+
+  dstWan.set(incomingWan);
+  if (shouldPreserveWanInternet(prevInternet, newInternet, newNote)) {
+    dstWan["internet"] = "online";
+  }
+}
+
 }  // namespace
 
 void RouterCacheManager::begin(StorageManager *storage, Logger *logger) {
@@ -274,7 +304,10 @@ bool RouterCacheManager::applyLiveSnapshot(JsonObjectConst snap) {
     }
     const char *hotspotStatus = observation["hotspotStatus"] | "";
     if (hotspotStatus && strlen(hotspotStatus) > 0) {
-      obs["hotspotStatus"] = hotspotStatus;
+      const char *existingHotspot = obs["hotspotStatus"] | "";
+      if (!shouldPreserveHotspotStatus(existingHotspot, hotspotStatus)) {
+        obs["hotspotStatus"] = hotspotStatus;
+      }
     }
     copyOptionalStringField(observation, "lastSuccessfulContactAt", obs);
     copyOptionalStringField(observation, "lastContactAttemptAt", obs);
@@ -282,7 +315,23 @@ bool RouterCacheManager::applyLiveSnapshot(JsonObjectConst snap) {
     copyOptionalStringField(observation, "hotspotServer", obs);
     copyOptionalStringField(observation, "hotspotInterface", obs);
     if (observation["wan"].is<JsonObjectConst>()) {
-      obs["wan"] = observation["wan"];
+      if (!obs["wan"].is<JsonObject>()) {
+        obs["wan"].to<JsonObject>();
+      }
+      mergeWanObservation(observation["wan"].as<JsonObjectConst>(),
+                          obs["wan"].as<JsonObject>());
+    }
+    if (observation["ethernetPorts"].is<JsonArrayConst>()) {
+      obs["ethernetPorts"] = observation["ethernetPorts"];
+      obs["ethernetPortsKnown"] = observation["ethernetPortsKnown"] | true;
+    } else if (observation["ethernetPortsKnown"].is<bool>()) {
+      obs["ethernetPortsKnown"] = observation["ethernetPortsKnown"].as<bool>();
+    }
+    if (observation["networkAddresses"].is<JsonArrayConst>()) {
+      obs["networkAddresses"] = observation["networkAddresses"];
+      obs["networkAddressesKnown"] = observation["networkAddressesKnown"] | true;
+    } else if (observation["networkAddressesKnown"].is<bool>()) {
+      obs["networkAddressesKnown"] = observation["networkAddressesKnown"].as<bool>();
     }
 
     const char *obsConnectivity = obs["connectivity"] | "unknown";
@@ -301,6 +350,24 @@ bool RouterCacheManager::applyLiveSnapshot(JsonObjectConst snap) {
 
   stampSynchronized();
   const bool ok = save();
+  if (!ok) {
+    // Live MikroTik snapshot is already in RAM. When SD is missing / fallback,
+    // still accept so Admin Synchronize / Refresh can complete (persist to
+    // SPIFFS when eligible; otherwise RAM until media returns).
+    const bool degraded =
+        !_storage || !_storage->healthy() || _storage->usingFallback() ||
+        !_storage->isSdMounted();
+    if (degraded && isPopulated()) {
+      Serial.println(
+          "[router-cache] persist deferred — RAM snapshot kept (degraded storage)");
+      if (_logger) {
+        _logger->warn(
+            "router",
+            "[router-sync] persist=deferred storage=degraded ram=kept");
+      }
+      return true;
+    }
+  }
   if (ok && _logger) {
     if (isPopulated()) {
       const char *identity = _doc["identity"] | "";
@@ -351,7 +418,11 @@ bool RouterCacheManager::applyObservation(JsonObjectConst observation) {
     obs["connectivity"] = observation["connectivity"].as<const char *>();
   }
   if (observation["hotspotStatus"].is<const char *>()) {
-    obs["hotspotStatus"] = observation["hotspotStatus"].as<const char *>();
+    const char *incomingHotspot = observation["hotspotStatus"].as<const char *>();
+    const char *existingHotspot = obs["hotspotStatus"] | "";
+    if (!shouldPreserveHotspotStatus(existingHotspot, incomingHotspot)) {
+      obs["hotspotStatus"] = incomingHotspot;
+    }
   }
   if (observation["lastContactError"].is<const char *>()) {
     obs["lastContactError"] = observation["lastContactError"].as<const char *>();
@@ -359,7 +430,23 @@ bool RouterCacheManager::applyObservation(JsonObjectConst observation) {
   copyOptionalStringField(observation, "hotspotServer", obs);
   copyOptionalStringField(observation, "hotspotInterface", obs);
   if (observation["wan"].is<JsonObjectConst>()) {
-    obs["wan"] = observation["wan"];
+    if (!obs["wan"].is<JsonObject>()) {
+      obs["wan"].to<JsonObject>();
+    }
+    mergeWanObservation(observation["wan"].as<JsonObjectConst>(),
+                        obs["wan"].as<JsonObject>());
+  }
+  if (observation["ethernetPorts"].is<JsonArrayConst>()) {
+    obs["ethernetPorts"] = observation["ethernetPorts"];
+    obs["ethernetPortsKnown"] = observation["ethernetPortsKnown"] | true;
+  } else if (observation["ethernetPortsKnown"].is<bool>()) {
+    obs["ethernetPortsKnown"] = observation["ethernetPortsKnown"].as<bool>();
+  }
+  if (observation["networkAddresses"].is<JsonArrayConst>()) {
+    obs["networkAddresses"] = observation["networkAddresses"];
+    obs["networkAddressesKnown"] = observation["networkAddressesKnown"] | true;
+  } else if (observation["networkAddressesKnown"].is<bool>()) {
+    obs["networkAddressesKnown"] = observation["networkAddressesKnown"].as<bool>();
   }
 
   const char *connectivity = obs["connectivity"] | "unknown";
@@ -393,6 +480,16 @@ bool RouterCacheManager::applyWirelessFields(JsonObjectConst wireless) {
     doc["wirelessInterface"] = iface;
   } else {
     copyStringField(wireless, "wirelessInterface", doc);
+  }
+
+  // Keep productionNetwork.ssid aligned with the applied SSID. Dashboard System
+  // Status prefers productionNetwork.ssid; leaving it stale after a wireless
+  // save shows the old MikroTik SSID while Wireless settings show the new one.
+  const char *ssid = wireless["ssid"] | "";
+  if (ssid && ssid[0] != '\0') {
+    JsonObject production = doc["productionNetwork"].to<JsonObject>();
+    production["ssid"] = ssid;
+    production["expectedSsid"] = ssid;
   }
 
   stampSynchronized();
@@ -578,6 +675,18 @@ void RouterCacheManager::fillObservation(JsonObject out) const {
     out["hotspotInterface"]        = obs["hotspotInterface"] | "";
     if (obs["wan"].is<JsonObjectConst>()) {
       out["wan"] = obs["wan"];
+    }
+    if (obs["ethernetPorts"].is<JsonArrayConst>()) {
+      out["ethernetPorts"] = obs["ethernetPorts"];
+    }
+    if (obs["ethernetPortsKnown"].is<bool>()) {
+      out["ethernetPortsKnown"] = obs["ethernetPortsKnown"].as<bool>();
+    }
+    if (obs["networkAddresses"].is<JsonArrayConst>()) {
+      out["networkAddresses"] = obs["networkAddresses"];
+    }
+    if (obs["networkAddressesKnown"].is<bool>()) {
+      out["networkAddressesKnown"] = obs["networkAddressesKnown"].as<bool>();
     }
   }
   out["connectivity"]  = connectivity;

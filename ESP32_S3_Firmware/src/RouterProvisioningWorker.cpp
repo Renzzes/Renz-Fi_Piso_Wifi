@@ -5,6 +5,8 @@
 #include <vector>
 
 #include "Config.h"
+#include "ContentFilterManager.h"
+#include "GamingPriorityRouterSync.h"
 #include "EthernetManager.h"
 #include "EventBus.h"
 #include "ExistingNetworkScanner.h"
@@ -18,6 +20,7 @@
 #include "RouterWirelessAdapter.h"
 #include "RouterProvisioningManager.h"
 #include "RouterWorkerDiagnostics.h"
+#include "DmaMemoryMonitor.h"
 #include "SetupProvisioningManager.h"
 #include "SetupStatusContext.h"
 #include "StorageManager.h"
@@ -25,6 +28,8 @@
 #include "WifiDiscoveryCache.h"
 #include "ActivationLatencyTrace.h"
 #include "FinishTrace.h"
+
+#include <cstring>
 
 namespace {
 
@@ -111,48 +116,116 @@ void applyCacheJobFailure(RouterProvisioningWorker::Result &result,
 
 bool openPersistedRouterClient(EthernetManager *eth,
                                SetupRouterConnectionManager *routerConnection,
+                               StorageManager *storage,
                                std::unique_ptr<RouterOsClient> &clientOut,
                                String &errorOut, String &errorCodeOut) {
-  if (!eth || !routerConnection) {
+  if (!eth) {
     errorOut     = "Router connection unavailable";
     errorCodeOut = "INTERNAL_ERROR";
     return false;
   }
-  SetupRouterConnectionManager::ResolvedRouterCredentials credentials;
-  SetupRouterConnectionManager::OperationResult credResult;
-  if (!routerConnection->resolveRouterCredentials(
-          SetupRouterConnectionManager::RouterCredentialSource::Persisted, nullptr,
-          credentials, credResult)) {
-    errorOut     = credResult.errorMessage;
-    errorCodeOut = credResult.errorCode;
+
+  String host;
+  String username;
+  String password;
+  uint16_t apiPort = RenzFiConfig::ROUTEROS_API_PORT;
+  const char *credSource = nullptr;
+  String setupError;
+  String setupCode;
+
+  // Prefer production router.json first — same source as Hotspot Activate /
+  // Verify. Setup-persisted (router-connection.json) can be missing or stale
+  // after SD recovery while production credentials still work.
+  if (storage) {
+    HeapJsonDocument storedDoc(RenzFiConfig::JSON_DOC_SMALL);
+    DynamicJsonDocument &stored = storedDoc.doc();
+    if (storage->readJson(RenzFiConfig::ROUTER_FILE, stored)) {
+      host     = stored["host"] | "";
+      username = stored["username"] | "";
+      password = stored["password"] | "";
+      host.trim();
+      username.trim();
+      if (!host.isEmpty() && !username.isEmpty() && !password.isEmpty()) {
+        apiPort    = RenzFiConfig::ROUTEROS_API_PORT;
+        credSource = "production-router-json";
+      }
+    }
+  }
+
+  if (!credSource && routerConnection) {
+    SetupRouterConnectionManager::ResolvedRouterCredentials credentials;
+    SetupRouterConnectionManager::OperationResult credResult;
+    if (routerConnection->resolveRouterCredentials(
+            SetupRouterConnectionManager::RouterCredentialSource::Persisted,
+            nullptr, credentials, credResult)) {
+      host       = credentials.host;
+      username   = credentials.username;
+      password   = credentials.password;
+      apiPort    = credentials.apiPort ? credentials.apiPort
+                                       : RenzFiConfig::ROUTEROS_API_PORT;
+      credSource = "setup-persisted";
+    } else {
+      setupError = credResult.errorMessage;
+      setupCode  = credResult.errorCode;
+    }
+  }
+
+  if (!credSource) {
+    errorOut = setupError.isEmpty()
+                   ? String("MikroTik credentials unavailable")
+                   : setupError;
+    errorCodeOut =
+        setupCode.isEmpty() ? String("CREDENTIAL_UNAVAILABLE") : setupCode;
+    Serial.printf("[router-client] open failed code=%s err=%s\n",
+                  errorCodeOut.c_str(), errorOut.c_str());
     return false;
   }
+
   clientOut.reset(new (std::nothrow) RouterOsClient());
   if (!clientOut) {
     errorOut     = "Router client unavailable";
     errorCodeOut = "ROUTER_PLAN_UNAVAILABLE";
+    Serial.println("[router-client] open failed: client alloc");
     return false;
   }
-  const auto input = credentials.toRouterInput();
   clientOut->setTimeouts(RenzFiConfig::SETUP_ROUTER_CONNECT_TIMEOUT_MS,
                          RenzFiConfig::SETUP_ROUTER_IO_TIMEOUT_MS);
-  clientOut->setCredentials(input.host, input.username, input.password, input.apiPort);
-  clientOut->setCredentialSource("setup-persisted");
+  clientOut->setCredentials(host, username, password, apiPort);
+  clientOut->setCredentialSource(credSource);
+  Serial.printf("[router-client] open source=%s host=%s\n", credSource,
+                host.c_str());
+  // SoftAP setup shares INTERNAL DMA with W5500. Prefer extra margin, then
+  // connect if ETH TX (1536) is free. Do not hard-fail at 4096 — SoftAP
+  // often steadies at ~4084 and Step 4 Finish must still proceed.
+  if (!DmaMemoryMonitor::waitForRouterOsConnectHeadroom(1500)) {
+    errorOut     = "Ethernet DMA memory low — defer RouterOS connect";
+    errorCodeOut = "ETH_DMA_LOW";
+    DmaMemoryMonitor::logSnapshot("open-persisted-dma-wait-failed");
+    clientOut.reset();
+    return false;
+  }
   if (!clientOut->connect()) {
     errorOut     = clientOut->lastError();
     errorCodeOut = clientOut->lastErrorCode();
+    Serial.printf("[router-client] connect failed code=%s err=%s\n",
+                  errorCodeOut.c_str(), errorOut.c_str());
     clientOut.reset();
     return false;
   }
   if (!clientOut->login()) {
     errorOut     = clientOut->lastError();
     errorCodeOut = clientOut->lastErrorCode();
+    Serial.printf("[router-client] login failed code=%s err=%s\n",
+                  errorCodeOut.c_str(), errorOut.c_str());
     clientOut->disconnect();
     clientOut.reset();
     return false;
   }
-  (void)eth;
   return true;
+}
+
+StorageManager *workerStorage(RouterProvisioningEngine *finishEngine) {
+  return finishEngine ? finishEngine->storage() : nullptr;
 }
 
 void fillWorkerSetupStatus(SetupProvisioningManager *provisioning,
@@ -164,19 +237,29 @@ void fillWorkerSetupStatus(SetupProvisioningManager *provisioning,
       data, eth, buildSetupStatusContext(routerProvisioning, nullptr));
 }
 
-String attrFromReply(const RouterOsClient::CommandResult &result, uint8_t row,
-                     const char *keyName) {
-  if (row >= result.replyCount || !keyName || !keyName[0]) return String();
-  const auto &record = result.replyAt(row);
-  for (uint8_t i = 0; i < record.attrCount; ++i) {
-    String key;
-    String value;
-    if (RouterOsClient::parseAttr(record.attr(i), key, value) &&
-        key.equalsIgnoreCase(keyName)) {
-      return value;
+// MikroTik ARP "reachable" is conclusive online. Other states (stale, delay,
+// incomplete, failed, missing) are inconclusive and fall through to /ping.
+bool arpStatusIsConclusiveReachable(const String &statusRaw) {
+  String status = statusRaw;
+  status.trim();
+  status.toLowerCase();
+  return status == "reachable";
+}
+
+bool routerOsPingSucceeded(const RouterOsClient::CommandResult &pingResult) {
+  if (pingResult.trapReceived) return false;
+  for (uint8_t i = 0; i < pingResult.replyCount; ++i) {
+    const String received = RouterOsClient::replyAttr(pingResult, i, "received");
+    if (received.length() > 0 && received.toInt() > 0) return true;
+    const String status = RouterOsClient::replyAttr(pingResult, i, "status");
+    if (status.equalsIgnoreCase("host unreachable") ||
+        status.equalsIgnoreCase("timeout")) {
+      continue;
     }
+    const String time = RouterOsClient::replyAttr(pingResult, i, "time");
+    if (time.length() > 0) return true;
   }
-  return String();
+  return false;
 }
 
 }  // namespace
@@ -225,6 +308,12 @@ const char *RouterProvisioningWorker::opTypeLabel(OpType type) {
       return "admin-user-profile";
     case OpType::AccessPointDetect:
       return "access-point-detect";
+    case OpType::AccessPointCheck:
+      return "access-point-check";
+    case OpType::ContentFilterSync:
+      return "content-filter-sync";
+    case OpType::GamingPrioritySync:
+      return "gaming-priority-sync";
     default:
       return "unknown";
   }
@@ -620,6 +709,22 @@ RouterProvisioningWorker::EnqueueOutcome RouterProvisioningWorker::enqueueIntern
 
   if (xSemaphoreTake(_dispatchMutex, pdMS_TO_TICKS(200)) != pdTRUE) return out;
   if (_running) {
+    // Idempotent join: Step 4 Finish / adoption may re-POST configure while the
+    // first job is still running (job-poll 503 ETH_DMA_LOW → UI retry). Returning
+    // BUSY made the wizard show "Configuration failed" even when adoption OK.
+    const char *want = opTypeLabel(prepared.type);
+    const bool joinable =
+        prepared.type == OpType::ConfigureExistingNetwork ||
+        prepared.type == OpType::FinishSetupProvisioning;
+    if (joinable && _lastJob.jobId != 0 && _lastJob.opType == want) {
+      out.accepted = true;
+      out.jobId = _lastJob.jobId;
+      Serial.printf(
+          "[router-worker] join in-flight type=%s jobId=%u\n", want,
+          static_cast<unsigned>(_lastJob.jobId));
+      xSemaphoreGive(_dispatchMutex);
+      return out;
+    }
     xSemaphoreGive(_dispatchMutex);
     return out;
   }
@@ -633,6 +738,7 @@ RouterProvisioningWorker::EnqueueOutcome RouterProvisioningWorker::enqueueIntern
   _lastJob = JobRecord{};
   _lastJob.jobId = _nextJobId;
   _lastJob.state = JobState::Queued;
+  _lastJob.opType = opTypeLabel(prepared.type);
   _running = true;
 
   xSemaphoreTake(_doneSem, 0);
@@ -938,6 +1044,30 @@ RouterProvisioningWorker::enqueueAccessPointDetect(const String &requestJson) {
   return enqueueAdminPrepared(prepared, "access-point-detect");
 }
 
+RouterProvisioningWorker::EnqueueOutcome
+RouterProvisioningWorker::enqueueAccessPointCheck(const String &requestJson) {
+  WorkSlot prepared;
+  prepared.type = OpType::AccessPointCheck;
+  prepared.requestJson = requestJson;
+  return enqueueAdminPrepared(prepared, "access-point-check");
+}
+
+RouterProvisioningWorker::EnqueueOutcome
+RouterProvisioningWorker::enqueueContentFilterSync(const String &requestJson) {
+  WorkSlot prepared;
+  prepared.type = OpType::ContentFilterSync;
+  prepared.requestJson = requestJson;
+  return enqueueAdminPrepared(prepared, "content-filter-sync");
+}
+
+RouterProvisioningWorker::EnqueueOutcome
+RouterProvisioningWorker::enqueueGamingPrioritySync(const String &requestJson) {
+  WorkSlot prepared;
+  prepared.type = OpType::GamingPrioritySync;
+  prepared.requestJson = requestJson;
+  return enqueueAdminPrepared(prepared, "gaming-priority-sync");
+}
+
 void RouterProvisioningWorker::runOp(WorkSlot &slot) {
   struct ScratchGuard {
     explicit ScratchGuard(RouterOsClient::CommandResult *scratch) {
@@ -1173,9 +1303,13 @@ void RouterProvisioningWorker::runOp(WorkSlot &slot) {
     std::unique_ptr<RouterOsClient> client;
     String connectError, connectCode;
     RouterWorkerDiagnostics::checkStackMargin("list-wifi-before-connect");
-    if (!openPersistedRouterClient(_eth, _routerConnection, client, connectError,
-                                   connectCode)) {
-      slot.result.httpStatus = 502;
+    if (!openPersistedRouterClient(_eth, _routerConnection,
+                                   workerStorage(_finishEngine), client,
+                                   connectError, connectCode)) {
+      // SoftAP DMA wait timeout: 503 + Retry-After semantics via UI 202-style
+      // retry. Keep 502 only for hard RouterOS failures.
+      const bool dmaLow = connectCode == "ETH_DMA_LOW";
+      slot.result.httpStatus = dmaLow ? 503 : 502;
       slot.result.body =
           buildErrorBody(connectError, connectCode.isEmpty() ? "ROUTER_CONNECT_FAILED"
                                                              : connectCode);
@@ -1184,9 +1318,10 @@ void RouterProvisioningWorker::runOp(WorkSlot &slot) {
     } else {
       client->setTimeouts(RenzFiConfig::ROUTER_WIFI_DISCOVERY_CONNECT_MS,
                           RenzFiConfig::ROUTER_WIFI_DISCOVERY_CMD_MS);
-      HeapJsonDocument responseDoc(RenzFiConfig::JSON_DOC_MEDIUM);
-      DynamicJsonDocument &envelope = responseDoc.doc();
-      JsonArray data                = envelope.createNestedArray("data");
+      // PSRAM pool — SoftAP WiFi DMA must keep INTERNAL contiguous blocks.
+      PsramJsonDocument responseDoc;
+      JsonDocument &envelope = responseDoc.doc();
+      JsonArray data         = envelope["data"].to<JsonArray>();
       RouterWireless::ListNetworksResult listResult;
       if (!RouterWireless::listNetworks(*client, data, listResult)) {
         envelope["success"] = false;
@@ -1203,7 +1338,7 @@ void RouterProvisioningWorker::runOp(WorkSlot &slot) {
         envelope["code"]    = listResult.code;
         envelope["message"] = listResult.message;
         envelope["driver"]  = listResult.driver;
-        JsonObject summary  = envelope.createNestedObject("summary");
+        JsonObject summary  = envelope["summary"].to<JsonObject>();
         summary["interfaceCount"]  = listResult.interfaceCount;
         summary["configuredCount"] = listResult.configuredCount;
         summary["disabledCount"]   = listResult.disabledCount;
@@ -1225,26 +1360,34 @@ void RouterProvisioningWorker::runOp(WorkSlot &slot) {
     // WifiDiscoveryCache / Config::WIFI_DISCOVERY_CACHE_TTL_MS.
     WifiDiscoveryCache::store(slot.result.httpStatus, slot.result.body);
   } else if (slot.type == OpType::ConfigureExistingNetwork) {
-    HeapJsonDocument bodyDoc(RenzFiConfig::JSON_DOC_LARGE);
-    DynamicJsonDocument &body = bodyDoc.doc();
+    DmaMemoryMonitor::logTrace("configure-job-enter");
+    // Request/response JSON on PSRAM so SoftAP 0x80c WiFi DMA retains INTERNAL.
+    PsramJsonDocument bodyDoc;
+    JsonDocument &body = bodyDoc.doc();
     if (deserializeJson(body, slot.requestJson)) {
       slot.result.httpStatus = 400;
       slot.result.body       = buildErrorBody("Invalid JSON body", "INVALID_JSON");
     } else {
       std::unique_ptr<RouterOsClient> client;
       String connectError, connectCode;
-      const bool haveClient =
-          openPersistedRouterClient(_eth, _routerConnection, client, connectError,
-                                    connectCode);
+      const bool haveClient = openPersistedRouterClient(
+          _eth, _routerConnection, workerStorage(_finishEngine), client,
+          connectError, connectCode);
+      DmaMemoryMonitor::logTrace(haveClient ? "configure-job-after-connect"
+                                            : "configure-job-connect-failed");
       if (!haveClient) {
-        slot.result.httpStatus = 502;
+        const bool dmaLow = connectCode == "ETH_DMA_LOW";
+        slot.result.httpStatus = dmaLow ? 503 : 502;
         slot.result.body       = buildErrorBody(connectError, connectCode);
       } else {
-        HeapJsonDocument responseDoc(RenzFiConfig::JSON_DOC_LARGE);
-        DynamicJsonDocument &envelope = responseDoc.doc();
-        JsonObject data               = envelope.createNestedObject("data");
+        // Brief settle after SoftAP/captive churn before wireless print.
+        (void)DmaMemoryMonitor::waitForRouterOsConnectHeadroom(1500);
+        PsramJsonDocument responseDoc;
+        JsonDocument &envelope = responseDoc.doc();
+        JsonObject data        = envelope["data"].to<JsonObject>();
         const auto result = _routerProvisioning->configureExistingNetwork(
             body.as<JsonObjectConst>(), data, client.get(), _finishEngine);
+        DmaMemoryMonitor::logTrace("configure-job-after-routeros");
         client->disconnect("success");
         if (!result.success) {
           envelope["success"] = false;
@@ -1691,23 +1834,39 @@ void RouterProvisioningWorker::runOp(WorkSlot &slot) {
 
     std::unique_ptr<RouterOsClient> client;
     String connectError, connectCode;
-    if (!openPersistedRouterClient(_eth, _routerConnection, client, connectError,
-                                   connectCode)) {
-      slot.result.httpStatus = 502;
+    if (!openPersistedRouterClient(_eth, _routerConnection,
+                                   workerStorage(_finishEngine), client,
+                                   connectError, connectCode)) {
+      slot.result.httpStatus = connectCode == "ETH_DMA_LOW" ? 503 : 502;
       slot.result.body =
           buildErrorBody(connectError, connectCode.isEmpty() ? "ROUTER_CONNECT_FAILED"
                                                              : connectCode);
       slot.result.ok = false;
+      slot.result.healthReason =
+          connectCode == "ETH_DMA_LOW" ? String("router_unreachable")
+                                       : String("job_failed");
+      Serial.printf("[access-point-detect] connect failed code=%s err=%s\n",
+                    connectCode.c_str(), connectError.c_str());
     } else {
-      RouterOsClient::CommandResult arpResult;
-      RouterOsClient::CommandResult bridgeHostResult;
-      RouterOsClient::CommandResult leaseResult;
-      RouterOsClient::initializeCommandResult(arpResult);
-      RouterOsClient::initializeCommandResult(bridgeHostResult);
-      RouterOsClient::initializeCommandResult(leaseResult);
+      // One reusable CommandResult (worker scratch) — three stack CommandResults
+      // previously overflowed router_worker after login (same class of bug as
+      // SetupRouterValidator metadata). Copy ARP rows into a compact table.
+      struct DetectRow {
+        char ip[16];
+        char mac[20];
+        char iface[24];
+        char status[16];
+        char bridgePort[24];
+        char hostname[32];
+      };
+      DetectRow rows[RouterOsClient::MAX_REPLY_RECORDS];
+      uint8_t rowCount = 0;
 
+      RouterOsClient::CommandResult &cmd =
+          RouterCommandScratchContext::acquire();
       const String arpProps[] = {"=.proplist=address,mac-address,interface,status"};
-      const bool arpOk = client->executeCommand("/ip/arp/print", arpProps, 1, arpResult);
+      const bool arpOk =
+          client->executeCommand("/ip/arp/print", arpProps, 1, cmd);
       if (!arpOk) {
         const String err = client->lastError();
         slot.result.body = buildErrorBody(
@@ -1715,33 +1874,99 @@ void RouterProvisioningWorker::runOp(WorkSlot &slot) {
             "AP_DETECT_FAILED");
         slot.result.httpStatus = 502;
         slot.result.ok = false;
+        slot.result.healthReason = "router_unreachable";
+        Serial.printf("[access-point-detect] arp failed err=%s\n",
+                      err.c_str());
       } else {
-        const String bridgeProps[] = {"=.proplist=mac-address,on-interface,bridge"};
-        const bool bridgeOk = client->executeCommand("/interface/bridge/host/print",
-                                                     bridgeProps, 1, bridgeHostResult);
-        const String leaseProps[] = {"=.proplist=address,mac-address,host-name,status"};
-        const bool leaseOk = client->executeCommand("/ip/dhcp-server/lease/print",
-                                                    leaseProps, 1, leaseResult);
+        for (uint8_t i = 0; i < cmd.replyCount && rowCount < RouterOsClient::MAX_REPLY_RECORDS;
+             ++i) {
+          const String ip = RouterOsClient::replyAttr(cmd, i, "address");
+          const String mac = RouterOsClient::replyAttr(cmd, i, "mac-address");
+          if (ip.isEmpty() || ip == "0.0.0.0" || mac.isEmpty()) continue;
+          DetectRow &row = rows[rowCount];
+          memset(&row, 0, sizeof(row));
+          strncpy(row.ip, ip.c_str(), sizeof(row.ip) - 1);
+          strncpy(row.mac, mac.c_str(), sizeof(row.mac) - 1);
+          strncpy(row.iface, RouterOsClient::replyAttr(cmd, i, "interface").c_str(),
+                  sizeof(row.iface) - 1);
+          strncpy(row.status, RouterOsClient::replyAttr(cmd, i, "status").c_str(),
+                  sizeof(row.status) - 1);
+          rowCount++;
+        }
+        const uint8_t arpRows = cmd.replyCount;
 
-        HeapJsonDocument outDoc(RenzFiConfig::JSON_DOC_LARGE);
-        DynamicJsonDocument &out = outDoc.doc();
+        RouterOsClient::initializeCommandResult(cmd);
+        const String bridgeProps[] = {"=.proplist=mac-address,on-interface,bridge"};
+        const bool bridgeOk = client->executeCommand(
+            "/interface/bridge/host/print", bridgeProps, 1, cmd);
+        if (bridgeOk) {
+          for (uint8_t i = 0; i < rowCount; ++i) {
+            for (uint8_t j = 0; j < cmd.replyCount; ++j) {
+              if (RouterOsClient::replyAttr(cmd, j, "mac-address")
+                      .equalsIgnoreCase(rows[i].mac)) {
+                strncpy(rows[i].bridgePort,
+                        RouterOsClient::replyAttr(cmd, j, "on-interface").c_str(),
+                        sizeof(rows[i].bridgePort) - 1);
+                break;
+              }
+            }
+          }
+        }
+
+        RouterOsClient::initializeCommandResult(cmd);
+        const String leaseProps[] = {
+            "=.proplist=address,mac-address,host-name,status"};
+        const bool leaseOk = client->executeCommand(
+            "/ip/dhcp-server/lease/print", leaseProps, 1, cmd);
+        if (leaseOk) {
+          for (uint8_t i = 0; i < rowCount; ++i) {
+            for (uint8_t j = 0; j < cmd.replyCount; ++j) {
+              const String leaseIp = RouterOsClient::replyAttr(cmd, j, "address");
+              const String leaseMac = RouterOsClient::replyAttr(cmd, j, "mac-address");
+              if (leaseIp == rows[i].ip ||
+                  leaseMac.equalsIgnoreCase(rows[i].mac)) {
+                strncpy(rows[i].hostname,
+                        RouterOsClient::replyAttr(cmd, j, "host-name").c_str(),
+                        sizeof(rows[i].hostname) - 1);
+                break;
+              }
+            }
+          }
+        }
+
+        PsramJsonDocument outDoc;
+        JsonDocument &out = outDoc.doc();
         out["success"] = true;
         JsonObject data = out["data"].to<JsonObject>();
         JsonArray devices = data["devices"].to<JsonArray>();
+        JsonArray registeredDevices = data["registeredDevices"].to<JsonArray>();
         uint16_t filtered = 0;
 
-        for (uint8_t i = 0; i < arpResult.replyCount; ++i) {
-          const String ip = attrFromReply(arpResult, i, "address");
-          const String mac = attrFromReply(arpResult, i, "mac-address");
-          const String iface = attrFromReply(arpResult, i, "interface");
-          const String status = attrFromReply(arpResult, i, "status");
-          if (ip.isEmpty() || ip == "0.0.0.0" || mac.isEmpty()) {
+        for (uint8_t i = 0; i < rowCount; ++i) {
+          bool alreadyRegistered = false;
+          for (const String &registered : registeredIps) {
+            if (registered == rows[i].ip) {
+              alreadyRegistered = true;
+              break;
+            }
+          }
+
+          if (alreadyRegistered) {
+            JsonObject row = registeredDevices.add<JsonObject>();
+            row["ip"] = rows[i].ip;
+            row["mac"] = rows[i].mac;
+            row["interface"] = rows[i].iface;
+            row["bridgePort"] = rows[i].bridgePort;
+            row["hostname"] = rows[i].hostname;
+            row["status"] = rows[i].status;
+            row["alreadyRegistered"] = true;
             filtered++;
             continue;
           }
+
           bool duplicate = false;
           for (JsonVariantConst existing : devices) {
-            if (String(existing["ip"] | "") == ip) {
+            if (String(existing["ip"] | "") == rows[i].ip) {
               duplicate = true;
               break;
             }
@@ -1750,49 +1975,19 @@ void RouterProvisioningWorker::runOp(WorkSlot &slot) {
             filtered++;
             continue;
           }
-          bool alreadyRegistered = false;
-          for (const String &registered : registeredIps) {
-            if (registered == ip) {
-              alreadyRegistered = true;
-              break;
-            }
-          }
-          if (alreadyRegistered) {
-            filtered++;
-            continue;
-          }
-
-          String bridgePort;
-          for (uint8_t j = 0; j < bridgeHostResult.replyCount; ++j) {
-            if (attrFromReply(bridgeHostResult, j, "mac-address")
-                    .equalsIgnoreCase(mac)) {
-              bridgePort = attrFromReply(bridgeHostResult, j, "on-interface");
-              break;
-            }
-          }
-
-          String hostname;
-          for (uint8_t j = 0; j < leaseResult.replyCount; ++j) {
-            const String leaseIp = attrFromReply(leaseResult, j, "address");
-            const String leaseMac = attrFromReply(leaseResult, j, "mac-address");
-            if ((leaseIp == ip || leaseMac.equalsIgnoreCase(mac))) {
-              hostname = attrFromReply(leaseResult, j, "host-name");
-              break;
-            }
-          }
 
           JsonObject row = devices.add<JsonObject>();
-          row["ip"] = ip;
-          row["mac"] = mac;
-          row["interface"] = iface;
-          row["bridgePort"] = bridgePort;
-          row["hostname"] = hostname;
-          row["status"] = status;
+          row["ip"] = rows[i].ip;
+          row["mac"] = rows[i].mac;
+          row["interface"] = rows[i].iface;
+          row["bridgePort"] = rows[i].bridgePort;
+          row["hostname"] = rows[i].hostname;
+          row["status"] = rows[i].status;
         }
 
         data["source"] = "mikrotik_arp";
         data["oneTime"] = true;
-        data["arpRows"] = arpResult.replyCount;
+        data["arpRows"] = arpRows;
         data["returned"] = devices.size();
         data["filteredOut"] = filtered;
         Serial.printf(
@@ -1806,6 +2001,437 @@ void RouterProvisioningWorker::runOp(WorkSlot &slot) {
         slot.result.httpStatus = 200;
         slot.result.ok = true;
       }
+      client->disconnect("success");
+    }
+  } else if (slot.type == OpType::AccessPointCheck) {
+    // Owner Check: MikroTik ARP → optional RouterOS /ping. Never ESP32→AP.
+    String accessPointId;
+    String managementIp;
+    if (!slot.requestJson.isEmpty()) {
+      HeapJsonDocument bodyDoc(RenzFiConfig::JSON_DOC_SMALL);
+      DynamicJsonDocument &body = bodyDoc.doc();
+      if (!deserializeJson(body, slot.requestJson)) {
+        accessPointId = body["accessPointId"] | "";
+        managementIp = body["managementIp"] | "";
+      }
+    }
+    accessPointId.trim();
+    managementIp.trim();
+
+    Serial.printf("[AP CHECK] Checking registered AP: %s\n",
+                  managementIp.c_str());
+
+    auto writeCheckResult = [&](bool online, const char *method,
+                                const char *message, const char *errorCode,
+                                int httpStatus, bool ok) {
+      HeapJsonDocument outDoc(RenzFiConfig::JSON_DOC_MEDIUM);
+      DynamicJsonDocument &out = outDoc.doc();
+      out["success"] = ok;
+      JsonObject data = out["data"].to<JsonObject>();
+      data["accessPointId"] = accessPointId;
+      data["ipAddress"] = managementIp;
+      data["managementIp"] = managementIp;
+      data["online"] = online;
+      data["method"] = method ? method : "arp_ping";
+      data["status"] = online ? "online" : "unreachable";
+      if (errorCode && errorCode[0]) data["errorCode"] = errorCode;
+      out["message"] = message ? message : (online ? "Online" : "Offline");
+      serializeJson(out, slot.result.body);
+      slot.result.httpStatus = httpStatus;
+      slot.result.ok = ok;
+      Serial.printf("[AP CHECK] Result: %s method=%s\n",
+                    online ? "ONLINE" : "OFFLINE",
+                    method ? method : "arp_ping");
+    };
+
+    if (managementIp.isEmpty()) {
+      slot.result.body =
+          buildErrorBody("Access point management IP missing", "INVALID_IP");
+      slot.result.httpStatus = 400;
+      slot.result.ok = false;
+    } else {
+      std::unique_ptr<RouterOsClient> client;
+      String connectError, connectCode;
+      if (!openPersistedRouterClient(_eth, _routerConnection,
+                                     workerStorage(_finishEngine), client,
+                                     connectError, connectCode)) {
+        slot.result.httpStatus = connectCode == "ETH_DMA_LOW" ? 503 : 502;
+        slot.result.body =
+            buildErrorBody(connectError,
+                           connectCode.isEmpty() ? "ROUTER_CONNECT_FAILED"
+                                                 : connectCode);
+        slot.result.ok = false;
+        Serial.printf("[AP CHECK] MikroTik unavailable: %s\n",
+                      connectError.c_str());
+      } else {
+        RouterOsClient::CommandResult &arpResult =
+            RouterCommandScratchContext::acquire();
+        Serial.printf("[AP CHECK] ARP lookup: %s\n", managementIp.c_str());
+        const String arpAttrs[] = {
+            String("?address=") + managementIp,
+            String("=.proplist=address,mac-address,interface,status"),
+        };
+        const bool arpOk =
+            client->executeCommand("/ip/arp/print", arpAttrs, 2, arpResult);
+
+        bool arpConclusiveOnline = false;
+        bool arpInconclusive = true;
+        String arpStatus;
+        String arpMac;
+        if (arpOk && !arpResult.trapReceived) {
+          for (uint8_t i = 0; i < arpResult.replyCount; ++i) {
+            const String ip = RouterOsClient::replyAttr(arpResult, i, "address");
+            if (ip != managementIp) continue;
+            arpMac = RouterOsClient::replyAttr(arpResult, i, "mac-address");
+            arpStatus = RouterOsClient::replyAttr(arpResult, i, "status");
+            if (arpMac.length() > 0 &&
+                arpStatusIsConclusiveReachable(arpStatus)) {
+              arpConclusiveOnline = true;
+              arpInconclusive = false;
+            } else {
+              arpInconclusive = true;
+            }
+            break;
+          }
+          if (arpResult.replyCount == 0) {
+            arpInconclusive = true;
+          }
+        } else {
+          arpInconclusive = true;
+          Serial.println("[AP CHECK] ARP lookup failed or trap — trying ping");
+        }
+
+        if (arpConclusiveOnline) {
+          Serial.printf("[AP CHECK] ARP reachable: true mac=%s status=%s\n",
+                        arpMac.c_str(), arpStatus.c_str());
+          writeCheckResult(true, "arp", "Online", nullptr, 200, true);
+        } else {
+          Serial.printf(
+              "[AP CHECK] ARP inconclusive for %s status=%s — Starting RouterOS ping\n",
+              managementIp.c_str(),
+              arpStatus.length() > 0 ? arpStatus.c_str() : "(none)");
+          RouterOsClient::CommandResult &pingResult =
+              RouterCommandScratchContext::acquire();
+          const String pingAttrs[] = {
+              String("=address=") + managementIp,
+              String("=count=3"),
+          };
+          const bool pingOk =
+              client->executeCommand("/ping", pingAttrs, 2, pingResult);
+          if (pingOk && routerOsPingSucceeded(pingResult)) {
+            Serial.println("[AP CHECK] Ping successful");
+            writeCheckResult(true, "ping", "Online", nullptr, 200, true);
+          } else {
+            // Proven: first Check often sees ARP status=stale and /ping fails
+            // (AP may not answer ICMP, or neighbor is still refreshing). The
+            // ping attempt still refreshes MikroTik ARP — a second owner Check
+            // then sees status=reachable. Re-query ARP once in the same job.
+            Serial.println(
+                "[AP CHECK] RouterOS ping failed — rechecking ARP once");
+            RouterOsClient::CommandResult &arpRetry =
+                RouterCommandScratchContext::acquire();
+            const String arpRetryAttrs[] = {
+                String("?address=") + managementIp,
+                String("=.proplist=address,mac-address,interface,status"),
+            };
+            const bool retryOk = client->executeCommand(
+                "/ip/arp/print", arpRetryAttrs, 2, arpRetry);
+            bool retryOnline = false;
+            String retryMac;
+            String retryStatus;
+            if (retryOk && !arpRetry.trapReceived) {
+              for (uint8_t i = 0; i < arpRetry.replyCount; ++i) {
+                const String ip = RouterOsClient::replyAttr(arpRetry, i, "address");
+                if (ip != managementIp) continue;
+                retryMac = RouterOsClient::replyAttr(arpRetry, i, "mac-address");
+                retryStatus = RouterOsClient::replyAttr(arpRetry, i, "status");
+                if (retryMac.length() > 0 &&
+                    arpStatusIsConclusiveReachable(retryStatus)) {
+                  retryOnline = true;
+                }
+                break;
+              }
+            }
+            if (retryOnline) {
+              Serial.printf(
+                  "[AP CHECK] ARP reachable after ping refresh mac=%s status=%s\n",
+                  retryMac.c_str(), retryStatus.c_str());
+              writeCheckResult(true, "arp", "Online", nullptr, 200, true);
+            } else {
+              Serial.printf(
+                  "[AP CHECK] Still offline after ARP retry status=%s\n",
+                  retryStatus.length() > 0 ? retryStatus.c_str() : "(none)");
+              writeCheckResult(false, "arp_ping", "Offline",
+                               "ACCESS_POINT_OFFLINE", 200, true);
+            }
+          }
+          (void)arpInconclusive;
+        }
+        client->disconnect("success");
+      }
+    }
+  } else if (slot.type == OpType::ContentFilterSync) {
+    bool enabled = false;
+    String guestBridge;
+    std::vector<String> desiredDomains;
+    if (!slot.requestJson.isEmpty()) {
+      HeapJsonDocument bodyDoc(RenzFiConfig::JSON_DOC_MEDIUM);
+      DynamicJsonDocument &body = bodyDoc.doc();
+      if (!deserializeJson(body, slot.requestJson)) {
+        enabled = body["enabled"] | false;
+        guestBridge = body["guestBridge"] | "";
+        JsonArrayConst domains = body["domains"].as<JsonArrayConst>();
+        if (!domains.isNull()) {
+          for (JsonVariantConst item : domains) {
+            String domain = item.as<String>();
+            domain.trim();
+            if (domain.length() > 0) desiredDomains.push_back(domain);
+          }
+        }
+      }
+    }
+    if (guestBridge.isEmpty() && _routerProvisioning) {
+      guestBridge = _routerProvisioning->guestBridgeName();
+    }
+    guestBridge.trim();
+    if (guestBridge.isEmpty()) guestBridge = "bridge-renzfi";
+
+    auto writeSyncResult = [&](bool ok, int httpStatus, const char *message,
+                               JsonObject dataObj) {
+      HeapJsonDocument outDoc(RenzFiConfig::JSON_DOC_MEDIUM);
+      DynamicJsonDocument &out = outDoc.doc();
+      out["success"] = ok;
+      out["message"] = message ? message : (ok ? "Content filter synced" : "Sync failed");
+      JsonObject data = out["data"].to<JsonObject>();
+      data["enabled"] = enabled;
+      data["guestBridge"] = guestBridge;
+      if (!dataObj.isNull()) {
+        data["domains"] = dataObj["domains"];
+      }
+      serializeJson(out, slot.result.body);
+      slot.result.httpStatus = httpStatus;
+      slot.result.ok = ok;
+    };
+
+    std::unique_ptr<RouterOsClient> client;
+    String connectError, connectCode;
+    if (!openPersistedRouterClient(_eth, _routerConnection,
+                                   workerStorage(_finishEngine), client,
+                                   connectError, connectCode)) {
+      slot.result.httpStatus = connectCode == "ETH_DMA_LOW" ? 503 : 502;
+      slot.result.body =
+          buildErrorBody(connectError,
+                         connectCode.isEmpty() ? "ROUTER_CONNECT_FAILED"
+                                               : connectCode);
+      slot.result.ok = false;
+    } else {
+      RouterOsClient::CommandResult &filterResult =
+          RouterCommandScratchContext::acquire();
+      RouterOsClient::CommandResult &listResult =
+          RouterCommandScratchContext::acquire();
+
+      String filterRuleId;
+      const String filterPrintAttrs[] = {
+          String("?comment=") + ContentFilterManager::kRuleComment,
+          "=.proplist=.id,comment,disabled,chain,action,in-interface",
+      };
+      if (client->executeCommand("/ip/firewall/filter/print", filterPrintAttrs, 2,
+                                 filterResult) &&
+          !filterResult.trapReceived) {
+        for (uint8_t i = 0; i < filterResult.replyCount; ++i) {
+          if (RouterOsClient::replyAttr(filterResult, i, "comment") ==
+              ContentFilterManager::kRuleComment) {
+            filterRuleId = RouterOsClient::replyAttr(filterResult, i, ".id");
+            break;
+          }
+        }
+      }
+
+      if (!enabled) {
+        if (filterRuleId.length() > 0) {
+          const String disableAttrs[] = {
+              "=.id=" + filterRuleId,
+              "=disabled=yes",
+          };
+          client->executeCommand("/ip/firewall/filter/set", disableAttrs, 2,
+                                 filterResult);
+        }
+        HeapJsonDocument dataDoc(RenzFiConfig::JSON_DOC_MEDIUM);
+        JsonArray rows = dataDoc.doc()["domains"].to<JsonArray>();
+        for (const String &domain : desiredDomains) {
+          JsonObject row = rows.add<JsonObject>();
+          row["domain"] = domain;
+          row["status"] = "disabled";
+        }
+        writeSyncResult(true, 200, "Content filtering disabled on guest network",
+                        dataDoc.doc().as<JsonObject>());
+        client->disconnect("success");
+      } else {
+        if (filterRuleId.isEmpty()) {
+          const String addRuleAttrs[] = {
+              "=chain=forward",
+              "=action=drop",
+              "=dst-address-list=" + String(ContentFilterManager::kListName),
+              "=in-interface=" + guestBridge,
+              "=comment=" + String(ContentFilterManager::kRuleComment),
+              "=disabled=no",
+          };
+          if (!client->executeCommand("/ip/firewall/filter/add", addRuleAttrs, 6,
+                                      filterResult) ||
+              filterResult.trapReceived) {
+            slot.result.httpStatus = 500;
+            slot.result.body = buildErrorBody(
+                filterResult.trapMessage.length() > 0
+                    ? filterResult.trapMessage
+                    : "Unable to create guest content filter rule",
+                "FILTER_RULE_FAILED");
+            slot.result.ok = false;
+          } else if (client->executeCommand("/ip/firewall/filter/print",
+                                            filterPrintAttrs, 2, filterResult) &&
+                     !filterResult.trapReceived) {
+            for (uint8_t i = 0; i < filterResult.replyCount; ++i) {
+              if (RouterOsClient::replyAttr(filterResult, i, "comment") ==
+                  ContentFilterManager::kRuleComment) {
+                filterRuleId = RouterOsClient::replyAttr(filterResult, i, ".id");
+                break;
+              }
+            }
+          }
+        } else {
+          const String enableAttrs[] = {
+              "=.id=" + filterRuleId,
+              "=disabled=no",
+              "=in-interface=" + guestBridge,
+          };
+          client->executeCommand("/ip/firewall/filter/set", enableAttrs, 3,
+                                 filterResult);
+        }
+
+        if (slot.result.body.isEmpty()) {
+          // Collect existing list entries.
+          struct ExistingEntry {
+            String id;
+            String address;
+          };
+          ExistingEntry existing[ContentFilterManager::kMaxDomains + 4];
+          uint8_t existingCount = 0;
+          const String listPrintAttrs[] = {
+              String("?list=") + ContentFilterManager::kListName,
+              "=.proplist=.id,list,address",
+          };
+          if (client->executeCommand("/ip/firewall/address-list/print",
+                                     listPrintAttrs, 2, listResult) &&
+              !listResult.trapReceived) {
+            for (uint8_t i = 0; i < listResult.replyCount &&
+                               existingCount < ContentFilterManager::kMaxDomains + 4;
+                 ++i) {
+              existing[existingCount].id = RouterOsClient::replyAttr(listResult, i, ".id");
+              existing[existingCount].address =
+                  RouterOsClient::replyAttr(listResult, i, "address");
+              existingCount++;
+            }
+          }
+
+          auto domainDesired = [&](const String &address) {
+            for (const String &domain : desiredDomains) {
+              if (domain.equalsIgnoreCase(address)) return true;
+            }
+            return false;
+          };
+
+          for (uint8_t i = 0; i < existingCount; ++i) {
+            if (!domainDesired(existing[i].address) && existing[i].id.length() > 0) {
+              const String removeAttrs[] = {"=.id=" + existing[i].id};
+              client->executeCommand("/ip/firewall/address-list/remove",
+                                     removeAttrs, 1, listResult);
+            }
+          }
+
+          HeapJsonDocument dataDoc(RenzFiConfig::JSON_DOC_MEDIUM);
+          JsonArray rows = dataDoc.doc()["domains"].to<JsonArray>();
+          bool allOk = true;
+
+          for (const String &domain : desiredDomains) {
+            bool present = false;
+            for (uint8_t i = 0; i < existingCount; ++i) {
+              if (domain.equalsIgnoreCase(existing[i].address)) {
+                present = true;
+                break;
+              }
+            }
+            JsonObject row = rows.add<JsonObject>();
+            row["domain"] = domain;
+            if (present) {
+              row["status"] = "active";
+              continue;
+            }
+            const String addAttrs[] = {
+                "=list=" + String(ContentFilterManager::kListName),
+                "=address=" + domain,
+                "=comment=renzfi:" + domain,
+            };
+            if (client->executeCommand("/ip/firewall/address-list/add", addAttrs, 3,
+                                       listResult) &&
+                !listResult.trapReceived) {
+              row["status"] = "active";
+            } else {
+              allOk = false;
+              row["status"] = "failed";
+              row["error"] = listResult.trapMessage.length() > 0
+                                 ? listResult.trapMessage
+                                 : "RouterOS rejected domain";
+            }
+          }
+
+          writeSyncResult(allOk, allOk ? 200 : 500,
+                          allOk ? "Content filter applied to guest network"
+                                : "Some domains failed to apply on MikroTik",
+                          dataDoc.doc().as<JsonObject>());
+          client->disconnect("success");
+        }
+      }
+    }
+  } else if (slot.type == OpType::GamingPrioritySync) {
+    String guestBridge;
+    if (_routerProvisioning) {
+      guestBridge = _routerProvisioning->guestBridgeName();
+    }
+    guestBridge.trim();
+    if (guestBridge.isEmpty()) guestBridge = "bridge-renzfi";
+    bool enabled = false;
+    {
+      HeapJsonDocument bodyDoc(RenzFiConfig::JSON_DOC_SMALL);
+      if (!deserializeJson(bodyDoc.doc(), slot.requestJson)) {
+        enabled = bodyDoc.doc()["enabled"] | false;
+      }
+    }
+
+    std::unique_ptr<RouterOsClient> client;
+    String connectError, connectCode;
+    if (!openPersistedRouterClient(_eth, _routerConnection,
+                                   workerStorage(_finishEngine), client,
+                                   connectError, connectCode)) {
+      slot.result.httpStatus = connectCode == "ETH_DMA_LOW" ? 503 : 502;
+      slot.result.body =
+          buildErrorBody(connectError,
+                         connectCode.isEmpty() ? "ROUTER_CONNECT_FAILED"
+                                               : connectCode);
+      slot.result.ok = false;
+    } else {
+      String message;
+      String syncError;
+      const bool ok = gamingPriorityRouterSync(*client, slot.requestJson,
+                                             guestBridge, message, syncError);
+      HeapJsonDocument outDoc(RenzFiConfig::JSON_DOC_SMALL);
+      DynamicJsonDocument &out = outDoc.doc();
+      out["success"] = ok;
+      out["message"] = ok ? message : syncError;
+      JsonObject data = out["data"].to<JsonObject>();
+      data["guestBridge"] = guestBridge;
+      data["enabled"] = enabled;
+      serializeJson(out, slot.result.body);
+      slot.result.httpStatus = ok ? 200 : 500;
+      slot.result.ok = ok;
       client->disconnect("success");
     }
   }

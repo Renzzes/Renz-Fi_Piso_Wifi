@@ -1,3 +1,4 @@
+import type { AccessPointRecord, AccessPointStatus } from "@/services/accessPoints";
 import type { CoinState, SystemStatus } from "@/types/api";
 
 export type StatusTone = "ok" | "warn" | "bad" | "unknown" | "neutral";
@@ -210,4 +211,45 @@ export function coinRateLabel(
   if (!Number.isFinite(pulses) || pulses <= 0) return "N/A";
   if (pulses === 1) return "₱1";
   return `₱1 / ${pulses} pulses`;
+}
+
+/** Registry status for the dashboard Network Status Access Point row. */
+export function accessPointRegistryDisplay(
+  records: AccessPointRecord[] | undefined,
+  loading: boolean,
+  fetchFailed: boolean,
+): { label: string; tone: StatusTone } {
+  if (loading) {
+    return { label: "Loading...", tone: "unknown" };
+  }
+  if (fetchFailed) {
+    return { label: "Unable to verify", tone: "unknown" };
+  }
+
+  const enabled = (records ?? []).filter((record) => record.enabled);
+  if (enabled.length === 0) {
+    return { label: "Not registered", tone: "unknown" };
+  }
+
+  return accessPointStatusDisplay(enabled[0].status);
+}
+
+function accessPointStatusDisplay(status?: AccessPointStatus | null): {
+  label: string;
+  tone: StatusTone;
+} {
+  switch (status) {
+    case "online":
+    case "network_reachable":
+    case "management_reachable":
+      return { label: "Online", tone: "ok" };
+    case "unreachable":
+    case "offline":
+      return { label: "Offline", tone: "bad" };
+    case "disabled":
+      return { label: "Disabled", tone: "neutral" };
+    case "unknown":
+    default:
+      return { label: "Unknown", tone: "unknown" };
+  }
 }

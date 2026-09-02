@@ -240,46 +240,48 @@ The management IP identifies the AP management interface. It is **not** a client
 
 Stage C is **External AP Reachability / Management Status**, not an External AP Configuration Driver.
 
-`GenericApDriver` is generic and non-destructive. It may:
+**Owner Check** (Admin **Check** button) asks **MikroTik** whether the **saved** `managementIp` is present:
 
-1. Check Ethernet readiness
-2. ICMP ping (count=1, timeout ≤ 2000 ms, `esp_ping_*`, not NetworkDiagnostics)
-3. TCP connect port 80 (timeout ≤ 2000 ms)
-4. TCP connect port 443 if 80 fails
-5. Classify reachability
+1. Load registered AP and its saved management IP (never hardcode)
+2. RouterOS `/ip/arp/print` for that IP — `status=reachable` → **Online** (`method: arp`)
+3. If ARP is missing/stale/incomplete/failed/inconclusive → RouterOS `/ping` to the same IP
+4. Ping success → **Online** (`method: ping`)
+5. Ping fail → one ARP re-query (ping often refreshes the neighbor even when ICMP fails); `reachable` → **Online** (`method: arp`); otherwise **Offline** (`method: arp_ping`)
 
-It must not authenticate, HTTP GET with credentials, HTTP POST/PUT, change configuration, detect vendor by API calls, or reboot the AP.
+**Proven field note (first Check Offline / second Online):** MikroTik often returns ARP `stale` on a cold/idle management IP. Check falls through to `/ping`; many APs do not answer ICMP on the management address, so ping fails and Admin shows Offline. That same ping still refreshes RouterOS ARP, so a second Check sees `reachable` and shows Online. Firmware now re-queries ARP once in the same Check job after ping failure.
+
+Path: `ESP32 → MikroTik → AP`. The ESP32 must **not** ICMP/TCP directly to the AP for Check.
+
+`GenericApDriver` (ESP32 ICMP + TCP 80/443) remains only for legacy Sync probe paths. Check does not use it.
 
 HTTP:
 
-- `POST /api/access-points/{id}/check` → **202** `{ jobId, accessPointId, state: "queued" }`
-- `GET /api/access-points/jobs/{jobId}` → RAM snapshot, no network I/O
+- `POST /api/access-points/{id}/check` → **202** `{ jobId, accessPointId, state: "queued" }` (Router Worker)
+- `GET /api/access-points/jobs/{jobId}` → job snapshot including `online`, `status` (`online`|`unreachable`), `method`, `ipAddress`
 
-Worker: dedicated `ap_check_worker` (core 0, single-flight). Not RouterWorker. Not `async_tcp`. Not `loopTask`.
+Worker: existing `RouterProvisioningWorker` (same exception as Detect). Not `async_tcp`. Not `loopTask`. Not ESP32 LAN scan.
 
-If a check is already running: `503 ACCESS_POINT_CHECK_BUSY` (rejected, not queued).  
-If SD recovery is active: `503 STORAGE_RECOVERY_IN_PROGRESS` (do not enqueue).  
-Empty registry: idle — no ping, no TCP, no SD write, no RouterOS.
+If Router Worker is busy: `503 ROUTER_WORKER_BUSY`.  
+Empty / disabled registry entry: rejected — no RouterOS probe.
 
-Status means reachability, not “the AP is correctly configured”:
+Status means MikroTik-confirmed presence, not “the AP is correctly configured”:
 
 | Status | Meaning |
 |--------|---------|
-| `online` | ICMP works **and** management TCP is reachable |
-| `network_reachable` | ICMP works; management TCP is unavailable |
-| `management_reachable` | ICMP failed/filtered; management TCP is reachable |
-| `unreachable` | ICMP failed **and** management TCP is unavailable |
+| `online` | MikroTik ARP reachable **or** RouterOS ping success for the saved IP |
+| `unreachable` | ARP inconclusive and RouterOS ping failed/timeout (**Offline** in Admin) |
 | `disabled` | Registry entry disabled; no probe |
-| `unknown` | Ethernet is not ready / cannot safely probe |
+| `unknown` | MikroTik/RouterOS unavailable or check failed to run |
 
 `auth_failed` is not produced. There is no AP authentication feature.
 
-One-time Detect is separate from Stage C check:
+One-time Detect is separate from Check:
 
 - `POST /api/access-points/detect` queues one bounded RouterWorker job (HTTP 202)
 - `GET /api/access-points/detect/jobs/{jobId}` polls only that queued job
 - Detect may return ARP data (IP/MAC/interface/bridge-port/hostname/status)
-- Detect does not auto-create AP entries and does not replace Check status classification
+- Detect does not auto-create AP entries
+- Check uses the **saved** registered IP only; Detect finds candidates
 
 ---
 
@@ -386,15 +388,17 @@ If VLAN-aware deployments are ever needed, that is a separate MikroTik segmentat
 | MikroTik down | AP may still ping; hotspot/vouchers degrade independently |
 | RouterWorker busy | Irrelevant; AP checks do not use it |
 
-IP validation (live `EthernetManager` only; never hardcoded `10.10.10.x`):
+IP validation (live `EthernetManager` only; never hardcoded site subnets such as
+`10.10.10.x` or `192.168.88.x`):
 
-- valid IPv4
-- not network or broadcast
-- not ESP32 IP
-- not live gateway
+- valid unicast IPv4
+- Ethernet has a usable IP
+- not ESP32 SoftAP range `192.168.4.0/24`
+- not ESP32 IP or live gateway
+- not network/broadcast of the live Ethernet subnet (when candidate is on-subnet)
+- same Ethernet subnet **or** any other RFC1918 private address (routed via MikroTik)
 - not duplicate AP IP
-- not `192.168.4.0/24` (ESP32 Management AP)
-- on the live Ethernet subnet
+- Sync/Check prove reachability; validation does not ping or scan
 
 ---
 
@@ -425,44 +429,46 @@ Historical Stage B/C checkpoints must not be rewritten. `v0.5.0-fully-operationa
 
 ---
 
-## 17. RouterOS Worker Ownership Exception — External AP Detect
+## 17. RouterOS Worker Ownership Exception — External AP Detect + Check
 
-External AP Detect needs RouterOS data (`/ip/arp/print` and optional
-read-only bridge/lease lookups), so it must run on the existing asynchronous
-RouterOS job owner.
+External AP Detect and Check need RouterOS data (`/ip/arp/print`, optional
+bridge/lease lookups, and Check fallback `/ping`), so they must run on the
+existing asynchronous RouterOS job owner.
 
 Approved exception:
 
 - `RouterProvisioningWorker` remains the sole asynchronous RouterOS job owner.
-- External AP Detect may reuse this existing job infrastructure for one-time,
-  bounded, read-only RouterOS detection.
+- External AP Detect and Check may reuse this existing job infrastructure for
+  one-time, bounded, read-only RouterOS operations (Check may issue `/ping`
+  to the **saved** management IP only).
 - This exception does not authorize AP configuration, RouterOS configuration
-  writes, periodic scanning, or creation of another RouterOS worker/client.
+  writes (other than none), periodic scanning, or creation of another RouterOS
+  worker/client.
 
 Why this is required:
 
-1. Detect needs MikroTik-side evidence; AP Check does not.
+1. Detect and Check need MikroTik-side evidence; the ESP32 must not probe the
+   AP directly across split L2 segments.
 2. Reusing the existing worker avoids competing RouterOS clients/queues and
    duplicated recovery/auth/session ownership.
-3. Detect remains asynchronous (`POST` enqueue -> `202` -> job poll), so no
+3. Both remain asynchronous (`POST` enqueue -> `202` -> job poll), so no
    blocking RouterOS work runs inside HTTP handlers.
-4. Detect remains one-time and owner-triggered only; no timers, daemons, or
+4. Both remain one-time and owner-triggered only; no timers, daemons, or
    continuous ARP monitoring.
-5. Detect is read-only and bounded.
-6. Detect cannot auto-create AP entries; owner confirmation is required via
-   "Use This Device."
-7. Detect cannot configure the AP, cannot alter MikroTik, and cannot control
-   AP power/interface state.
-8. AP Check remains completely independent on `ap_check_worker` with
-   `GenericApDriver` (ICMP + TCP), no RouterOS, no SD, no AP credentials.
+5. Detect is read-only and bounded; Check is ARP + optional `/ping` only.
+6. Detect cannot auto-create AP entries; owner confirmation is required.
+7. Neither may configure the AP, alter MikroTik topology, or control AP power.
+8. Legacy Sync may still use `ap_check_worker` / `GenericApDriver`; Admin Check
+   uses Router Worker MikroTik ARP + ping.
 
-Allowed Detect read operations:
+Allowed Detect/Check RouterOS operations:
 
 - `/ip/arp/print`
-- optional `/interface/bridge/host/print`
-- optional `/ip/dhcp-server/lease/print`
+- optional `/interface/bridge/host/print` (Detect)
+- optional `/ip/dhcp-server/lease/print` (Detect)
+- `/ping` to the saved AP management IP only (Check fallback)
 
-Detect is prohibited from RouterOS writes and network-control mutations.
+Detect/Check are prohibited from RouterOS writes and network-control mutations.
 
 ---
 

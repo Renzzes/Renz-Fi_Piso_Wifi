@@ -19,6 +19,8 @@ export type RouterWireless = {
   interfaceId?: string;
   wifiMode?: string;
   configured?: boolean;
+  externalApOnly?: boolean;
+  guestTopologyMode?: string;
   band?: string;
   truncated?: boolean;
   cached?: boolean;
@@ -37,10 +39,14 @@ export type RouterTestStep = {
 
 export type RouterOsResourceSnapshot = {
   version?: string;
+  boardName?: string;
   cpuLoad?: string;
   freeMemory?: string;
   totalMemory?: string;
   uptime?: string;
+  totalHddSpace?: string;
+  freeHddSpace?: string;
+  cpuTemperature?: string;
 };
 
 export type ProductionNetworkCacheSnapshot = {
@@ -116,6 +122,26 @@ export type RouterCacheSnapshot = {
     hotspotStatus?: string;
     lastSuccessfulContactAt?: string;
     lastContactError?: string;
+    wan?: {
+      interface?: string;
+      link?: string;
+    };
+    ethernetPorts?: Array<{
+      name: string;
+      defaultName?: string;
+      running?: boolean;
+      disabled?: boolean;
+      comment?: string;
+      bridge?: string;
+    }>;
+    ethernetPortsKnown?: boolean;
+    networkAddresses?: Array<{
+      interface: string;
+      address: string;
+      network?: string;
+      actualInterface?: string;
+    }>;
+    networkAddressesKnown?: boolean;
   };
   error?: string;
 };
@@ -183,9 +209,7 @@ function normalizeProfilesResult(raw: unknown): RouterProfilesResult {
     profileDetails = normalizeProfileDetails(record.profiles);
   }
   const profiles =
-    profilesFromNames.length > 0
-      ? profilesFromNames
-      : profileDetails.map((p) => p.name);
+    profilesFromNames.length > 0 ? profilesFromNames : profileDetails.map((p) => p.name);
 
   return {
     profiles,
@@ -198,8 +222,7 @@ function normalizeProfilesResult(raw: unknown): RouterProfilesResult {
     stale: record.stale === true,
     lastSynchronizedAt:
       typeof record.lastSynchronizedAt === "string" ? record.lastSynchronizedAt : undefined,
-    error:
-      typeof record.error === "string" && record.error.length > 0 ? record.error : undefined,
+    error: typeof record.error === "string" && record.error.length > 0 ? record.error : undefined,
   };
 }
 
@@ -259,10 +282,7 @@ async function pollAdminRouterJob<T>(jobId: number): Promise<T> {
   throw new ApiError("Router job timed out", 504, "ROUTER_JOB_TIMEOUT");
 }
 
-async function enqueueAdminRouterJob<T>(
-  path: string,
-  init?: RequestInit,
-): Promise<T> {
+async function enqueueAdminRouterJob<T>(path: string, init?: RequestInit): Promise<T> {
   const queued = await apiFetch<RouterJobQueued>(path, init);
   if (!queued?.jobId) {
     throw new ApiError("Router job id missing from response", 502, "ROUTER_JOB_ID_MISSING");

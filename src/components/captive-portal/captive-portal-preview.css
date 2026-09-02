@@ -1,0 +1,544 @@
+/* Scoped mirror of portal/renzfi-style.css — preview only; does not affect Admin shell. */
+.portal-live-preview {
+  --bg-0: #030712;
+  --bg-1: #050b16;
+  --panel: #071426;
+  --blue-3: #19b5ff;
+  --green: #39ff6a;
+  --amber: #ffb000;
+  --red: #ff304f;
+  --text: #f4f8ff;
+  --muted: #8fa7c4;
+  --line: rgba(0, 174, 255, 0.55);
+  --glow: rgba(0, 174, 255, 0.25);
+  --radius: 2px;
+  --btn-h: 54px;
+  --portal-design-width: 520px;
+  --preview-edge-bleed: 14px;
+
+  width: 100%;
+  max-width: 100%;
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  user-select: none;
+}
+
+.portal-live-preview__viewport {
+  width: 100%;
+  height: min(72vh, 680px);
+  min-height: 420px;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  box-sizing: border-box;
+  border: 1px solid rgba(0, 174, 255, 0.22);
+  border-radius: 12px;
+  background: rgba(3, 7, 18, 0.35);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 174, 255, 0.35) transparent;
+}
+
+.portal-live-preview__viewport::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.portal-live-preview__viewport::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(0, 174, 255, 0.35);
+}
+
+.portal-live-preview__fit-host {
+  max-width: 100%;
+  overflow: visible;
+  flex-shrink: 0;
+  padding: 0 2px;
+}
+
+.portal-live-preview__fit-inner {
+  transform-origin: top left;
+  will-change: transform;
+  padding: 0 var(--preview-edge-bleed, 14px);
+  box-sizing: border-box;
+}
+
+.portal-live-preview__backdrop {
+  width: var(--portal-design-width);
+  overflow: visible;
+  border-radius: 12px;
+  background:
+    radial-gradient(1200px 480px at 50% -12%, rgba(0, 140, 255, 0.16), transparent 58%),
+    linear-gradient(180deg, var(--bg-1), var(--bg-0) 38%, #02040a);
+  padding: 10px var(--preview-edge-bleed, 14px) 14px;
+  box-sizing: border-box;
+}
+
+.portal-live-preview .portal-shell {
+  width: var(--portal-design-width);
+  margin: 0 auto;
+  padding: 4px 0 10px;
+  box-sizing: border-box;
+}
+
+.portal-live-preview .hero,
+.portal-live-preview .portal-banner {
+  position: relative;
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  margin: 0 0 8px;
+  padding: 0;
+  overflow: hidden;
+  line-height: 0;
+  background: none;
+  border: 0;
+  border-radius: 2px;
+  box-sizing: border-box;
+}
+
+.portal-live-preview .hero.branding-pending {
+  aspect-ratio: 1568 / 1003;
+}
+
+.portal-live-preview .banner-upload-placeholder {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-height: 120px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 16px;
+  box-sizing: border-box;
+  background: linear-gradient(180deg, rgba(0, 168, 255, 0.08), rgba(7, 20, 38, 0.95));
+  text-align: center;
+}
+
+.portal-live-preview .banner-upload-placeholder__icon {
+  width: 2rem;
+  height: 2rem;
+  color: var(--blue-3);
+  opacity: 0.85;
+}
+
+.portal-live-preview .banner-upload-placeholder__title {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.portal-live-preview .banner-upload-placeholder__hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.portal-live-preview .hero img,
+.portal-live-preview .hero video,
+.portal-live-preview .portal-banner img,
+.portal-live-preview .portal-banner video {
+  position: relative;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  object-fit: contain;
+  object-position: center;
+  background: transparent;
+}
+
+.portal-live-preview .banner-frame {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  padding: 2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #0077ff, #00d8ff, #9af0ff, #00d8ff, #0077ff);
+  background-size: 280% 100%;
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  box-shadow:
+    0 0 8px rgba(0, 200, 255, 0.45),
+    0 0 18px rgba(0, 160, 255, 0.25);
+  animation: portalPreviewFrameRun 2.4s linear infinite;
+}
+
+.portal-live-preview .hud-panel {
+  position: relative;
+  width: 100%;
+  max-width: 100%;
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  box-sizing: border-box;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow:
+    0 0 6px var(--glow),
+    inset 0 0 8px rgba(0, 174, 255, 0.05);
+}
+
+.portal-live-preview .hud-panel::before,
+.portal-live-preview .hud-panel::after {
+  content: "";
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  pointer-events: none;
+  border-color: var(--blue-3);
+  border-style: solid;
+  z-index: 1;
+}
+
+.portal-live-preview .hud-panel::before {
+  top: -1px;
+  left: -1px;
+  border-width: 2px 0 0 2px;
+}
+
+.portal-live-preview .hud-panel::after {
+  right: -1px;
+  bottom: -1px;
+  border-width: 0 2px 2px 0;
+}
+
+.portal-live-preview .hud-kicker {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-align: center;
+}
+
+.portal-live-preview .status-panel {
+  text-align: center;
+  padding: 12px 12px 10px;
+}
+
+.portal-live-preview .status-panel--connected {
+  border: 2px solid transparent;
+  background:
+    linear-gradient(var(--panel), var(--panel)) padding-box,
+    linear-gradient(90deg, #39ff6a, #00e5ff, #19b5ff, #39ff6a, #00e5ff) border-box;
+  background-size: auto, 280% 100%;
+  animation: portalPreviewRainbowBorder 2.6s linear infinite;
+}
+
+.portal-live-preview .status-readout {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.portal-live-preview .status-pulse {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 6px rgba(255, 48, 79, 0.45);
+}
+
+.portal-live-preview .status-pulse--connected {
+  background: var(--green);
+  box-shadow: 0 0 6px rgba(57, 255, 106, 0.45);
+  order: -1;
+}
+
+.portal-live-preview .status-label {
+  color: var(--red);
+  font-size: 1.28rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.portal-live-preview .status-label--connected {
+  color: var(--green);
+}
+
+.portal-live-preview .preview-date {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.portal-live-preview .device-card {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  padding: 0;
+}
+
+.portal-live-preview .info-item {
+  display: grid;
+  gap: 2px;
+  padding: 10px 12px;
+  text-align: center;
+}
+
+.portal-live-preview .info-item + .info-item {
+  border-left: 1px solid rgba(0, 174, 255, 0.18);
+}
+
+.portal-live-preview .info-item.credits-item {
+  grid-column: 1 / -1;
+  border-left: 0;
+  border-top: 1px solid rgba(0, 174, 255, 0.18);
+}
+
+.portal-live-preview .info-item p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.58rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+}
+
+.portal-live-preview .info-item strong {
+  color: var(--text);
+  font-size: 0.88rem;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.portal-live-preview .timer-card {
+  overflow: hidden;
+  padding: 8px 10px;
+  text-align: center;
+  background:
+    radial-gradient(circle at 50% 58%, rgba(0, 174, 255, 0.2), transparent 46%),
+    var(--panel);
+}
+
+.portal-live-preview .timer-value {
+  font-size: 1.65rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  font-variant-numeric: tabular-nums;
+}
+
+.portal-live-preview .timer-labels {
+  display: flex;
+  justify-content: center;
+  gap: 1.5rem;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.58rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.portal-live-preview .package-panel {
+  padding: 10px 12px 12px;
+}
+
+.portal-live-preview .actions {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 18px;
+}
+
+.portal-live-preview .action-btn {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: var(--btn-h);
+  margin: 0;
+  padding: 0 12px;
+  border-radius: var(--radius);
+  font-size: 0.86rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  touch-action: manipulation;
+  cursor: default;
+  box-sizing: border-box;
+}
+
+.portal-live-preview .actions .action-btn.green {
+  cursor: pointer;
+}
+
+.portal-live-preview .action-btn .btn-ico {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 22px;
+  flex: 0 0 26px;
+  filter: drop-shadow(0 0 5px currentColor);
+}
+
+.portal-live-preview .action-btn .btn-ico svg {
+  display: block;
+  width: 24px;
+  height: 22px;
+}
+
+.portal-live-preview .action-btn .btn-copy,
+.portal-live-preview .action-btn b {
+  flex: 1;
+  text-align: center;
+}
+
+.portal-live-preview .action-btn .chevron {
+  font-size: 1.35rem;
+  line-height: 1;
+  opacity: 0.85;
+}
+
+.portal-live-preview .action-btn.green {
+  color: var(--green);
+  background: linear-gradient(180deg, rgba(57, 255, 106, 0.14), rgba(57, 255, 106, 0.04));
+  border: 1px solid rgba(57, 255, 106, 0.9);
+  text-shadow: 0 0 8px rgba(57, 255, 106, 0.45);
+  box-shadow:
+    0 0 8px rgba(57, 255, 106, 0.28),
+    inset 0 0 10px rgba(57, 255, 106, 0.08);
+}
+
+.portal-live-preview .action-btn.amber {
+  color: var(--amber);
+  background: linear-gradient(180deg, rgba(255, 176, 0, 0.14), rgba(255, 176, 0, 0.04));
+  border: 1px solid rgba(255, 176, 0, 0.9);
+  text-shadow: 0 0 8px rgba(255, 176, 0, 0.4);
+  box-shadow:
+    0 0 8px rgba(255, 176, 0, 0.26),
+    inset 0 0 10px rgba(255, 176, 0, 0.08);
+}
+
+.portal-live-preview .action-btn.blue {
+  color: var(--blue-3);
+  background: linear-gradient(180deg, rgba(0, 168, 255, 0.14), rgba(0, 168, 255, 0.04));
+  border: 1px solid rgba(0, 168, 255, 0.85);
+  text-shadow: 0 0 8px rgba(0, 168, 255, 0.4);
+  box-shadow:
+    0 0 8px rgba(0, 168, 255, 0.26),
+    inset 0 0 10px rgba(0, 168, 255, 0.08);
+}
+
+.portal-live-preview .action-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.portal-live-preview .voucher-card {
+  margin-top: 6px;
+  padding: 10px 12px 12px;
+}
+
+.portal-live-preview .voucher-card h2 {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.portal-live-preview .voucher-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  width: 100%;
+}
+
+.portal-live-preview .voucher-row input {
+  min-height: 40px;
+  padding: 0 10px;
+  border: 1px solid rgba(0, 174, 255, 0.35);
+  border-radius: var(--radius);
+  background: #06101f;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.portal-live-preview .voucher-row button {
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid rgba(0, 174, 255, 0.45);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, #0a2038, #071426);
+  color: var(--blue-3);
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.portal-live-preview .voucher-help {
+  margin: 6px 0 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.portal-live-preview .footer {
+  margin-top: 8px;
+  text-align: center;
+}
+
+.portal-live-preview .footer .color-strip {
+  height: 3px;
+  margin: 0 0 8px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #0077ff, #00d8ff, #39ff6a, #ffb000, #ff304f);
+}
+
+.portal-live-preview .footer p {
+  margin: 0;
+  font-size: 0.78rem;
+}
+
+.portal-live-preview .footer small {
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+@keyframes portalPreviewFrameRun {
+  0% {
+    background-position: 0% 50%;
+  }
+  100% {
+    background-position: 280% 50%;
+  }
+}
+
+@keyframes portalPreviewRainbowBorder {
+  0% {
+    background-position:
+      0 0,
+      0% 50%;
+  }
+  100% {
+    background-position:
+      0 0,
+      280% 50%;
+  }
+}

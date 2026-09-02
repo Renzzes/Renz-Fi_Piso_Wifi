@@ -67,6 +67,16 @@ bool PortalConfigManager::fillBrandingJson(JsonObject out,
   const String v = String("?v=") + _revision;
   out["bannerUrl"] = baseUrl + "/api/portal/assets/banner" + v;
   out["musicUrl"]  = baseUrl + "/api/portal/assets/music" + v;
+  if (banner.found) {
+    out["bannerMime"] = banner.mimeType.length() > 0 ? banner.mimeType
+                                                     : assetCanonicalMimeType(AssetType::Banner);
+    const bool mimeVideo = banner.mimeType.startsWith("video/");
+    const bool pathVideo = banner.path.endsWith(".mp4") || banner.path.endsWith(".MP4");
+    out["bannerIsVideo"] = mimeVideo || pathVideo;
+  } else {
+    out["bannerMime"] = "";
+    out["bannerIsVideo"] = false;
+  }
   return true;
 }
 
@@ -89,7 +99,17 @@ bool PortalConfigManager::fillSettingsJson(JsonObject out,
   out["bannerUrl"] = baseUrl + "/api/portal/assets/banner" + v;
   out["musicUrl"] = baseUrl + "/api/portal/assets/music" + v;
 
-  if (_hasBanner && banner.found) out["banner_path"] = banner.path;
+  if (_hasBanner && banner.found) {
+    out["bannerMime"] = banner.mimeType.length() > 0 ? banner.mimeType
+                                                     : assetCanonicalMimeType(AssetType::Banner);
+    const bool mimeVideo = banner.mimeType.startsWith("video/");
+    const bool pathVideo = banner.path.endsWith(".mp4") || banner.path.endsWith(".MP4");
+    out["bannerIsVideo"] = mimeVideo || pathVideo;
+    out["banner_path"] = banner.path;
+  } else {
+    out["bannerMime"] = "";
+    out["bannerIsVideo"] = false;
+  }
   if (_hasMusic && music.found) out["music_path"] = music.path;
   return true;
 }

@@ -9,7 +9,16 @@ import {
   StatusBadge,
   CardSkeleton,
 } from "@/components/dashboard/DashboardPrimitives";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import type { CoinState } from "@/types/api";
+
+export type SalesPeriod = "today" | "weekly" | "monthly";
 
 function SummaryTitle({ title, icon: Icon }: { title: string; icon: LucideIcon }) {
   return (
@@ -24,26 +33,79 @@ function SummaryTitle({ title, icon: Icon }: { title: string; icon: LucideIcon }
   );
 }
 
+function salesPeriodTitle(period: SalesPeriod): string {
+  if (period === "weekly") return "Weekly Sales";
+  if (period === "monthly") return "Monthly Sales";
+  return "Today's Sales";
+}
+
 export function MonthlySalesCard({
   loading,
-  amount,
-  sessions,
+  period,
+  onPeriodChange,
   todayAmount,
+  todaySessions,
   weekAmount,
+  weekSessions,
+  monthAmount,
+  monthSessions,
   chartValues,
 }: {
   loading: boolean;
-  amount: number | undefined;
-  sessions: number | undefined;
+  period: SalesPeriod;
+  onPeriodChange: (period: SalesPeriod) => void;
   todayAmount: number | undefined;
+  todaySessions: number | undefined;
   weekAmount: number | undefined;
+  weekSessions: number | undefined;
+  monthAmount: number | undefined;
+  monthSessions: number | undefined;
   chartValues: number[];
 }) {
+  const amount =
+    period === "weekly" ? weekAmount : period === "monthly" ? monthAmount : todayAmount;
+  const sessions =
+    period === "weekly"
+      ? weekSessions
+      : period === "monthly"
+        ? monthSessions
+        : todaySessions;
+
   if (loading && amount === undefined) return <CardSkeleton rows={3} />;
+
+  const subtitle =
+    period === "today"
+      ? `This week ${formatPeso(weekAmount, loading)} • This month ${formatPeso(monthAmount, loading)}`
+      : period === "weekly"
+        ? `Today ${formatPeso(todayAmount, loading)} • This month ${formatPeso(monthAmount, loading)}`
+        : `Today ${formatPeso(todayAmount, loading)} • This week ${formatPeso(weekAmount, loading)}`;
+
   return (
     <DashboardCard className="border-amber-500/20">
-      <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-amber-700 dark:text-amber-300/90">
-        Monthly Sales
+      <div className="flex items-start justify-between gap-2">
+        <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-amber-700 dark:text-amber-300/90">
+          {salesPeriodTitle(period)}
+        </div>
+        <Select
+          value={period}
+          onValueChange={(value) => {
+            if (value === "today" || value === "weekly" || value === "monthly") {
+              onPeriodChange(value);
+            }
+          }}
+        >
+          <SelectTrigger
+            aria-label="Sales period"
+            className="h-7 w-[6.75rem] shrink-0 border-amber-500/25 bg-background/80 px-2 text-[11px] font-medium"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent align="end">
+            <SelectItem value="today">Today</SelectItem>
+            <SelectItem value="weekly">Weekly</SelectItem>
+            <SelectItem value="monthly">Monthly</SelectItem>
+          </SelectContent>
+        </Select>
       </div>
       <div className="mt-2 flex min-w-0 items-end justify-between gap-3">
         <div className="min-w-0 text-[28px] font-semibold leading-none tabular-nums text-foreground">
@@ -53,9 +115,7 @@ export function MonthlySalesCard({
           {formatSessions(sessions, loading)}
         </div>
       </div>
-      <div className="mt-2 text-[12px] text-muted-foreground">
-        Today {formatPeso(todayAmount, loading)} • This week {formatPeso(weekAmount, loading)}
-      </div>
+      <div className="mt-2 text-[12px] text-muted-foreground">{subtitle}</div>
       {chartValues.length >= 2 ? (
         <div className="mt-3">
           <Sparkline values={chartValues} />

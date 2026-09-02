@@ -4,6 +4,7 @@
 
 class AuthManager;
 class EthernetManager;
+class FactoryResetWorker;
 
 namespace HttpPlaneGate {
 
@@ -31,6 +32,18 @@ enum class AccessClass : uint8_t {
 
 void bindEthernet(EthernetManager *eth);
 void bindAuth(AuthManager *auth);
+void bindFactoryReset(FactoryResetWorker *factoryReset);
+
+// True while FactoryResetWorker owns the destructive lifecycle.
+bool isFactoryResetBusy();
+
+// Factory-reset allow-list: enqueue + status only.
+bool isFactoryResetAllowListed(AsyncWebServerRequest *req);
+
+// Early communication quiesce: when factory reset is busy, reject every
+// non-allow-listed request with 409 FACTORY_RESET_IN_PROGRESS before
+// endpoint JSON/SD/beginResponse work. Returns false when rejected.
+bool ensureNotFactoryResetting(AsyncWebServerRequest *req);
 
 Plane classify(AsyncWebServerRequest *req);
 AccessClass classifyAccess(AsyncWebServerRequest *req);

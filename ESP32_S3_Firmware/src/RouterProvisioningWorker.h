@@ -56,6 +56,8 @@ class RouterProvisioningWorker {
     uint32_t   jobId = 0;
     JobState   state = JobState::Queued;
     Result     result;
+    // Op label for poll disambiguation (e.g. access-point-check).
+    String     opType;
     // Live progress, populated only for job types that report it
     // (FinishSetupProvisioning, ExistingNetworkScan) — empty otherwise.
     String     stageId;
@@ -165,6 +167,11 @@ class RouterProvisioningWorker {
   EnqueueOutcome enqueueAdminRefreshCache(const String &successMessage);
   EnqueueOutcome enqueueAdminUserProfileOp(const String &requestJson);
   EnqueueOutcome enqueueAccessPointDetect(const String &requestJson);
+  // One-time owner Check: MikroTik ARP for saved management IP, then RouterOS
+  // /ping fallback. Never ESP32 ICMP/HTTP to the AP.
+  EnqueueOutcome enqueueAccessPointCheck(const String &requestJson);
+  EnqueueOutcome enqueueContentFilterSync(const String &requestJson);
+  EnqueueOutcome enqueueGamingPrioritySync(const String &requestJson);
 
   // Mutex-protected snapshot read of the most recently enqueued job. Returns
   // false when jobId doesn't match the tracked job (never existed, or the
@@ -205,6 +212,9 @@ class RouterProvisioningWorker {
     AdminRefreshCache,
     AdminUserProfileOp,
     AccessPointDetect,
+    AccessPointCheck,
+    ContentFilterSync,
+    GamingPrioritySync,
   };
 
   struct WorkSlot {

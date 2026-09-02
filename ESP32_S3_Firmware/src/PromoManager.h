@@ -23,8 +23,11 @@ class PromoManager {
   /** Highest matching promo profile for a sale total (minutes not used). */
   bool resolveHighestProfileForAmount(int amount, String *profileOut,
                                       int *promoIdOut = nullptr);
+  /** Human-readable speed label for the best matching promo at a sale total. */
+  bool resolveSpeedLabelForAmount(int amount, String *speedOut);
 
  private:
+  static String formatPromoSpeedLabel(JsonObjectConst promo);
   StorageManager *_storage = nullptr;
   Logger *_logger = nullptr;
   EventBus *_events = nullptr;

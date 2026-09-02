@@ -4,7 +4,7 @@ export const SYSTEM_CONFIG_SECTIONS = [
   { id: "syscfg-overview", label: "Overview" },
   { id: "syscfg-network", label: "Network" },
   { id: "syscfg-wireless", label: "Wireless" },
-  { id: "syscfg-hotspot", label: "Hotspot" },
+  { id: "syscfg-hotspot", label: "Bandwidth" },
   { id: "syscfg-storage", label: "Storage & Firmware" },
   { id: "syscfg-router", label: "Router Status" },
 ] as const;

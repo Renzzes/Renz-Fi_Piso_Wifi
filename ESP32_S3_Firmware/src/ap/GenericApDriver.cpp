@@ -9,14 +9,18 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <esp_netif.h>
+#include <lwip/etharp.h>
 #include <lwip/inet.h>
-#include <lwip/netdb.h>
+#include <lwip/netif.h>
 #include <lwip/sockets.h>
+#include <lwip/tcpip.h>
 #include <ping/ping_sock.h>
 
 #include "DmaMemoryMonitor.h"
 
 namespace {
+
+constexpr uint32_t kPingWaitMs = 2700;
 
 struct PingWait {
   SemaphoreHandle_t done = nullptr;
@@ -43,9 +47,8 @@ void onPingTimeout(esp_ping_handle_t handle, void *args) {
 }
 
 void onPingEnd(esp_ping_handle_t handle, void *args) {
+  (void)handle;
   auto *ctx = static_cast<PingWait *>(args);
-  esp_ping_stop(handle);
-  esp_ping_delete_session(handle);
   if (!ctx) return;
   ctx->ended = true;
   if (ctx->done) xSemaphoreGive(ctx->done);
@@ -55,6 +58,161 @@ uint32_t resolveEthernetPingInterface() {
   esp_netif_t *ethNetif = esp_netif_get_handle_from_ifkey("ETH_DEF");
   if (!ethNetif) return 0;
   return esp_netif_get_netif_impl_index(ethNetif);
+}
+
+bool resolveEthernetLocalIp(in_addr_t &out) {
+  out = 0;
+  esp_netif_t *ethNetif = esp_netif_get_handle_from_ifkey("ETH_DEF");
+  if (!ethNetif) return false;
+  esp_netif_ip_info_t info{};
+  if (esp_netif_get_ip_info(ethNetif, &info) != ESP_OK) return false;
+  out = info.ip.addr;
+  return out != 0;
+}
+
+// Caller must hold LOCK_TCPIP_CORE().
+struct netif *resolveEthernetLwipNetifLocked() {
+  const uint32_t iface = resolveEthernetPingInterface();
+  if (iface == 0) return nullptr;
+  return netif_get_by_index(static_cast<u8_t>(iface));
+}
+
+bool ipv4SameSubnet(in_addr_t a, in_addr_t b, in_addr_t mask) {
+  if (mask == 0) return false;
+  return (a & mask) == (b & mask);
+}
+
+// Resolve neighbor MAC. Never holds TCPIP core lock across vTaskDelay.
+bool resolveNeighborMac(struct netif *netif, const ip4_addr_t &ip,
+                        struct eth_addr &out) {
+  if (netif == nullptr) return false;
+
+  struct eth_addr *ethRet = nullptr;
+  const ip4_addr_t *ipRet = nullptr;
+
+  LOCK_TCPIP_CORE();
+  if (etharp_find_addr(netif, &ip, &ethRet, &ipRet) >= 0 && ethRet != nullptr) {
+    out = *ethRet;
+    UNLOCK_TCPIP_CORE();
+    return true;
+  }
+  (void)etharp_query(netif, &ip, nullptr);
+  UNLOCK_TCPIP_CORE();
+
+  for (int attempt = 0; attempt < 12; ++attempt) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+    ethRet = nullptr;
+    ipRet = nullptr;
+    LOCK_TCPIP_CORE();
+    const bool found =
+        etharp_find_addr(netif, &ip, &ethRet, &ipRet) >= 0 && ethRet != nullptr;
+    if (found) {
+      out = *ethRet;
+      UNLOCK_TCPIP_CORE();
+      return true;
+    }
+    UNLOCK_TCPIP_CORE();
+  }
+  return false;
+}
+
+// Same-subnet APs on a different L2 segment (e.g. guest bridge) are reached
+// via the default gateway. Install a temporary static ARP entry so lwIP sends
+// to the router MAC instead of failing ARP on the local Ethernet segment.
+//
+// FORENSIC (2026-08-23): Calling netif_get_by_index / etharp_* from
+// ap_check_worker WITHOUT LOCK_TCPIP_CORE() asserted and rebooted:
+//   assert failed: netif_get_by_index
+//   (Required to lock TCPIP core functionality!)
+class GatewayArpRoute {
+ public:
+  GatewayArpRoute() = default;
+  GatewayArpRoute(const GatewayArpRoute &) = delete;
+  GatewayArpRoute &operator=(const GatewayArpRoute &) = delete;
+
+  bool install(const char *targetIp) {
+    if (targetIp == nullptr || targetIp[0] == '\0') return false;
+
+#if !ETHARP_SUPPORT_STATIC_ENTRIES
+    (void)targetIp;
+    return false;
+#else
+    esp_netif_t *ethNetif = esp_netif_get_handle_from_ifkey("ETH_DEF");
+    if (ethNetif == nullptr) return false;
+    esp_netif_ip_info_t info{};
+    if (esp_netif_get_ip_info(ethNetif, &info) != ESP_OK) return false;
+    if (info.ip.addr == 0 || info.gw.addr == 0 || info.netmask.addr == 0) {
+      return false;
+    }
+
+    ip4_addr_t target{};
+    if (!ip4addr_aton(targetIp, &target)) return false;
+    // Off-subnet targets already go via the gateway — no ARP override needed.
+    if (!ipv4SameSubnet(info.ip.addr, target.addr, info.netmask.addr)) {
+      return true;
+    }
+    if (target.addr == info.ip.addr) return true;
+
+    LOCK_TCPIP_CORE();
+    netif_ = resolveEthernetLwipNetifLocked();
+    UNLOCK_TCPIP_CORE();
+    if (netif_ == nullptr) return false;
+
+    ip4_addr_t gateway{};
+    gateway.addr = info.gw.addr;
+    struct eth_addr gatewayMac{};
+    if (!resolveNeighborMac(netif_, gateway, gatewayMac)) {
+      Serial.println("[ap-check] gateway mac unresolved for routed AP probe");
+      return false;
+    }
+
+    LOCK_TCPIP_CORE();
+    const err_t added = etharp_add_static_entry(&target, &gatewayMac);
+    UNLOCK_TCPIP_CORE();
+    if (added != ERR_OK) {
+      Serial.println("[ap-check] static arp install failed");
+      return false;
+    }
+
+    target_ = target;
+    installed_ = true;
+    Serial.printf("[ap-check] routed-via-gw target=%s gw=%s\n", targetIp,
+                  ip4addr_ntoa(&gateway));
+    return true;
+#endif
+  }
+
+  ~GatewayArpRoute() { remove(); }
+
+ private:
+  bool installed_ = false;
+  ip4_addr_t target_{};
+  struct netif *netif_ = nullptr;
+
+  void remove() {
+#if ETHARP_SUPPORT_STATIC_ENTRIES
+    if (!installed_) return;
+    LOCK_TCPIP_CORE();
+    (void)etharp_remove_static_entry(&target_);
+    UNLOCK_TCPIP_CORE();
+    installed_ = false;
+#endif
+  }
+};
+
+void teardownPingSession(esp_ping_handle_t ping, PingWait &wait) {
+  if (ping == nullptr) return;
+  if (!wait.ended) {
+    esp_ping_stop(ping);
+    if (wait.done &&
+        xSemaphoreTake(wait.done, pdMS_TO_TICKS(kPingWaitMs)) != pdTRUE) {
+      // Session did not signal end; avoid deleting the semaphore while the
+      // ping callback may still be running.
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+  }
+  esp_ping_delete_session(ping);
+  vTaskDelay(pdMS_TO_TICKS(20));
 }
 
 }  // namespace
@@ -112,13 +270,17 @@ bool GenericApDriver::pingOnce(const char *ip, bool &ok, uint32_t &latencyMs,
   }
 
   const TickType_t waitTicks = pdMS_TO_TICKS(kIcmpTimeoutMs + 700);
-  if (xSemaphoreTake(wait.done, waitTicks) != pdTRUE) {
-    if (!wait.ended) {
-      esp_ping_stop(ping);
+  if (xSemaphoreTake(wait.done, waitTicks) != pdTRUE && !wait.ended) {
+    esp_ping_stop(ping);
+    if (wait.done) {
       xSemaphoreTake(wait.done, pdMS_TO_TICKS(500));
     }
   }
-  vSemaphoreDelete(wait.done);
+  teardownPingSession(ping, wait);
+  if (wait.done) {
+    vSemaphoreDelete(wait.done);
+    wait.done = nullptr;
+  }
 
   ok = wait.success;
   if (ok) {
@@ -140,6 +302,19 @@ bool GenericApDriver::tcpConnect(const char *ip, uint16_t port,
   const int sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (sock < 0) return false;
 
+  in_addr_t localIp = 0;
+  if (resolveEthernetLocalIp(localIp)) {
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = localIp;
+    local.sin_port = 0;
+    if (::bind(sock, reinterpret_cast<sockaddr *>(&local), sizeof(local)) !=
+        0) {
+      Serial.printf("[ap-check] tcp port=%u bind errno=%d\n",
+                    static_cast<unsigned>(port), errno);
+    }
+  }
+
   const int flags = fcntl(sock, F_GETFL, 0);
   if (flags >= 0) {
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
@@ -154,8 +329,8 @@ bool GenericApDriver::tcpConnect(const char *ip, uint16_t port,
   }
 
   const uint32_t startedMs = millis();
-  const int rc = ::connect(sock, reinterpret_cast<sockaddr *>(&addr),
-                           sizeof(addr));
+  const int rc =
+      ::connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
   if (rc == 0) {
     latencyMs = millis() - startedMs;
     ok = true;
@@ -196,6 +371,11 @@ ExternalAccessPoint::ProbeResult GenericApDriver::probe(
   if (target.managementIp == nullptr || target.managementIp[0] == '\0') {
     result.errorCode = "ICMP_FAILED";
     return result;
+  }
+
+  GatewayArpRoute routedProbe;
+  if (!routedProbe.install(target.managementIp)) {
+    Serial.println("[ap-check] routed-via-gw setup failed; probing directly");
   }
 
   const char *icmpError = nullptr;

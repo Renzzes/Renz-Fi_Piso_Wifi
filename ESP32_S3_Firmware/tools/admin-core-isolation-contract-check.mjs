@@ -60,16 +60,18 @@ check("2 Connect sync always reads Core status", () => {
   mustNotContain("no /api/router/test", SYNC, "/api/router/test");
 });
 
-check("3 Stale-only worker refresh uses existing cache/sync", () => {
-  mustContain("stale gate", SYNC, "cacheStale");
-  mustContain("existing syncRouter", SYNC, "routerApi.syncRouter");
-  mustContain("worker enqueue exists", API, String.raw`/api/router/cache/sync`);
+check("3 Connect never auto-enqueues RouterOS cache/sync", () => {
+  mustContain("status snapshot", SYNC, "systemApi.status");
+  mustNotContain("no syncRouter on connect", SYNC, "routerApi.syncRouter");
+  mustNotContain("no router test on connect", SYNC, "routerApi.test");
+  mustContain("worker enqueue exists for button path", API, String.raw`/api/router/cache/sync`);
   mustContain("enqueueAdminSyncCache", API, "enqueueAdminSyncCache");
+  // Thin connect: workerRefreshRequested is always false (no auto enqueue).
+  mustContain("no auto worker refresh", SYNC, "workerRefreshRequested: false");
 });
 
 check("4 Accurate sync wording (no credential transfer claim)", () => {
   mustContain("Renz-Fi state", SYNC, "Synchronizing Renz-Fi state");
-  mustContain("Checking router state", SYNC, "Checking router state");
   mustNotContain("no credentials label", SYNC, "Synchronizing MikroTik credentials");
   mustNotContain("no connecting Mikrotik claim", SYNC, "Connecting to MikroTik");
   mustContain("credentials stay on ESP32", SCREEN, "credentials stay on the ESP32");
@@ -105,9 +107,10 @@ check("8 sale.created uses targeted UI patch", () => {
   mustContain("sale.created listener", EVENTS, String.raw`addEventListener\("sale.created"`);
 });
 
-check("9 Health poll skipped while SSE live", () => {
+check("9 Health poll skipped while SSE live or Admin standby", () => {
   mustContain("sseConnected option", MONITOR, "sseConnected");
-  mustContain("skip interval when SSE", MONITOR, String.raw`if \(sseConnected\) \{`);
+  mustContain("standbyIdle option", MONITOR, "standbyIdle");
+  mustContain("skip interval when SSE or standby", MONITOR, String.raw`if \(sseConnected \|\| standbyIdle\)`);
   mustContain("no interval while SSE", MONITOR, "HEALTH_POLL_MS");
 });
 

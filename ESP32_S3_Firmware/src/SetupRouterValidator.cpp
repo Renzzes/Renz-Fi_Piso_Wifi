@@ -39,24 +39,8 @@ const char *stageForLoginCode(const String &code) {
   return "login";
 }
 
-String attrFromResult(const RouterOsClient::CommandResult &result,
-                      const char *attrName) {
-  for (uint8_t i = 0; i < result.replyCount; ++i) {
-    const RouterOsClient::ReplyRecord &record = result.replyAt(i);
-    for (uint8_t j = 0; j < record.attrCount; ++j) {
-      String key;
-      String value;
-      if (RouterOsClient::parseAttr(record.attr(j), key, value) &&
-          key == attrName) {
-        return value;
-      }
-    }
-  }
-  return "";
-}
-
 String identityFromResult(const RouterOsClient::CommandResult &result) {
-  const String name = attrFromResult(result, "name");
+  const String name = RouterOsClient::findReplyAttr(result, "name");
   return name.isEmpty() ? String("RouterOS") : name;
 }
 
@@ -79,16 +63,16 @@ void populateRouterMetadata(RouterOsClient *client,
   RouterOsClient::initializeCommandResult(result);
   if (client->executeCommand("/system/routerboard/print", result) &&
       !result.trapReceived) {
-    out.board = attrFromResult(result, "board-name");
+    out.board = RouterOsClient::findReplyAttr(result, "board-name");
     if (out.board.isEmpty()) {
-      out.board = attrFromResult(result, "model");
+      out.board = RouterOsClient::findReplyAttr(result, "model");
     }
   }
 
   RouterOsClient::initializeCommandResult(result);
   if (client->executeCommand("/system/resource/print", result) &&
       !result.trapReceived) {
-    out.routerOsVersion = attrFromResult(result, "version");
+    out.routerOsVersion = RouterOsClient::findReplyAttr(result, "version");
   }
 }
 

@@ -25,7 +25,11 @@ class EventBus {
   void setInternalListener(InternalListener listener, void *ctx);
 
   // Send a periodic keepalive ping; call from loop().
+  // No-ops while factory reset communication quiesce is active.
   void heartbeat();
+
+  // Drop all SSE clients (factory-reset quiesce). Safe if begin() never ran.
+  void closeAllClients();
 
   size_t clientCount() const;
 

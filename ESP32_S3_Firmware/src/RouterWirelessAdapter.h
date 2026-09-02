@@ -22,6 +22,8 @@ static constexpr const char *kModeExisting = "existing";
 
 static constexpr const char *kModeNew      = "new";
 
+static constexpr const char *kModeExternalAp = "external_ap";
+
 
 
 static constexpr const char *kOpenSecurityProfileName = "RenzFi-Open";

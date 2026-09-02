@@ -152,6 +152,9 @@ function makeElement(id) {
       attrs[k] = String(v);
     },
     getAttribute: (k) => (k in attrs ? attrs[k] : null),
+    removeAttribute: (k) => {
+      delete attrs[k];
+    },
     addEventListener: (type, fn) => {
       (listeners[type] || (listeners[type] = [])).push(fn);
     },
@@ -312,7 +315,12 @@ function fetchStub(url, init) {
     case "/api/portal/cancel-modal":
       s.coinWindowActive = false;
       s.coinWindowRemaining = 0;
-      if (s.sessionState === "waiting_coin") s.sessionState = "idle";
+      if (s.secondsLeft > 0) {
+        s.sessionState = "active";
+        if (s.hadRouterAuth) s.connected = true;
+      } else if (s.sessionState === "waiting_coin") {
+        s.sessionState = "idle";
+      }
       return ok(withCapabilities(s));
 
     case "/api/portal/rates":

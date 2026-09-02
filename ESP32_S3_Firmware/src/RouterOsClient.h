@@ -82,6 +82,12 @@ class RouterOsClient {
 
   static bool parseAttr(const String &word, String &key, String &value);
 
+  static String replyAttr(const CommandResult &result, uint8_t row,
+                          const char *keyName);
+  static bool replyAttrToBuf(const CommandResult &result, uint8_t row,
+                             const char *keyName, char *out, size_t cap);
+  static String findReplyAttr(const CommandResult &result, const char *keyName);
+
   void setTimeouts(uint32_t connectMs, uint32_t ioMs);
   void setCredentials(const String &host, const String &username,
                       const String &password, uint16_t port = 8728);

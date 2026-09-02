@@ -31,6 +31,7 @@ const REASON_LABELS: Record<string, string> = {
   "routeros-error": "RouterOS reported an error while verifying production Wi-Fi.",
   "missing-interface": "The configured production wireless interface was not found.",
   "api-failure": "Unable to reach the router API for production Wi-Fi verification.",
+  "external-ap-topology": "Guest Wi-Fi is provided by an external access point on the MikroTik LAN.",
 };
 
 export function productionNetworkReasonLabel(

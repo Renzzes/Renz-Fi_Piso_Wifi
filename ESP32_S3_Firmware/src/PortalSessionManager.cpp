@@ -81,6 +81,62 @@ void commitAuthorizedClockUnlocked(JsonObject session, uint32_t authorizedAtMs,
   session["secondsLeft"] = rem < 0 ? static_cast<long>(grantedSeconds) : rem;
 }
 
+bool macKeysEqual(const String &a, const String &b) {
+  if (a.equalsIgnoreCase(b)) return true;
+  String na = a;
+  String nb = b;
+  na.replace(":", "");
+  na.replace("-", "");
+  na.toUpperCase();
+  nb.replace(":", "");
+  nb.replace("-", "");
+  nb.toUpperCase();
+  return na.length() > 0 && na == nb;
+}
+
+// Closing Add Additional Time / insert timeout must not drop a paid session
+// to Idle. That froze timerRunning, hid the MAC from Active Users, and left
+// MikroTik HotSpot Active running. Restore Active + the millis clock so the
+// countdown continues without a RouterOS round-trip (HotSpot login is unchanged).
+void restorePaidSessionAfterCoinWindowUnlocked(JsonObject session) {
+  session["coinWindowActive"] = false;
+  session["coinWindowRemaining"] = 0;
+
+  const char *state = session["sessionState"] | PortalState::Idle;
+  if (strcmp(state, PortalState::Expiring) == 0 ||
+      strcmp(state, PortalState::Expired) == 0) {
+    return;
+  }
+
+  const long remaining = session["secondsLeft"] | 0L;
+  const bool paused = (session["paused"] | false) ||
+                      strcmp(state, PortalState::Paused) == 0;
+  if (remaining > 0 && paused) {
+    session["sessionState"] = PortalState::Paused;
+    session["connected"] = false;
+    return;
+  }
+
+  if (remaining > 0) {
+    if (strcmp(state, PortalState::Activating) == 0 ||
+        strcmp(state, PortalState::ActivationError) == 0) {
+      return;
+    }
+    session["sessionState"] = PortalState::Active;
+    if (session["hadRouterAuth"] | false) {
+      session["connected"] = true;
+      commitAuthorizedClockUnlocked(session, millis(),
+                                    static_cast<uint32_t>(remaining));
+    }
+    return;
+  }
+
+  if (strcmp(state, PortalState::WaitingCoin) == 0) {
+    session["sessionState"] = PortalState::Idle;
+    session["connected"] = false;
+  }
+}
+
 bool alreadyAuthorizedThisGeneration(JsonObjectConst session) {
   const char* state = session["sessionState"] | PortalState::Idle;
   return (session["hadRouterAuth"] | false) &&
@@ -172,7 +228,7 @@ void PortalSessionManager::begin(StorageManager* storage, Logger* logger,
   recoverSessionsAfterReboot();
 
   lockState();
-  JsonArray loadedSessions = _doc["sessions"].as<JsonArray>();
+  JsonArray loadedSessions = _doc.doc()["sessions"].as<JsonArray>();
   const size_t count =
       loadedSessions.isNull() ? 0U : loadedSessions.size();
   unlockState();
@@ -274,7 +330,7 @@ void PortalSessionManager::retryPendingRouterWork() {
   bool activateWaitingOnEthernet = false;
 
   lockState();
-  JsonArray sessions = _doc["sessions"].as<JsonArray>();
+  JsonArray sessions = _doc.doc()["sessions"].as<JsonArray>();
   for (JsonObject session : sessions) {
     const String mac = session["macAddress"] | "";
     if (mac.isEmpty()) continue;
@@ -409,8 +465,14 @@ void PortalSessionManager::enrichSessionCapabilities(JsonDocument& out) {
 
   // Voucher authority: wall-clock serviceExpiresAt (NTP), not Active presence.
   if (isVoucher) {
+    const bool clockFrozen =
+        out["voucherClockFrozen"] | false ||
+        strcmp(state.c_str(), PortalState::Paused) == 0 ||
+        paused;
     const String serviceExpiresAt = out["serviceExpiresAt"] | "";
-    if (!serviceExpiresAt.isEmpty()) {
+    if (clockFrozen) {
+      secondsLeft = out["secondsLeft"] | 0L;
+    } else if (!serviceExpiresAt.isEmpty()) {
       const long wallRemaining = secondsUntilRecordedAt(serviceExpiresAt);
       if (wallRemaining == 0) {
         secondsLeft = 0;
@@ -447,6 +509,12 @@ void PortalSessionManager::enrichSessionCapabilities(JsonDocument& out) {
                     (paused || state == PortalState::ActivationError);
   out["canTerminate"]  = !isVoucher && !ended && (secondsLeft > 0 || paused);
   out["canReconnect"]  = isVoucher && !ended && secondsLeft > 0;
+
+  if (out["ownerDisconnectNotice"] | false) {
+    out["sessionNotice"] =
+        "You have been disconnected by Owner, if this is a mistake, contact the "
+        "owner";
+  }
 
   // The countdown only advances in Active; the UI must not interpolate in any
   // other state (see the timer-ownership contract in the portal bundle).
@@ -498,6 +566,14 @@ bool PortalSessionManager::startCoinWindow(const String& mac,
     return false;
   }
   const int windowSecs = (int)coinInsertTimeoutSecs();
+  // Preserve remaining paid time while the customer inserts more coins.
+  // Freezing first snapshots wall-clock remaining into secondsLeft before we
+  // leave Active (tick no longer advances during waiting_coin).
+  if ((session["secondsLeft"] | 0L) > 0 ||
+      strcmp(session["sessionState"] | "", PortalState::Active) == 0 ||
+      strcmp(session["sessionState"] | "", PortalState::Paused) == 0) {
+    freezeSessionClockUnlocked(session);
+  }
   session["coinWindowActive"]    = true;
   session["coinWindowRemaining"] = windowSecs;
   session["sessionState"]        = PortalState::WaitingCoin;
@@ -694,10 +770,10 @@ bool PortalSessionManager::donePaying(const String& mac, String& errorCode,
       Serial.println("[portal] done-paying idempotent (activation in progress)");
       return true;
     }
-    if (strcmp(stateStr, PortalState::Active) == 0 && secondsLeft > 0) {
-      unlockState();
-      Serial.println("[portal] done-paying idempotent (already active)");
-      return true;
+  if (strcmp(stateStr, PortalState::Active) == 0 && secondsLeft > 0) {
+    unlockState();
+    Serial.println("[portal] done-paying idempotent (already active)");
+    return true;
     }
     unlockState();
     Serial.println("[portal] done-paying aborted (no credits)");
@@ -705,8 +781,7 @@ bool PortalSessionManager::donePaying(const String& mac, String& errorCode,
     return false;
   }
 
-  if (hasPendingActivationUnlocked(mac) ||
-      hasPendingRecordSaleUnlocked(mac, String(session["sessionId"] | ""))) {
+  if (hasPendingActivationUnlocked(mac)) {
     unlockState();
     Serial.println("[portal] done-paying idempotent (activation in progress)");
     return true;
@@ -730,12 +805,16 @@ bool PortalSessionManager::donePaying(const String& mac, String& errorCode,
   }
 
   const String existingProfileEarly = session["hotspotProfile"] | "";
+  // Add Additional Time opens the coin window as waiting_coin while
+  // secondsLeft still holds the prior entitlement. Treat that as add-time
+  // so Done Paying extends remaining minutes instead of replacing them.
   const bool addTimeEarly =
       secondsLeft > 0 &&
       (strcmp(stateStr, PortalState::Active) == 0 ||
        strcmp(stateStr, PortalState::Paused) == 0 ||
        strcmp(stateStr, PortalState::Activating) == 0 ||
-       strcmp(stateStr, PortalState::ActivationError) == 0);
+       strcmp(stateStr, PortalState::ActivationError) == 0 ||
+       strcmp(stateStr, PortalState::WaitingCoin) == 0);
   // Add Time keeps the stored Hotspot profile — do not block activation on
   // a promo-table read that will be discarded.
   const bool needPromoProfile =
@@ -787,8 +866,7 @@ bool PortalSessionManager::donePaying(const String& mac, String& errorCode,
     errorCode = "NO_CREDITS";
     return false;
   }
-  if (hasPendingActivationUnlocked(mac) ||
-      hasPendingRecordSaleUnlocked(mac, String(session["sessionId"] | ""))) {
+  if (hasPendingActivationUnlocked(mac)) {
     unlockState();
     Serial.println("[portal] done-paying idempotent (activation in progress)");
     return true;
@@ -811,7 +889,8 @@ bool PortalSessionManager::donePaying(const String& mac, String& errorCode,
       (strcmp(stateStr, PortalState::Active) == 0 ||
        strcmp(stateStr, PortalState::Paused) == 0 ||
        strcmp(stateStr, PortalState::Activating) == 0 ||
-       strcmp(stateStr, PortalState::ActivationError) == 0);
+       strcmp(stateStr, PortalState::ActivationError) == 0 ||
+       strcmp(stateStr, PortalState::WaitingCoin) == 0);
   const long purchasedSeconds = (long)saleMinutes * 60L;
   const long newRemaining =
       addTime ? (existingRemaining + purchasedSeconds) : purchasedSeconds;
@@ -889,10 +968,10 @@ bool PortalSessionManager::donePaying(const String& mac, String& errorCode,
       routerAccepted = true;
     }
     if (!routerAccepted) {
-      lockState();
-      session = findSessionUnlocked(mac);
-      if (!session.isNull()) {
-        session["credits"] = saleAmount;
+    lockState();
+    session = findSessionUnlocked(mac);
+    if (!session.isNull()) {
+      session["credits"] = saleAmount;
         session["insertedAmount"] = saleAmount;
         session["purchasedMinutes"] = saleMinutes;
         session["secondsLeft"] = existingRemaining;
@@ -902,20 +981,20 @@ bool PortalSessionManager::donePaying(const String& mac, String& errorCode,
         session["connected"] = addTime && existingRemaining > 0;
         session["routerAuthPending"] = false;
         session["activationError"] = false;
-        _dirty = true;
-      }
-      unlockState();
-      enqueueSaveSessions();
+      _dirty = true;
+    }
+    unlockState();
+    enqueueSaveSessions();
       enqueueEmitBus("sessions.changed");
       Serial.println("[portal] done-paying aborted (activation enqueue failed)");
-      if (_logger) {
+    if (_logger) {
         _logger->errorLocal("portal",
                             "donePaying: activation queue full — credits restored for " +
                                 mac);
-      }
+    }
       errorCode = "ACTIVATION_QUEUE_FULL";
       activationLatencyTrace().reset();
-      return false;
+    return false;
     }
   }
 
@@ -1147,22 +1226,21 @@ bool PortalSessionManager::resume(const String& mac, String* errorCode) {
 bool PortalSessionManager::cancelModal(const String& mac, JsonDocument& out) {
   lockState();
   JsonObject session = findOrCreateUnlocked(mac, "");
-  session["coinWindowActive"]    = false;
-  session["coinWindowRemaining"] = 0;
-  if (strcmp(session["sessionState"] | PortalState::Idle,
-             PortalState::WaitingCoin) == 0) {
-    session["sessionState"] = PortalState::Idle;
-  }
+  restorePaidSessionAfterCoinWindowUnlocked(session);
   // Preserve credits / insertedAmount — customer may reopen insert flow.
   session["lastSeen"] = (unsigned long)(millis() / 1000);
-  if (_activeInsertMac.equalsIgnoreCase(mac)) _activeInsertMac = "";
+  if (macKeysEqual(_activeInsertMac, mac)) _activeInsertMac = "";
   _dirty = true;
   out.set(session);
   unlockState();
 
+  enrichSessionPurchasedMinutes(out);
+  enrichSessionCapabilities(out);
   enqueueSaveSessions();
   enqueueWork(PortalWorkType::EmitSessionEvent, mac, "portal.session.updated");
   enqueueEmitBus("sessions.changed");
+  enqueueEmitBus("users.active");
+  enqueueEmitBus("system.status");
   return true;
 }
 
@@ -1268,8 +1346,8 @@ bool PortalSessionManager::reset(const String& mac) {
   session["routerCleanupComplete"] = false;
   session["terminationReason"] = "owner_disconnected";
   session["terminationActor"] = "owner";
-  if (_activeInsertMac == mac) _activeInsertMac = "";
-  _dirty = true;
+    if (_activeInsertMac == mac) _activeInsertMac = "";
+    _dirty = true;
   unlockState();
 
   if (!voucherCode.isEmpty() && _vouchers) {
@@ -1277,9 +1355,180 @@ bool PortalSessionManager::reset(const String& mac) {
                       salesRecordedAtNow());
   }
   enqueueWork(PortalWorkType::ExpireSession, mac, nullptr, 0, resetGen);
+    enqueueSaveSessions();
+    enqueueEmitBus("sessions.changed");
+    enqueueEmitBus("users.active");
+  return true;
+}
+
+bool PortalSessionManager::suspendInternet(const String& mac, String* errorCode) {
+  if (errorCode) *errorCode = "";
+  lockState();
+  JsonObject session = findSessionUnlocked(mac);
+  if (session.isNull()) {
+    if (errorCode) *errorCode = "SESSION_NOT_FOUND";
+    unlockState();
+    return false;
+  }
+  const bool isVoucher = strcmp(session["source"] | "portal", "voucher") == 0;
+  unlockState();
+
+  if (isVoucher) {
+    long remaining = 0;
+    lockState();
+    session = findSessionUnlocked(mac);
+    if (session.isNull()) {
+      if (errorCode) *errorCode = "SESSION_NOT_FOUND";
+      unlockState();
+      return false;
+    }
+    if (!voucherWallRemaining(session, remaining) || remaining <= 0) {
+      if (errorCode) *errorCode = "SESSION_ENDED";
+      unlockState();
+      return false;
+    }
+    const char* stateStr = session["sessionState"] | PortalState::Idle;
+    if (strcmp(stateStr, PortalState::Expired) == 0 ||
+        strcmp(stateStr, PortalState::Expiring) == 0) {
+      if (errorCode) *errorCode = "SESSION_ENDED";
+      unlockState();
+      return false;
+    }
+    session["secondsLeft"] = remaining;
+    session["voucherClockFrozen"] = true;
+    session["connected"] = false;
+    session["paused"] = true;
+    session["sessionState"] = PortalState::Paused;
+    session["routerPausePending"] = true;
+    session["ownerSuspended"] = true;
+    session["updatedAt"] = static_cast<unsigned long>(millis() / 1000);
+    session["lastSeen"] = static_cast<unsigned long>(millis() / 1000);
+    const uint32_t pauseGen = sessionGenerationOf(session);
+    _dirty = true;
+    unlockState();
+    enqueueSaveSessions();
+    enqueueWork(PortalWorkType::PauseSession, mac, nullptr, 0, pauseGen);
+    enqueueEmitBus("sessions.changed");
+    enqueueEmitBus("users.active");
+    enqueueEmitBus("system.status");
+    return true;
+  }
+
+  return pause(mac, errorCode, false);
+}
+
+bool PortalSessionManager::reconnectInternet(const String& mac,
+                                             String* errorCode) {
+  if (errorCode) *errorCode = "";
+  lockState();
+  JsonObject session = findSessionUnlocked(mac);
+  if (session.isNull()) {
+    if (errorCode) *errorCode = "SESSION_NOT_FOUND";
+    unlockState();
+    return false;
+  }
+  const bool isVoucher = strcmp(session["source"] | "portal", "voucher") == 0;
+  const String ip = String(session["ipAddress"] | "");
+  unlockState();
+
+  if (isVoucher) {
+    DynamicJsonDocument outDoc(RenzFiConfig::JSON_DOC_MEDIUM);
+    lockState();
+    session = findSessionUnlocked(mac);
+    if (session.isNull()) {
+      if (errorCode) *errorCode = "SESSION_NOT_FOUND";
+      unlockState();
+      return false;
+    }
+    const long remaining = session["secondsLeft"] | 0L;
+    if (remaining <= 0) {
+      if (errorCode) *errorCode = "SESSION_ENDED";
+      unlockState();
+      return false;
+    }
+    const String now = salesRecordedAtNow();
+    if (now.isEmpty()) {
+      if (errorCode) *errorCode = "CLOCK_NOT_READY";
+      unlockState();
+      return false;
+    }
+    session["voucherClockFrozen"] = false;
+    session.remove("ownerSuspended");
+    session["serviceExpiresAt"] =
+        addSecondsToRecordedAt(now, static_cast<uint32_t>(remaining));
+    session["serviceExpiresEpoch"] =
+        static_cast<unsigned long>(time(nullptr) + remaining);
+    session["secondsLeft"] = remaining;
+    _dirty = true;
+    unlockState();
+    if (!reconnectVoucher(mac, ip, outDoc, *errorCode)) return false;
+    enqueueEmitBus("sessions.changed");
+    enqueueEmitBus("users.active");
+    enqueueEmitBus("system.status");
+    return true;
+  }
+
+  return resume(mac, errorCode);
+}
+
+bool PortalSessionManager::ownerTerminateSession(const String& mac,
+                                                 String* errorCode) {
+  if (errorCode) *errorCode = "";
+  String voucherCode;
+  uint32_t terminateGen = 0;
+  lockState();
+  JsonObject session = findSessionUnlocked(mac);
+  if (session.isNull()) {
+    if (errorCode) *errorCode = "SESSION_NOT_FOUND";
+    unlockState();
+    return false;
+  }
+  voucherCode = String(session["voucherCode"] | "");
+  terminateGen = sessionGenerationOf(session);
+  clearSessionClockUnlocked(session);
+  session["secondsLeft"] = 0;
+  session["credits"] = 0;
+  session["insertedAmount"] = 0;
+  session["purchasedMinutes"] = 0;
+  session["paused"] = false;
+  session["connected"] = false;
+  session["coinWindowActive"] = false;
+  session["coinWindowRemaining"] = 0;
+  session["voucherClockFrozen"] = false;
+  session["sessionState"] = PortalState::Expired;
+  session["routerAuthPending"] = false;
+  session["routerPausePending"] = false;
+  session["resumePending"] = false;
+  session["routerCleanupQueued"] = true;
+  session["routerCleanupPending"] = true;
+  session["routerCleanupComplete"] = false;
+  session["terminationReason"] = "owner_terminated";
+  session["terminationActor"] = "owner";
+  session["ownerDisconnectNotice"] = true;
+  session["serviceExpiresAt"] = salesRecordedAtNow();
+  session["serviceExpiresEpoch"] = static_cast<unsigned long>(time(nullptr));
+  if (!voucherCode.isEmpty()) {
+    session["voucherStatus"] = "expired";
+  }
+  session["updatedAt"] = static_cast<unsigned long>(millis() / 1000);
+  session["lastSeen"] = static_cast<unsigned long>(millis() / 1000);
+  if (_activeInsertMac == mac) _activeInsertMac = "";
+  _dirty = true;
+  unlockState();
+
+  if (!voucherCode.isEmpty() && _vouchers) {
+    _vouchers->expire(voucherCode, "owner_terminated", salesRecordedAtNow());
+  }
+  completeAccounting(mac, "owner_terminated", "owner");
   enqueueSaveSessions();
+  enqueueWork(PortalWorkType::ExpireSession, mac, nullptr, 0, terminateGen);
+  enqueueWork(PortalWorkType::EmitSessionEvent, mac, "portal.session.expired");
   enqueueEmitBus("sessions.changed");
   enqueueEmitBus("users.active");
+  enqueueEmitBus("system.status");
+  if (_logger) {
+    _logger->infoLocal("portal", "Session terminated by owner: " + mac);
+  }
   return true;
 }
 
@@ -1308,10 +1557,14 @@ bool PortalSessionManager::redeemVoucher(const String& code, const String& mac,
     return false;
   }
 
-  const String recordedAt = salesRecordedAtNow();
+  const String recordedAtRaw = salesRecordedAtNow();
+  String recordedAt = recordedAtRaw;
+  // Parity with donePaying: never block voucher Internet solely because NTP
+  // is down (WAN unplugged / DNS cleared during incomplete setup).
   if (recordedAt.isEmpty()) {
-    errorCode = "CLOCK_NOT_READY";
-    return false;
+    recordedAt = String("uptime-ms:") + millis();
+    Serial.println(
+        "[voucher-redeem] wall clock unavailable — using uptime redeem marker");
   }
 
   lockState();
@@ -1339,22 +1592,26 @@ bool PortalSessionManager::redeemVoucher(const String& code, const String& mac,
       errorCode = "STORAGE_ERROR";
     else
       errorCode = "VOUCHER_UNAVAILABLE";
+    Serial.printf("[voucher-redeem] reserve rejected code=%s status=%d\n",
+                  errorCode.c_str(), static_cast<int>(reserved.result));
     return false;
   }
 
   const String sessionId =
       reserved.sessionId.isEmpty() ? candidateSessionId : reserved.sessionId;
   const String saleId = "sale-" + sessionId;
-  // Absolute voucher authority: remaining until redeemedAt+validity (serviceExpiresAt).
+  // Absolute voucher authority when wall clock + serviceExpiresAt exist.
+  // Otherwise relative minutes (same operational outcome as coin entitlement).
   long entitlementSeconds = static_cast<long>(reserved.minutes) * 60L;
+  if (entitlementSeconds < 1 && reserved.minutes > 0) {
+    entitlementSeconds = static_cast<long>(reserved.minutes) * 60L;
+  }
   if (!reserved.serviceExpiresAt.isEmpty()) {
-    entitlementSeconds = secondsUntilRecordedAt(reserved.serviceExpiresAt);
-    if (entitlementSeconds < 0) {
-      errorCode = "CLOCK_NOT_READY";
-      return false;
-    }
-    if (entitlementSeconds == 0) {
-      _vouchers->expire(reserved.code, "time_expired", recordedAt);
+    const long wallRemaining =
+        secondsUntilRecordedAt(reserved.serviceExpiresAt);
+    if (wallRemaining == 0) {
+      _vouchers->expire(reserved.code, "time_expired",
+                        recordedAtRaw.isEmpty() ? recordedAt : recordedAtRaw);
       Serial.printf(
           "[voucher-expiry] mac=%s code=%s redeemedAt= expiresAt=%s now=%s "
           "remaining=0 action=expire\n",
@@ -1363,8 +1620,20 @@ bool PortalSessionManager::redeemVoucher(const String& code, const String& mac,
       errorCode = "VOUCHER_EXPIRED";
       return false;
     }
-  } else if (reserved.status == "active") {
-    // Legacy active voucher without serviceExpiresAt — refuse extension.
+    if (wallRemaining > 0) {
+      entitlementSeconds = wallRemaining;
+    } else {
+      Serial.printf(
+          "[voucher-redeem] mac=%s code=%s wall remaining unreadable — "
+          "using relative minutes=%d\n",
+          mac.c_str(), reserved.code.c_str(), reserved.minutes);
+    }
+  } else if (reserved.status == "active" && reserved.minutes < 1) {
+    // Legacy active voucher without serviceExpiresAt or minutes — refuse.
+    errorCode = "VOUCHER_UNAVAILABLE";
+    return false;
+  }
+  if (entitlementSeconds < 1) {
     errorCode = "VOUCHER_UNAVAILABLE";
     return false;
   }
@@ -1415,10 +1684,14 @@ bool PortalSessionManager::redeemVoucher(const String& code, const String& mac,
   session["startedAt"] =
       reserved.activatedAt.isEmpty() ? recordedAt : reserved.activatedAt;
   session["serviceExpiresAt"] = reserved.serviceExpiresAt;
-  session["serviceExpiresEpoch"] =
-      !reserved.serviceExpiresAt.isEmpty()
-          ? static_cast<unsigned long>(time(nullptr) + entitlementSeconds)
-          : 0UL;
+  if (!reserved.serviceExpiresAt.isEmpty() && salesTimeReady()) {
+    session["serviceExpiresEpoch"] =
+        static_cast<unsigned long>(time(nullptr) + entitlementSeconds);
+  } else {
+    // Relative voucher (no NTP stamp): millis clock after HotSpot grant.
+    session["serviceExpiresEpoch"] = 0UL;
+    clearSessionClockUnlocked(session);
+  }
   if (!reserved.profileName.isEmpty()) {
     session["hotspotProfile"] = reserved.profileName;
   }
@@ -1462,17 +1735,14 @@ bool PortalSessionManager::reconnectVoucher(const String& mac, const String& ip,
   const String serviceExpiresAt = session["serviceExpiresAt"] | "";
   if (!serviceExpiresAt.isEmpty()) {
     const long remaining = secondsUntilRecordedAt(serviceExpiresAt);
-    if (remaining < 0) {
-      unlockState();
-      errorCode = "CLOCK_NOT_READY";
-      return false;
-    } else if (remaining == 0) {
+    if (remaining == 0) {
       mustExpire = true;
-    } else {
+    } else if (remaining > 0) {
       session["secondsLeft"] = remaining;
       session["serviceExpiresEpoch"] =
           static_cast<unsigned long>(time(nullptr) + remaining);
     }
+    // remaining < 0 (clock not ready): keep stored secondsLeft and continue.
   } else if ((session["secondsLeft"] | 0L) <= 0) {
     mustExpire = true;
   }
@@ -1603,7 +1873,7 @@ void PortalSessionManager::completeAccounting(const String& mac,
 static bool macAlreadyListed(const JsonArray &seenMacs, const String &mac) {
   if (mac.isEmpty()) return false;
   for (JsonVariantConst seen : seenMacs) {
-    if (mac.equalsIgnoreCase(seen.as<const char *>())) return true;
+    if (macKeysEqual(mac, String(seen.as<const char *>()))) return true;
   }
   return false;
 }
@@ -1635,13 +1905,17 @@ static const char *portalApiState(JsonObjectConst session) {
  * path is browser presence.
  *
  * Paid Active / Paused / Activating / ActivationError with remaining time (or
- * pause) remain listed even when the captive portal is closed. Expiration and
- * Idle/Expired states remove them. Heartbeat must not equate to Hotspot auth.
+ * pause) remain listed even when the captive portal is closed. Expired is
+ * removed. Idle with leftover secondsLeft is still listed (paid time that
+ * must not disappear from Admin while HotSpot Active may still be granted).
+ * Heartbeat must not equate to Hotspot auth.
  */
 static bool isPortalSessionActive(JsonObjectConst session, unsigned long nowSec) {
   const char *state = session["sessionState"] | PortalState::Idle;
   if (strcmp(state, PortalState::Expired) == 0) return false;
-  if (strcmp(state, PortalState::Idle) == 0) return false;
+  if (strcmp(state, PortalState::Idle) == 0) {
+    return (session["secondsLeft"] | 0L) > 0;
+  }
   if (strcmp(state, PortalState::Expiring) == 0) {
     // Expiring still has entitlement until Expired transition.
     const long secondsLeft = session["secondsLeft"] | 0L;
@@ -1690,7 +1964,7 @@ static bool isPortalSessionActive(JsonObjectConst session, unsigned long nowSec)
 
 bool PortalSessionManager::hasActiveClientSession() const {
   lockState();
-  JsonArrayConst arr = _doc["sessions"];
+  JsonArrayConst arr = _doc.doc()["sessions"];
   if (arr.isNull()) {
     unlockState();
     return false;
@@ -1709,9 +1983,33 @@ bool PortalSessionManager::hasActiveClientSession() const {
   return false;
 }
 
+bool PortalSessionManager::hasOperationalPortalLoad() const {
+  lockState();
+  JsonArrayConst arr = _doc.doc()["sessions"];
+  if (arr.isNull()) {
+    unlockState();
+    return false;
+  }
+
+  const unsigned long nowSec = millis() / 1000;
+  for (JsonObjectConst session : arr) {
+    if (!isPortalSessionActive(session, nowSec)) continue;
+    const char *state = session["sessionState"] | PortalState::Idle;
+    if (strcmp(state, PortalState::Idle) == 0 ||
+        strcmp(state, PortalState::Expiring) == 0 ||
+        strcmp(state, PortalState::Expired) == 0) {
+      continue;
+    }
+    unlockState();
+    return true;
+  }
+  unlockState();
+  return false;
+}
+
 void PortalSessionManager::appendActiveUsers(JsonArray &out, JsonArray &seenMacs) {
   lockState();
-  JsonArray arr = _doc["sessions"].as<JsonArray>();
+  JsonArray arr = _doc.doc()["sessions"].as<JsonArray>();
   if (arr.isNull()) {
     unlockState();
     return;
@@ -1738,7 +2036,7 @@ void PortalSessionManager::appendActiveUsers(JsonArray &out, JsonArray &seenMacs
     const bool isVoucher = sourceRaw == "voucher";
 
     int remainingMinutes = 0;
-    if (isActiveState || isPausedState || isActivating) {
+    if (isActiveState || isPausedState || isActivating || secondsLeft > 0) {
       remainingMinutes = (int)((secondsLeft + 59L) / 60L);
     }
 
@@ -1765,7 +2063,7 @@ void PortalSessionManager::cleanupExpired() {
   bool changed = false;
 
   lockState();
-  JsonArray arr = _doc["sessions"].as<JsonArray>();
+  JsonArray arr = _doc.doc()["sessions"].as<JsonArray>();
   if (arr.isNull()) {
     unlockState();
     return;
@@ -1790,7 +2088,7 @@ void PortalSessionManager::cleanupExpired() {
     const bool heartbeatStale = lastSeen > 0 && nowSec > lastSeen &&
                                 (nowSec - lastSeen) > HEARTBEAT_TTL;
     const bool waitingLike = strcmp(state, PortalState::WaitingCoin) == 0 ||
-                             (s["coinWindowActive"] | false);
+                            (s["coinWindowActive"] | false);
 
     bool staleSince = false;
     if (expired) {
@@ -1800,10 +2098,23 @@ void PortalSessionManager::cleanupExpired() {
     } else if (idle || unpaid) {
       staleSince = (nowSec > lastSeen) && (nowSec - lastSeen > IDLE_TTL);
     } else if (waitingLike && heartbeatStale) {
-      // Browser presence may close an unpaid coin window, but it must never
-      // erase an active, activating, or paused entitlement. RouterOS cleanup
-      // remains an explicit lifecycle transition.
-      staleSince = true;
+      // Unpaid coin windows may be pruned when the browser leaves. Paid
+      // remaining time must never be erased — keep the session so Add Time
+      // can still extend it (Done Paying uses secondsLeft).
+      const long rem = s["secondsLeft"] | 0L;
+      if (rem > 0) {
+        staleSince = false;
+        if (s["coinWindowActive"] | false) {
+          s["coinWindowActive"] = false;
+          s["coinWindowRemaining"] = 0;
+          // Restore Active so the wall clock can resume after the portal
+          // reconnects; entitlement secondsLeft is already frozen.
+          s["sessionState"] = PortalState::Active;
+          changed = true;
+        }
+      } else {
+        staleSince = true;
+      }
     }
 
     if (staleSince) {
@@ -1825,7 +2136,7 @@ void PortalSessionManager::cleanupExpired() {
   }
 
   if (changed) {
-    _doc.set(tmp);
+    _doc.doc().set(tmp);
     _dirty = true;
   }
   unlockState();
@@ -1992,8 +2303,8 @@ void PortalSessionManager::processDeferredWork() {
     }
   }
   if (pickOffset == 0) {
-    item = _workQueue[_workTail];
-    _workTail = static_cast<uint8_t>((_workTail + 1) % kPortalWorkQueueCap);
+  item = _workQueue[_workTail];
+  _workTail = static_cast<uint8_t>((_workTail + 1) % kPortalWorkQueueCap);
   } else {
     const uint8_t pick =
         static_cast<uint8_t>((_workTail + pickOffset) % kPortalWorkQueueCap);
@@ -2047,6 +2358,14 @@ void PortalSessionManager::processDeferredWork() {
 
     case PortalWorkType::RecordSale: {
       if (!_sessions) break;
+      // Sales JSON must not allocate INTERNAL/DMA. Even with PSRAM docs, wait
+      // briefly if ETH DMA is already critical so concurrent portal HTTP can
+      // drain before we touch SD (loopTask — never async_tcp).
+      if (DmaMemoryMonitor::isEthDmaCritical() ||
+          !DmaMemoryMonitor::hasHttpServeHeadroom()) {
+        (void)DmaMemoryMonitor::waitForDmaHeadroom(
+            800, DmaMemoryMonitor::kMinLargestDmaBlockForHttpStart);
+      }
       String ip;
       String profile;
       lockState();
@@ -2068,10 +2387,24 @@ void PortalSessionManager::processDeferredWork() {
       sale.durationMinutes = item.saleMinutes;
       sale.credits = item.saleAmount;
       sale.profile = profile;
+      if (_promos) {
+        String speedLabel;
+        if (_promos->resolveSpeedLabelForAmount(item.saleAmount, &speedLabel)) {
+          sale.speed = speedLabel;
+        }
+      }
       sale.status = "pending_activation";
-      if (!_sessions->upsertSale(sale) && _logger) {
-        _logger->error("portal",
-                       String("deferred sale failed for ") + item.mac);
+      if (!_sessions->upsertSale(sale)) {
+        if (_logger) {
+          _logger->error("portal",
+                         String("deferred sale failed for ") + item.mac);
+        }
+        Serial.printf("[sales] record-fail mac=%s amount=%d session=%s\n",
+                      item.mac, item.saleAmount, item.saleSessionId);
+      } else {
+        _sessions->refreshSalesSummarySnapshot();
+        Serial.printf("[sales] recorded coin PHP %d mac=%s session=%s\n",
+                      item.saleAmount, item.mac, item.saleSessionId);
       }
       break;
     }
@@ -2134,7 +2467,7 @@ void PortalSessionManager::tickSessions() {
   _tickEffectCount = 0;
 
   lockState();
-  JsonArray arr = _doc["sessions"].as<JsonArray>();
+  JsonArray arr = _doc.doc()["sessions"].as<JsonArray>();
   if (arr.isNull()) {
     unlockState();
     return;
@@ -2153,10 +2486,15 @@ void PortalSessionManager::tickSessions() {
         session["coinWindowActive"]    = false;
         session["coinWindowRemaining"] = 0;
         const String mac = String(session["macAddress"] | "");
-        if (_activeInsertMac == mac) _activeInsertMac = "";
+        if (macKeysEqual(_activeInsertMac, mac)) _activeInsertMac = "";
 
         const int credits = session["credits"] | 0;
-        if (credits > 0) {
+        const long paidLeft = session["secondsLeft"] | 0L;
+        if (paidLeft > 0) {
+          restorePaidSessionAfterCoinWindowUnlocked(session);
+          pushTickEffect(PortalWorkType::EmitSessionEvent, mac,
+                         "portal.coin.window_closed");
+        } else if (credits > 0) {
           session["sessionState"] = PortalState::Idle;
           session["connected"]    = false;
           pushTickEffect(PortalWorkType::EmitSessionEvent, mac,
@@ -2389,7 +2727,7 @@ void PortalSessionManager::tickSessions() {
       if (secs > 0) {
         if ((session["expiresAtMs"] | 0U) == 0 &&
             strcmp(session["source"] | "portal", "voucher") != 0) {
-          session["secondsLeft"] = secs - 1;
+        session["secondsLeft"] = secs - 1;
         }
         session["connectedSeconds"] =
             (session["connectedSeconds"] | 0UL) + 1UL;
@@ -2429,20 +2767,63 @@ void PortalSessionManager::maybeEnqueueActiveVerify() {
   // Never from async_tcp — only loop() → router_worker.
   // Zero Connected sessions ⇒ never verify. Unhealthy RouterOS ⇒ never verify.
   if (!_routerWorker) return;
+  constexpr uint32_t kVerifyIntervalMs = 60000;
+  const uint32_t now = millis();
+  static uint32_t s_verifyBlockedSinceMs = 0;
   if (!RouterApiTransportGate::allowsHotspotVerify()) {
     static uint32_t s_lastVerifySkipLogMs = 0;
-    const uint32_t nowSkip = millis();
+    if (s_verifyBlockedSinceMs == 0) s_verifyBlockedSinceMs = now;
     if (s_lastVerifySkipLogMs == 0 ||
-        (nowSkip - s_lastVerifySkipLogMs) >= 30000U) {
-      s_lastVerifySkipLogMs = nowSkip;
+        (now - s_lastVerifySkipLogMs) >= 30000U) {
+      s_lastVerifySkipLogMs = now;
       Serial.printf(
           "[router-worker] verify skipped reason=router_unavailable health=%s\n",
           RouterApiTransportGate::healthLabel());
     }
+    // Failsafe: do not burn purchased time while Verify cannot run
+    // (UNAVAILABLE/COOLDOWN). Match not_active outcome after one interval.
+    if ((now - s_verifyBlockedSinceMs) >= kVerifyIntervalMs) {
+      s_verifyBlockedSinceMs = now;
+      bool cleared = false;
+      lockState();
+      JsonArray arr = _doc.doc()["sessions"].as<JsonArray>();
+      if (!arr.isNull()) {
+        for (JsonObject session : arr) {
+          const char* state = session["sessionState"] | PortalState::Idle;
+          if (strcmp(state, PortalState::Active) != 0) continue;
+          if (!(session["connected"] | false)) continue;
+          if (session["paused"] | false) continue;
+          if ((session["secondsLeft"] | 0L) <= 0) continue;
+          if (session["routerAuthPending"] | false) continue;
+          freezeSessionClockUnlocked(session);
+          session["connected"] = false;
+          session["activationError"] = true;
+          session["activationErrorReason"] =
+              "Internet authorization unverified — purchased time preserved. "
+              "Tap RETRY INTERNET.";
+          session["sessionState"] = PortalState::ActivationError;
+          session["routerAuthPending"] = false;
+          session.remove("activationStartedAt");
+          _dirty = true;
+          cleared = true;
+          Serial.printf(
+              "[portal-verify] mac=%s verify_blocked -> activation_error "
+              "(secondsLeft preserved)\n",
+              String(session["macAddress"] | "").c_str());
+        }
+      }
+      unlockState();
+      if (cleared) {
+        enqueueSaveSessions();
+        enqueueEmitBus("sessions.changed");
+        enqueueEmitBus("users.active");
+        enqueueEmitBus("system.status");
+      }
+    }
     return;
   }
-  constexpr uint32_t kVerifyIntervalMs = 60000;
-  const uint32_t now = millis();
+  s_verifyBlockedSinceMs = 0;
+
   if (_lastActiveVerifyMs != 0 &&
       (now - _lastActiveVerifyMs) < kVerifyIntervalMs) {
     return;
@@ -2450,7 +2831,7 @@ void PortalSessionManager::maybeEnqueueActiveVerify() {
 
   String mac;
   lockState();
-  JsonArray arr = _doc["sessions"].as<JsonArray>();
+  JsonArray arr = _doc.doc()["sessions"].as<JsonArray>();
   if (!arr.isNull()) {
     for (JsonObject session : arr) {
       const char* state = session["sessionState"] | PortalState::Idle;
@@ -2491,7 +2872,7 @@ void PortalSessionManager::maybeEnqueueActiveVerify() {
 
 bool PortalSessionManager::needsRouterOsWork() const {
   lockState();
-  JsonArrayConst arr = _doc["sessions"];
+  JsonArrayConst arr = _doc.doc()["sessions"];
   if (arr.isNull()) {
     unlockState();
     return false;
@@ -2553,7 +2934,7 @@ bool PortalSessionManager::needsRouterOsWork() const {
 
 bool PortalSessionManager::needsHealthRecoveryProbe() const {
   lockState();
-  JsonArrayConst arr = _doc["sessions"];
+  JsonArrayConst arr = _doc.doc()["sessions"];
   if (arr.isNull()) {
     unlockState();
     return false;
@@ -2608,7 +2989,7 @@ bool PortalSessionManager::needsHealthRecoveryProbe() const {
 
 bool PortalSessionManager::hasCustomerActivatePending() const {
   lockState();
-  JsonArrayConst arr = _doc["sessions"];
+  JsonArrayConst arr = _doc.doc()["sessions"];
   if (arr.isNull()) {
     unlockState();
     return false;
@@ -2679,7 +3060,7 @@ void PortalSessionManager::recoverSessionsAfterReboot() {
   lockState();
   _activeInsertMac = "";
 
-  JsonArray arr = _doc["sessions"].as<JsonArray>();
+  JsonArray arr = _doc.doc()["sessions"].as<JsonArray>();
   if (arr.isNull()) {
     unlockState();
     return;
@@ -2691,15 +3072,12 @@ void PortalSessionManager::recoverSessionsAfterReboot() {
     const int credits = session["credits"] | 0;
     const String mac = String(session["macAddress"] | "");
     if (hadWindow) {
-      session["coinWindowActive"]    = false;
-      session["coinWindowRemaining"] = 0;
-      session["sessionState"]        = PortalState::Idle;
-      session["connected"]           = false;
-      changed = true;
-      Serial.printf(
-          "[portal] Boot recovery: closed coin window for %s (credits=%d "
-          "preserved — customer must reopen insert flow)\n",
-          mac.c_str(), credits);
+    restorePaidSessionAfterCoinWindowUnlocked(session);
+    changed = true;
+    Serial.printf(
+        "[portal] Boot recovery: closed coin window for %s (credits=%d "
+        "paidLeft=%ld — restore Active when entitlement remains)\n",
+        mac.c_str(), credits, (long)(session["secondsLeft"] | 0L));
     }
 
     const char* state =
@@ -2740,14 +3118,57 @@ void PortalSessionManager::recoverSessionsAfterReboot() {
       }
     }
 
+    // HotSpot Active never survives ESP reboot. Never resume countdown from a
+    // persisted Active claim — that showed Admin "Active" / portal timer while
+    // MikroTik Active was empty (and while verify stayed skipped on
+    // health=UNKNOWN). Preserve secondsLeft; require re-authorize.
+    state = session["sessionState"] | PortalState::Idle;
+    secondsLeft = session["secondsLeft"] | 0L;
+    if (secondsLeft > 0 && strcmp(state, PortalState::Active) == 0 &&
+        !(session["paused"] | false)) {
+      freezeSessionClockUnlocked(session);
+      session["connected"] = false;
+      session["activationError"] = true;
+      session["activationErrorReason"] =
+          "Device restarted — purchased time preserved. Tap RETRY INTERNET "
+          "or wait for auto-retry.";
+      session["sessionState"] = PortalState::ActivationError;
+      session["routerAuthPending"] = false;
+      session.remove("activationStartedAt");
+      session["activationRetryAt"] =
+          (millis() / 1000UL) + kActivationRetryDelaySec;
+      Serial.printf(
+          "[portal] Boot recovery: mac=%s Active cleared -> "
+          "activation_error (secondsLeft=%ld preserved)\n",
+          mac.c_str(), (long)(session["secondsLeft"] | 0L));
+      pushTickEffect(PortalWorkType::EmitSessionEvent, mac,
+                     "portal.session.activation_failed");
+      pushTickEffect(PortalWorkType::EmitBusEvent, String(), "sessions.changed");
+      pushTickEffect(PortalWorkType::EmitBusEvent, String(), "users.active");
+      pushTickEffect(PortalWorkType::EmitBusEvent, String(), "system.status");
+      changed = true;
+    } else if (secondsLeft > 0 && (session["connected"] | false) &&
+               strcmp(state, PortalState::Paused) == 0) {
+      freezeSessionClockUnlocked(session);
+      session["connected"] = false;
+      changed = true;
+    }
+
+    state = session["sessionState"] | PortalState::Idle;
+    secondsLeft = session["secondsLeft"] | 0L;
     if (secondsLeft > 0 &&
         (strcmp(state, PortalState::Activating) == 0 ||
+         strcmp(state, PortalState::ActivationError) == 0 ||
          (strcmp(state, PortalState::Paused) == 0 &&
           (session["resumePending"] | false)))) {
-      session["routerAuthPending"] = true;
-      session["activationRetryPending"] = false;
-      pushTickEffect(PortalWorkType::ActivateSession, mac, nullptr,
-                     sessionGenerationOf(session));
+      session["routerAuthPending"] =
+          strcmp(state, PortalState::ActivationError) != 0;
+      session["activationRetryPending"] =
+          strcmp(state, PortalState::ActivationError) == 0;
+      if (strcmp(state, PortalState::ActivationError) != 0) {
+        pushTickEffect(PortalWorkType::ActivateSession, mac, nullptr,
+                       sessionGenerationOf(session));
+      }
       changed = true;
     } else if ((strcmp(state, PortalState::Expiring) == 0 ||
                 strcmp(state, PortalState::Expired) == 0) &&
@@ -2777,21 +3198,18 @@ void PortalSessionManager::recoverSessionsAfterReboot() {
 }
 
 void PortalSessionManager::closeOtherCoinWindowsUnlocked(const String& exceptMac) {
-  JsonArray arr = _doc["sessions"].as<JsonArray>();
+  JsonArray arr = _doc.doc()["sessions"].as<JsonArray>();
   if (arr.isNull()) return;
 
   for (JsonObject session : arr) {
     const String mac = String(session["macAddress"] | "");
-    if (mac.isEmpty() || mac == exceptMac) continue;
+    if (mac.isEmpty() || macKeysEqual(mac, exceptMac)) continue;
     if (!(session["coinWindowActive"] | false)) continue;
 
     session["coinWindowActive"]    = false;
     session["coinWindowRemaining"] = 0;
-    if (strcmp(session["sessionState"] | PortalState::Idle,
-               PortalState::WaitingCoin) == 0) {
-      session["sessionState"] = PortalState::Idle;
-    }
-    if (_activeInsertMac == mac) _activeInsertMac = "";
+    restorePaidSessionAfterCoinWindowUnlocked(session);
+    if (macKeysEqual(_activeInsertMac, mac)) _activeInsertMac = "";
     _dirty = true;
   }
 }
@@ -2826,14 +3244,37 @@ bool PortalSessionManager::hasPendingRecordSaleUnlocked(
 bool PortalSessionManager::loadFromSD() {
   if (!_storage) return false;
   DmaMemoryMonitor::ScopedProbe dmaProbe("portal-load");
-  _doc.clear();
-  if (!_storage->readJson(RenzFiConfig::PORTAL_SESSIONS_FILE, _doc)) {
-    _doc["sessions"].to<JsonArray>();
+  _doc.doc().clear();
+  if (!_storage->readJson(RenzFiConfig::PORTAL_SESSIONS_FILE, _doc.doc())) {
+    _doc.doc()["sessions"].to<JsonArray>();
     return false;
   }
-  if (!_doc["sessions"].is<JsonArray>()) {
-    _doc["sessions"].to<JsonArray>();
+  if (!_doc.doc()["sessions"].is<JsonArray>()) {
+    _doc.doc()["sessions"].to<JsonArray>();
   }
+  return true;
+}
+
+bool PortalSessionManager::reloadFromStorage() {
+  if (!_storage) return false;
+  PsramJsonDocument freshHeap;
+  JsonDocument &fresh = freshHeap.doc();
+  if (!_storage->readJson(RenzFiConfig::PORTAL_SESSIONS_FILE, fresh)) {
+    return false;
+  }
+  if (!fresh["sessions"].is<JsonArray>()) return false;
+
+  lockState();
+  _doc.doc().clear();
+  _doc.doc().set(fresh);
+  _dirty = false;
+  unlockState();
+  Serial.printf(
+      "[portal] Reloaded %u session record(s) after storage reconcile\n",
+      static_cast<unsigned>(_doc.doc()["sessions"].as<JsonArray>().size()));
+  // Same HotSpot claim invalidation as cold boot — SD reconcile must not
+  // resurrect connected=true countdown without Active presence.
+  recoverSessionsAfterReboot();
   return true;
 }
 
@@ -2856,7 +3297,7 @@ bool PortalSessionManager::saveToSD(bool immediate) {
     unlockState();
     return true;
   }
-  copy.set(_doc);
+  copy.set(_doc.doc());
   shouldWrite = true;
   unlockState();
 
@@ -2874,10 +3315,10 @@ bool PortalSessionManager::saveToSD(bool immediate) {
 }
 
 JsonObject PortalSessionManager::findSessionUnlocked(const String& mac) {
-  JsonArray arr = _doc["sessions"].as<JsonArray>();
+  JsonArray arr = _doc.doc()["sessions"].as<JsonArray>();
   if (arr.isNull()) return JsonObject();
   for (JsonObject s : arr) {
-    if (String(s["macAddress"] | "") == mac) return s;
+    if (macKeysEqual(String(s["macAddress"] | ""), mac)) return s;
   }
   return JsonObject();
 }
@@ -2893,8 +3334,8 @@ JsonObject PortalSessionManager::findOrCreateUnlocked(const String& mac,
     return existing;
   }
 
-  JsonArray arr = _doc["sessions"].as<JsonArray>();
-  if (arr.isNull()) arr = _doc["sessions"].to<JsonArray>();
+  JsonArray arr = _doc.doc()["sessions"].as<JsonArray>();
+  if (arr.isNull()) arr = _doc.doc()["sessions"].to<JsonArray>();
 
   JsonObject s        = arr.createNestedObject();
   const unsigned long nowSec = millis() / 1000;
@@ -2930,6 +3371,7 @@ bool PortalSessionManager::recycleExpiredSessionUnlocked(JsonObject session) {
   // Voucher records keep their terminal state so the portal can explain why the
   // code stopped working.
   if (strcmp(session["source"] | "portal", "voucher") == 0) return false;
+  if (session["ownerDisconnectNotice"] | false) return false;
   // Anything still owed to the customer (unspent credits, an open insert
   // window, leftover time) must survive untouched.
   if ((session["credits"] | 0) > 0) return false;
@@ -3119,8 +3561,8 @@ void PortalSessionManager::onSessionPaused(const String& mac,
           "[portal-pause] mac=%s stale job gen=%u current=%u ignored\n",
           mac.c_str(), static_cast<unsigned>(generation),
           static_cast<unsigned>(currentGen));
-      return;
-    }
+    return;
+  }
     jobGen = currentGen != 0 ? currentGen : generation;
   }
   unlockState();

@@ -20,6 +20,16 @@ bool salesParseRecordedAt(const char *recordedAt, int &year, int &month, int &da
 /** True when stamp is the offline fallback form "uptime-ms:<millis>". */
 bool salesIsUptimeMarker(const char *recordedAt);
 
+/** Parse uptime-ms:<millis> into boot-relative milliseconds. */
+bool salesParseUptimeMarkerMs(const char *stamp, uint32_t &outMs);
+
+/**
+ * Convert a same-boot uptime-ms marker to ISO local time when wall clock is ready.
+ * Returns empty when clock is not ready, marker is invalid, or saleMs > millis()
+ * (cross-boot marker — cannot recover wall time).
+ */
+String salesIsoFromUptimeMarker(const char *stamp);
+
 bool salesIsToday(const char *recordedAt);
 
 bool salesIsThisWeek(const char *recordedAt);

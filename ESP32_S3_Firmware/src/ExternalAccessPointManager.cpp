@@ -310,6 +310,12 @@ ExternalAccessPoint::CrudStatus ExternalAccessPointManager::validateIp(
   const ExternalAccessPoint::IpCheckResult check =
       ExternalAccessPoint::validateManagementIp(ip.c_str(), liveIp.c_str(),
                                                 liveGw.c_str(), liveMask.c_str());
+  if (check != ExternalAccessPoint::IpCheckResult::Ok) {
+    Serial.printf(
+        "[access-points] ip rejected candidate=%s esp32=%s gw=%s mask=%s code=%d\n",
+        ip.c_str(), liveIp.c_str(), liveGw.c_str(), liveMask.c_str(),
+        static_cast<int>(check));
+  }
   switch (check) {
     case ExternalAccessPoint::IpCheckResult::Ok:
       break;
@@ -356,7 +362,7 @@ bool ExternalAccessPointManager::applyInput(
 
   if (isCreate || jsonHasKey(input, "enabled")) {
     if (jsonHasKey(input, "enabled")) record.enabled = input["enabled"].as<bool>();
-    else if (isCreate) record.enabled = true;
+    else if (isCreate) record.enabled = false;
   }
   if (isCreate || jsonHasKey(input, "vendor")) {
     record.vendor = ExternalAccessPoint::parseVendor(input["vendor"] | "generic");
@@ -521,6 +527,16 @@ void ExternalAccessPointManager::workerTaskEntry(void *param) {
 
 ExternalAccessPoint::CheckEnqueueStatus ExternalAccessPointManager::enqueueCheck(
     const String &id, uint32_t &jobIdOut) {
+  return enqueueProbeJob(id, false, jobIdOut);
+}
+
+ExternalAccessPoint::CheckEnqueueStatus ExternalAccessPointManager::enqueueSync(
+    const String &id, uint32_t &jobIdOut) {
+  return enqueueProbeJob(id, true, jobIdOut);
+}
+
+ExternalAccessPoint::CheckEnqueueStatus ExternalAccessPointManager::enqueueProbeJob(
+    const String &id, bool activateOnSuccess, uint32_t &jobIdOut) {
   jobIdOut = 0;
   if (_storage && _storage->sdRecoveryInProgress()) {
     return ExternalAccessPoint::CheckEnqueueStatus::StorageRecovery;
@@ -548,6 +564,7 @@ ExternalAccessPoint::CheckEnqueueStatus ExternalAccessPointManager::enqueueCheck
     _job.jobId = _nextJobId++;
     if (_nextJobId == 0) _nextJobId = 1;
     copyId(_job.accessPointId, sizeof(_job.accessPointId), id);
+    _job.activateOnSuccess = activateOnSuccess;
     _job.state = ExternalAccessPoint::CheckJobState::Queued;
     _job.startedAt = millis();
     jobId = _job.jobId;
@@ -555,8 +572,9 @@ ExternalAccessPoint::CheckEnqueueStatus ExternalAccessPointManager::enqueueCheck
 
   jobIdOut = jobId;
   DmaMemoryMonitor::logSnapshot("ap-check-enqueue");
-  Serial.printf("[ap-check] queued id=%u ap=%s ip=%s\n",
-                static_cast<unsigned>(jobId), id.c_str(), ip);
+  Serial.printf("[ap-check] queued id=%u ap=%s ip=%s sync=%s\n",
+                static_cast<unsigned>(jobId), id.c_str(), ip,
+                activateOnSuccess ? "yes" : "no");
   notifyWorker();
   return ExternalAccessPoint::CheckEnqueueStatus::Ok;
 }
@@ -608,6 +626,29 @@ void ExternalAccessPointManager::applyRamStatus(
   }
 }
 
+void ExternalAccessPointManager::applyMikroTikCheckResult(const String &id,
+                                                          bool online,
+                                                          const char *method,
+                                                          uint32_t latencyMs) {
+  ScopedRegistryLock guard(this);
+  const int index = findIndex(id);
+  if (index < 0) return;
+  const ExternalAccessPoint::ReachabilityStatus status =
+      online ? ExternalAccessPoint::ReachabilityStatus::Online
+             : ExternalAccessPoint::ReachabilityStatus::Unreachable;
+  const char *errorCode = online ? nullptr : "ACCESS_POINT_OFFLINE";
+  applyRamStatus(_records[index], status, latencyMs > 0, latencyMs, errorCode,
+                 ExternalAccessPoint::ManagementTransport::None);
+  // MikroTik ICMP confirmation — treat as network-reachable capability.
+  if (online && method &&
+      (strcmp(method, "arp") == 0 || strcmp(method, "ping") == 0)) {
+    _records[index].capIcmp = true;
+  }
+  Serial.printf("[access-points] mikrotik-check id=%s online=%s method=%s\n",
+                id.c_str(), online ? "true" : "false",
+                method ? method : "?");
+}
+
 void ExternalAccessPointManager::finishJob(
     uint32_t jobId, ExternalAccessPoint::CheckJobState state, bool ok,
     ExternalAccessPoint::ReachabilityStatus status, bool latencyValid,
@@ -632,6 +673,7 @@ void ExternalAccessPointManager::runQueuedJob() {
   uint32_t jobId = 0;
   uint32_t startedMs = millis();
   char accessPointId[20] = {};
+  bool activateOnSuccess = false;
   {
     ScopedJobLock guard(this);
     if (_job.state != ExternalAccessPoint::CheckJobState::Queued) return;
@@ -639,6 +681,7 @@ void ExternalAccessPointManager::runQueuedJob() {
     _job.startedAt = millis();
     startedMs = _job.startedAt;
     jobId = _job.jobId;
+    activateOnSuccess = _job.activateOnSuccess;
     copyId(accessPointId, sizeof(accessPointId), String(_job.accessPointId));
   }
 
@@ -670,7 +713,7 @@ void ExternalAccessPointManager::runQueuedJob() {
   }
 
   const bool ethernetReady = _eth && _eth->hasIp();
-  if (!enabled) {
+  if (!enabled && !activateOnSuccess) {
     {
       ScopedRegistryLock guard(this);
       const int index = findIndex(String(accessPointId));
@@ -735,12 +778,46 @@ void ExternalAccessPointManager::runQueuedJob() {
     if (index >= 0) {
       applyRamStatus(_records[index], status, latencyValid, latencyMs,
                      probe.errorCode, probe.transport);
+      if (activateOnSuccess &&
+          ExternalAccessPoint::reachabilityIsSuccessful(status)) {
+        _records[index].enabled = true;
+      }
     }
   }
 
   const bool ok = ExternalAccessPoint::reachabilityIsSuccessful(status);
-  const char *message = "Check complete";
-  if (status == ExternalAccessPoint::ReachabilityStatus::Unreachable) {
+  if (activateOnSuccess && ok) {
+    Record syncedRecord;
+    ExternalAccessPoint::CrudStatus persistStatus =
+        ExternalAccessPoint::CrudStatus::StorageError;
+    {
+      ScopedRegistryLock guard(this);
+      const int index = findIndex(String(accessPointId));
+      if (index >= 0) {
+        syncedRecord = _records[index];
+        persistStatus = persist();
+      }
+    }
+    if (persistStatus != ExternalAccessPoint::CrudStatus::Ok) {
+      finishJob(jobId, ExternalAccessPoint::CheckJobState::Failed, false, status,
+                latencyValid, latencyMs, "PERSIST_FAILED",
+                "Verified but could not save enabled state");
+      Serial.printf(
+          "[ap-check] completed id=%u status=%s error=PERSIST_FAILED elapsed=%lu\n",
+          static_cast<unsigned>(jobId),
+          ExternalAccessPoint::reachabilityLabel(status),
+          static_cast<unsigned long>(millis() - startedMs));
+      return;
+    }
+    logSafe("synced", syncedRecord);
+  }
+
+  const char *message = activateOnSuccess ? "Sync complete" : "Check complete";
+  if (activateOnSuccess && ok) {
+    message = "Access point synced and enabled";
+  } else if (activateOnSuccess && !ok) {
+    message = "Sync failed — management IP not reachable";
+  } else if (status == ExternalAccessPoint::ReachabilityStatus::Unreachable) {
     message = "Access point is unreachable";
   } else if (status == ExternalAccessPoint::ReachabilityStatus::NetworkReachable) {
     message = "Host replies to ping; management port is closed";

@@ -192,6 +192,46 @@ int PromoManager::resolveForAmount(int amount, String *profileOut, int *promoIdO
   return amount * 5;
 }
 
+String PromoManager::formatPromoSpeedLabel(JsonObjectConst promo) {
+  const char *mode = promo["speedMode"] | "";
+  if (strcmp(mode, "custom") == 0) {
+    const int down = promo["customDownloadMbps"] | 0;
+    const int up = promo["customUploadMbps"] | 0;
+    if (down > 0 && up > 0) {
+      return String(down) + "/" + String(up) + " Mbps";
+    }
+  }
+  const int speed = promo["speed"] | 0;
+  if (speed > 0) return String(speed) + " Mbps";
+  return "";
+}
+
+bool PromoManager::resolveSpeedLabelForAmount(int amount, String *speedOut) {
+  if (speedOut) speedOut->clear();
+  if (amount <= 0) return false;
+
+  HeapJsonDocument heapDoc(RenzFiConfig::JSON_DOC_MEDIUM);
+  DynamicJsonDocument &doc = heapDoc.doc();
+  if (!list(doc)) return false;
+
+  int bestCoin = 0;
+  JsonObject bestPromo;
+  for (JsonObject promo : doc.as<JsonArray>()) {
+    if (promo["enabled"] == false) continue;
+    const int coin = promo["coin"] | 0;
+    const int minutes = promo["minutes"] | 0;
+    if (coin <= 0 || minutes <= 0 || coin > amount) continue;
+    if (coin > bestCoin) {
+      bestCoin = coin;
+      bestPromo = promo;
+    }
+  }
+  if (bestPromo.isNull()) return false;
+
+  if (speedOut) *speedOut = formatPromoSpeedLabel(bestPromo);
+  return speedOut && speedOut->length() > 0;
+}
+
 bool PromoManager::resolveHighestProfileForAmount(int amount, String *profileOut,
                                                   int *promoIdOut) {
   if (profileOut) profileOut->clear();

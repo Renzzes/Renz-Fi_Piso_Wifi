@@ -8,12 +8,18 @@ type UseAdminApiMonitorOptions = {
   enabled: boolean;
   /** When EventBus SSE is open, skip /api/health polling — ping is liveness. */
   sseConnected?: boolean;
+  /**
+   * Standby Admin (live updates off): no periodic /api/health.
+   * One check on enable + when the tab becomes visible again.
+   */
+  standbyIdle?: boolean;
   onReconnectRequireLogin: () => void | Promise<void>;
 };
 
 export function useAdminApiMonitor({
   enabled,
   sseConnected = false,
+  standbyIdle = false,
   onReconnectRequireLogin,
 }: UseAdminApiMonitorOptions) {
   const [connectionLost, setConnectionLost] = useState(false);
@@ -66,9 +72,15 @@ export function useAdminApiMonitor({
     };
     window.addEventListener("offline", onOffline);
 
-    if (sseConnected) {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void checkHealth();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+
+    if (sseConnected || standbyIdle) {
       return () => {
         window.removeEventListener("offline", onOffline);
+        document.removeEventListener("visibilitychange", onVisible);
       };
     }
 
@@ -76,8 +88,9 @@ export function useAdminApiMonitor({
     return () => {
       window.clearInterval(intervalId);
       window.removeEventListener("offline", onOffline);
+      document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [checkHealth, enabled, markLost, sseConnected]);
+  }, [checkHealth, enabled, markLost, sseConnected, standbyIdle]);
 
   return {
     connectionLost,

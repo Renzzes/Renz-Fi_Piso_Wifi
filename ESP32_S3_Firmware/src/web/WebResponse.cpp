@@ -8,6 +8,7 @@
 #include "CacheManager.h"
 #include "DmaMemoryMonitor.h"
 #include "JsonHeap.h"
+#include "MemoryDiagnostics.h"
 #include "MimeResolver.h"
 
 namespace {
@@ -23,7 +24,9 @@ int s_largeAssetInFlight = 0;
 struct PsramJsonBody {
   char *buf = nullptr;
   size_t len = 0;
+  bool holdsSlot = false;
   ~PsramJsonBody() {
+    if (holdsSlot) DmaMemoryMonitor::releaseHttpSlot();
     if (buf) heap_caps_free(buf);
   }
 };
@@ -41,32 +44,24 @@ std::shared_ptr<PsramJsonBody> makePsramJsonBody(JsonDocument &doc) {
   return body;
 }
 
-void sendPsramJson(AsyncWebServerRequest *req, int status, JsonDocument &doc,
-                   CachePolicy cache) {
-  auto body = makePsramJsonBody(doc);
-  if (!body) {
-    req->send(500, "application/json",
-              "{\"success\":false,\"error\":\"JSON alloc failed\","
-              "\"code\":\"JSON_ALLOC_FAILED\"}");
-    return;
-  }
-  AsyncWebServerResponse *res = req->beginResponse(
-      "application/json", body->len,
-      [body](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-        if (!buffer || !body->buf || index >= body->len) return 0;
-        const size_t remain = body->len - index;
-        const size_t n = remain < maxLen ? remain : maxLen;
-        memcpy(buffer, reinterpret_cast<const uint8_t *>(body->buf) + index, n);
-        return n;
-      });
-  if (!res) return;
-  res->setCode(status);
-  WebResponse::addCorsHeaders(res);
-  CacheManager::apply(res, cache);
-  req->send(res);
+void dropClient(AsyncWebServerRequest *req, const char *reason) {
+  // Proven StoreProhibited (EXCVADDR≈0xb4): closing/aborting the socket while
+  // DMA is already exhausted still drives W5500 TX + concurrent AsyncWebServer
+  // _send paths (ArduinoJson→String). Do not touch the client — peer times out;
+  // in-flight paced bodies already return RESPONSE_TRY_AGAIN.
+  (void)req;
+  Serial.printf("[http] drop reason=%s (ETH DMA critical, no socket I/O)\n",
+                reason ? reason : "dma");
+  DmaMemoryMonitor::logSnapshot("http-drop-dma-critical");
 }
 
 void sendEthDmaLow(AsyncWebServerRequest *req, const char *reason) {
+  // When DMA is already below the W5500 RX floor, sending a 503 still needs a
+  // SPI TX bounce buffer and can race RX into LoadProhibited. Close instead.
+  if (DmaMemoryMonitor::isEthDmaCritical()) {
+    dropClient(req, reason);
+    return;
+  }
   Serial.printf("[http] 503 reason=ETH_DMA_LOW detail=%s\n",
                 reason ? reason : "");
   DmaMemoryMonitor::logSnapshot("spa-serve-dma-low");
@@ -80,16 +75,95 @@ void sendEthDmaLow(AsyncWebServerRequest *req, const char *reason) {
   req->send(res);
 }
 
+bool admitPacedHttp(AsyncWebServerRequest *req, const char *reason) {
+  if (DmaMemoryMonitor::isEthDmaCritical()) {
+    dropClient(req, reason);
+    return false;
+  }
+  if (!DmaMemoryMonitor::hasHttpServeHeadroom()) {
+    sendEthDmaLow(req, reason);
+    return false;
+  }
+  if (!DmaMemoryMonitor::tryAcquireHttpSlot()) {
+    sendEthDmaLow(req, "concurrency");
+    return false;
+  }
+  return true;
+}
+
+void sendPsramJson(AsyncWebServerRequest *req, int status, JsonDocument &doc,
+                   CachePolicy cache) {
+  if (!admitPacedHttp(req, "json-admit")) return;
+
+  auto body = makePsramJsonBody(doc);
+  if (!body) {
+    DmaMemoryMonitor::releaseHttpSlot();
+    req->send(500, "application/json",
+              "{\"success\":false,\"error\":\"JSON alloc failed\","
+              "\"code\":\"JSON_ALLOC_FAILED\"}");
+    return;
+  }
+  body->holdsSlot = true;
+
+  AsyncWebServerResponse *res = req->beginResponse(
+      "application/json", body->len,
+      [body](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+        if (!buffer || !body->buf || index >= body->len) return 0;
+        if (DmaMemoryMonitor::isEthDmaCritical() ||
+            !DmaMemoryMonitor::hasEthTransmitHeadroom()) {
+          return RESPONSE_TRY_AGAIN;
+        }
+        const size_t remain = body->len - index;
+        const size_t n = remain < maxLen ? remain : maxLen;
+        memcpy(buffer, reinterpret_cast<const uint8_t *>(body->buf) + index, n);
+        return n;
+      });
+  if (!res) {
+    // beginResponse failed — release slot via PsramJsonBody dtor.
+    return;
+  }
+  res->setCode(status);
+  WebResponse::addCorsHeaders(res);
+  CacheManager::apply(res, cache);
+  req->send(res);
+}
+
 struct LargeAssetStream {
   File file;
-  LargeAssetStream() { s_largeAssetInFlight++; }
+  bool holdsSlot = false;
+  LargeAssetStream() {
+    s_largeAssetInFlight++;
+    holdsSlot = DmaMemoryMonitor::tryAcquireHttpSlot();
+  }
   ~LargeAssetStream() {
     if (file) file.close();
     if (s_largeAssetInFlight > 0) s_largeAssetInFlight--;
+    if (holdsSlot) DmaMemoryMonitor::releaseHttpSlot();
+  }
+};
+
+struct SmallAssetStream {
+  File file;
+  bool holdsSlot = false;
+  explicit SmallAssetStream(bool acquireSlot) : holdsSlot(acquireSlot) {}
+  ~SmallAssetStream() {
+    if (file) file.close();
+    if (holdsSlot) DmaMemoryMonitor::releaseHttpSlot();
   }
 };
 
 }  // namespace
+
+bool WebResponse::ensureEthTransmitHeadroom(AsyncWebServerRequest *req,
+                                            const char *reason) {
+  if (DmaMemoryMonitor::isEthDmaCritical()) {
+    dropClient(req, reason);
+    return false;
+  }
+  if (DmaMemoryMonitor::hasHttpServeHeadroom()) return true;
+  sendEthDmaLow(req, reason);
+  return false;
+}
 
 void WebResponse::addCorsHeaders(AsyncWebServerResponse *res) {
   if (!res) return;
@@ -119,49 +193,117 @@ void WebResponse::serveFile(AsyncWebServerRequest *req, fs::FS &fs,
   const size_t fileBytes = probe ? probe.size() : 0;
   if (probe) probe.close();
 
-  const bool largeAsset = fileBytes >= kLargeAssetBytes;
+  // Gate must run before beginResponse allocates the 2872-byte send buffer
+  // and before lwIP/W5500 fill the TCP window. This applies to every file
+  // serve, not only large SPA assets: favicon.svg / icon-192.png / small
+  // manifest files go through req->beginResponse(fs, path, mime) too, which
+  // has no per-chunk pacing hook. A concurrent browser fan-out (favicon +
+  // icons + several JSON polls, all on async_tcp) can still request a small
+  // (~200-450 byte) W5500 SPI DMA bounce buffer while the pool is already
+  // fragmented from a prior large asset/JSON burst — proven by
+  // [dma-alloc-fail] size=208/437/438 caps=0x00000808 task=async_tcp during
+  // /admin + /dashboard concurrent small-file + JSON load.
+  if (DmaMemoryMonitor::isEthDmaCritical()) {
+    dropClient(req, "headroom");
+    return;
+  }
+  if (!DmaMemoryMonitor::hasHttpServeHeadroom()) {
+    sendEthDmaLow(req, "headroom");
+    return;
+  }
+
+  const bool isStylesheet =
+      mimePath.endsWith(".css") || mimePath.endsWith(".css.gz");
+  // Stylesheets must not lose to the SPA JS single-flight lock: a dropped CSS
+  // response paints the unstyled login form until reload (when CSS is cached).
+  const bool largeAsset =
+      fileBytes >= kLargeAssetBytes && !isStylesheet;
   if (largeAsset) {
-    // Gate must run before beginResponse allocates the 2872-byte send buffer
-    // and before lwIP/W5500 fill the TCP window. Healthy DMA at accept is
-    // not enough: a second concurrent JS/CSS/PNG stream is what collapses
-    // dma_largest below the 1490-byte SPI priv TX buffer.
-    if (!DmaMemoryMonitor::hasEthTransmitHeadroom()) {
-      sendEthDmaLow(req, "headroom");
-      return;
-    }
+    // Large assets additionally serialize against each other; small files
+    // complete quickly enough that single-flight is not required.
     if (s_largeAssetInFlight != 0) {
       sendEthDmaLow(req, "in-flight");
       return;
     }
+    if (MemoryDiagnostics::hasOperationalPortalLoad() &&
+        !DmaMemoryMonitor::hasDmaHeadroom(
+            DmaMemoryMonitor::kMinLargestDmaBlockForLargeAssetWithPortal)) {
+      Serial.printf(
+          "[spa-stream] defer path=%s bytes=%u reason=portal-load "
+          "dma_largest=%u\n",
+          fsPath.c_str(), static_cast<unsigned>(fileBytes),
+          static_cast<unsigned>(
+              heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
+      sendEthDmaLow(req, "portal-load");
+      return;
+    }
+    if (DmaMemoryMonitor::pacedHttpInFlight() >=
+        DmaMemoryMonitor::kMaxPacedHttpInFlight) {
+      sendEthDmaLow(req, "concurrency");
+      return;
+    }
+  } else if (!isStylesheet &&
+             DmaMemoryMonitor::pacedHttpInFlight() >=
+                 DmaMemoryMonitor::kMaxPacedHttpInFlight) {
+    sendEthDmaLow(req, "concurrency");
+    return;
   }
+  // Stylesheets skip the large-asset lock and the paced concurrency reject so
+  // first paint is not left unstyled while SPA JS is streaming.
 
   const String mime = MimeResolver::fromPath(mimePath);
   AsyncWebServerResponse *res = nullptr;
 
   if (largeAsset) {
     auto ctx = std::make_shared<LargeAssetStream>();
+    if (!ctx->holdsSlot) {
+      sendEthDmaLow(req, "concurrency");
+      return;
+    }
     ctx->file = fs.open(fsPath, "r");
     if (!ctx->file) {
       serveNotFound(req, true);
       return;
     }
     Serial.printf(
-        "[spa-stream] path=%s bytes=%u inFlight=%d dma_largest=%u\n",
+        "[spa-stream] path=%s bytes=%u inFlight=%d paced=%d dma_largest=%u\n",
         fsPath.c_str(), static_cast<unsigned>(fileBytes),
-        s_largeAssetInFlight,
+        s_largeAssetInFlight, DmaMemoryMonitor::pacedHttpInFlight(),
         static_cast<unsigned>(
             heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
     res = req->beginResponse(
         mime.c_str(), fileBytes,
         [ctx](uint8_t *buf, size_t maxLen, size_t /*index*/) -> size_t {
           if (!buf || !ctx->file) return 0;
-          if (!DmaMemoryMonitor::hasEthTransmitHeadroom()) {
+          if (DmaMemoryMonitor::isEthDmaCritical() ||
+              !DmaMemoryMonitor::hasEthTransmitHeadroom()) {
             return RESPONSE_TRY_AGAIN;
           }
           return ctx->file.read(buf, maxLen);
         });
   } else {
-    res = req->beginResponse(fs, fsPath, mime.c_str());
+    const bool slotOk = DmaMemoryMonitor::tryAcquireHttpSlot();
+    if (!slotOk) {
+      sendEthDmaLow(req, "concurrency");
+      return;
+    }
+    auto ctx = std::make_shared<SmallAssetStream>(true);
+    ctx->file = fs.open(fsPath, "r");
+    if (!ctx->file) {
+      DmaMemoryMonitor::releaseHttpSlot();
+      serveNotFound(req, true);
+      return;
+    }
+    res = req->beginResponse(
+        mime.c_str(), fileBytes,
+        [ctx](uint8_t *buf, size_t maxLen, size_t /*index*/) -> size_t {
+          if (!buf || !ctx->file) return 0;
+          if (DmaMemoryMonitor::isEthDmaCritical() ||
+              !DmaMemoryMonitor::hasEthTransmitHeadroom()) {
+            return RESPONSE_TRY_AGAIN;
+          }
+          return ctx->file.read(buf, maxLen);
+        });
   }
 
   if (!res) {
@@ -177,6 +319,7 @@ void WebResponse::serveFile(AsyncWebServerRequest *req, fs::FS &fs,
 void WebResponse::serveJson(AsyncWebServerRequest *req, int status,
                             const String &body, CachePolicy cache) {
   if (!req) return;
+  if (!ensureEthTransmitHeadroom(req, "json-string")) return;
   AsyncWebServerResponse *res =
       req->beginResponse(status, "application/json", body);
   addCorsHeaders(res);
@@ -201,6 +344,11 @@ void WebResponse::serveErrorJson(AsyncWebServerRequest *req, int status,
 
 void WebResponse::serveNotFound(AsyncWebServerRequest *req, bool plainText) {
   if (!req) return;
+  if (DmaMemoryMonitor::isEthDmaCritical()) {
+    dropClient(req, "not-found");
+    return;
+  }
+  if (!ensureEthTransmitHeadroom(req, "not-found")) return;
   if (plainText) {
     AsyncWebServerResponse *res =
         req->beginResponse(404, "text/plain", "Not Found");
@@ -215,6 +363,11 @@ void WebResponse::serveNotFound(AsyncWebServerRequest *req, bool plainText) {
 void WebResponse::serveRedirect(AsyncWebServerRequest *req,
                                 const String &location, int statusCode) {
   if (!req) return;
+  if (DmaMemoryMonitor::isEthDmaCritical()) {
+    dropClient(req, "redirect");
+    return;
+  }
+  if (!ensureEthTransmitHeadroom(req, "redirect")) return;
   AsyncWebServerResponse *res = req->beginResponse(statusCode);
   res->addHeader("Location", location);
   addCorsHeaders(res);
@@ -226,6 +379,7 @@ void WebResponse::serveDownload(AsyncWebServerRequest *req, fs::FS &fs,
                                 const String &fsPath, const String &filename,
                                 const char *mime) {
   if (!req) return;
+  if (!ensureEthTransmitHeadroom(req, "download")) return;
   AsyncWebServerResponse *res = req->beginResponse(fs, fsPath, mime);
   res->addHeader("Content-Disposition",
                  String("attachment; filename=\"") + filename + "\"");
@@ -236,6 +390,11 @@ void WebResponse::serveDownload(AsyncWebServerRequest *req, fs::FS &fs,
 
 void WebResponse::serveOptions(AsyncWebServerRequest *req) {
   if (!req) return;
+  if (DmaMemoryMonitor::isEthDmaCritical()) {
+    dropClient(req, "options");
+    return;
+  }
+  if (!ensureEthTransmitHeadroom(req, "options")) return;
   AsyncWebServerResponse *res = req->beginResponse(204, "text/plain", "");
   addCorsHeaders(res);
   req->send(res);

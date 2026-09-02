@@ -70,6 +70,9 @@ class MikroTikDriver : public IRouterDriver {
   mutable String _cachedIdentity;
   mutable String _cachedHost;
   mutable String _cachedUsername;
+  mutable String _cachedPassword;
+  mutable String _cachedProfile;
+  mutable bool _routerCredsCached = false;
   // Exact reason the last hotspot authorize/pause/deauthorize failed.
   String _lastHotspotError;
   ActivateAuthTrace _lastActivateTrace{};
@@ -87,8 +90,10 @@ class MikroTikDriver : public IRouterDriver {
                           const String &hotspotPassword);
   bool removeHotspotActiveByMac(const String &mac);
   bool removeHotspotCookiesByMac(const String &mac);
-  // Sync/Test only — bounded WAN observe/repair inside an open RouterOS session.
-  void observeAndRepairWan(JsonObject observationOut);
+  // Sync/Test/Refresh — bounded WAN observe; repairs only when allowRepair.
+  void observeAndRepairWan(JsonObject observationOut, bool allowRepair = true);
+  void observeEthernetPorts(JsonObject observationOut);
+  void observeNetworkAddresses(JsonObject observationOut);
   bool resolveProductionWirelessInterface(String &ifaceOut,
                                           String &errorOut) const;
   bool resolveExpectedProductionSsid(String &ssidOut) const;
@@ -130,11 +135,11 @@ class MikroTikDriver : public IRouterDriver {
                                        JsonArray &detailsOut, JsonArray &namesOut);
   static bool profileExistsInResult(const RouterOsClient::CommandResult &result,
                                     const String &profile);
-  static String idFromResult(const RouterOsClient::CommandResult &result);
   static String macToHotspotUsername(const String &mac);
   static String formatLimitUptime(uint32_t seconds);
   // RouterOS HotSpot user/active duration strings ("5m", "1h2m3s", "00:05:00").
   static uint32_t parseRouterOsDurationSeconds(const String &raw);
-  static String attrFromResult(const RouterOsClient::CommandResult &result,
-                               const char *attrName);
+  static void populateRouterOsResourceFields(JsonObject routerOs,
+                                             const RouterOsClient::CommandResult &resourceResult,
+                                             String *versionOut);
 };

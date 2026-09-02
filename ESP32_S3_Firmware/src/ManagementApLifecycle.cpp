@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "AuthManager.h"
+#include "InstallationState.h"
 #include "InstallationStateManager.h"
 #include "ManagementApConfig.h"
 #include "ManagementApManager.h"
@@ -15,6 +16,10 @@ namespace {
 
 constexpr uint32_t kMinTemporaryDurationSeconds = 60;
 constexpr uint32_t kMaxTemporaryDurationSeconds = 3600;
+// After production ETH routes are live, stop unused SoftAP quickly.
+// Proven Guru (owner_created + Admin System Config): SoftAP still up at ~19s
+// with dma_largest≈532 while W5500 RX needed 548. A 60s idle wait was too late.
+constexpr uint32_t kProductionSoftApIdleYieldMs = 2000;
 
 }  // namespace
 
@@ -80,7 +85,14 @@ bool ManagementApLifecycle::startMaintenance() {
 }
 
 bool ManagementApLifecycle::startTemporary(uint32_t durationSeconds) {
-  if (!_mgmtAp || isFactoryMode()) return false;
+  if (!_mgmtAp) return false;
+
+  // Classic setup SoftAP is owned by applyBootPolicy / wizard — do not start a
+  // parallel "maintenance" AP while SoftAP is already the installer path.
+  // Exception: production ETH plane is live and SoftAP was idle-yielded (DMA);
+  // owner/installer must be able to re-open SoftAP with a timed maintenance window.
+  if (isFactoryMode() && !_productionPlaneReady) return false;
+  if (isFactoryMode() && _mgmtAp->isRunning()) return false;
 
   if (durationSeconds == 0) {
     durationSeconds = ManagementApConfig::MAINTENANCE_TIMEOUT_SECONDS;
@@ -92,7 +104,15 @@ bool ManagementApLifecycle::startTemporary(uint32_t durationSeconds) {
 
   _timeoutSeconds = durationSeconds;
   if (!_mgmtAp->start()) return false;
+  // Timed window even when installation is still pre-Ready (post-yield reopen).
   resetInactivityTimer();
+  _softApYieldArmed = false;
+  Serial.printf(
+      "[mgmt-ap] temporary SoftAP started durationSec=%u productionReady=%s "
+      "needsSetup=%s\n",
+      static_cast<unsigned>(durationSeconds),
+      _productionPlaneReady ? "yes" : "no",
+      isFactoryMode() ? "yes" : "no");
   return true;
 }
 
@@ -119,7 +139,8 @@ void ManagementApLifecycle::processMaintenanceTimeout() {
     return;
   }
 
-  if (isFactoryMode()) {
+  // Untimed installer SoftAP (boot policy, production not registered yet).
+  if (isFactoryMode() && !_productionPlaneReady) {
     clearInactivityTimer();
     return;
   }
@@ -140,12 +161,74 @@ void ManagementApLifecycle::processMaintenanceTimeout() {
     Serial.println("[mgmt-ap] maintenance inactivity timeout — stopping AP");
     _mgmtAp->stop();
     clearInactivityTimer();
+    // If production is live and setup still incomplete, re-arm idle yield so
+    // a later SoftAP reopen can yield again after clients leave.
+    if (_productionPlaneReady && isFactoryMode()) {
+      _softApYieldArmed = true;
+      _softApYieldSinceMs = millis();
+    }
   }
 }
 
 void ManagementApLifecycle::loop() {
   processSetupCompletion();
+  processProductionSoftApYield();
   processMaintenanceTimeout();
+}
+
+void ManagementApLifecycle::notifyProductionPlaneReady() {
+  _productionPlaneReady = true;
+  if (!_mgmtAp || !_mgmtAp->isRunning()) {
+    _softApYieldArmed = false;
+    return;
+  }
+  _softApYieldArmed = true;
+  _softApYieldSinceMs = millis();
+  Serial.printf(
+      "[mgmt-ap] production plane ready — SoftAP idle yield armed "
+      "(%u ms if no SoftAP clients)\n",
+      static_cast<unsigned>(kProductionSoftApIdleYieldMs));
+  // Attempt immediately; processProductionSoftApYield enforces the settle window.
+  processProductionSoftApYield();
+}
+
+void ManagementApLifecycle::processProductionSoftApYield() {
+  if (!_productionPlaneReady || !_softApYieldArmed || !_mgmtAp) return;
+  if (!_mgmtAp->isRunning()) {
+    _softApYieldArmed = false;
+    return;
+  }
+
+  // True factory (needs full SoftAP installer path) — do not yield yet.
+  if (_installation &&
+      _installation->current() == InstallationState::Factory) {
+    _softApYieldSinceMs = millis();
+    return;
+  }
+
+  const bool keepEnabled =
+      _networkSettings &&
+      _networkSettings->settings().managementApKeepEnabledAfterSetup;
+  if (keepEnabled) {
+    _softApYieldArmed = false;
+    return;
+  }
+
+  _mgmtAp->refreshRuntimeState();
+  if (_mgmtAp->connectedClients() > 0) {
+    _softApYieldSinceMs = millis();
+    return;
+  }
+
+  if ((millis() - _softApYieldSinceMs) < kProductionSoftApIdleYieldMs) return;
+
+  Serial.println(
+      "[mgmt-ap] production ETH active + SoftAP idle — stopping Management AP "
+      "(DMA headroom; re-enable via maintenance AP if needed)");
+  SetupDnsPolicy::restoreProductionDns();
+  _mgmtAp->stop();
+  clearInactivityTimer();
+  _softApYieldArmed = false;
 }
 
 void ManagementApLifecycle::processSetupCompletion() {

@@ -9,6 +9,20 @@ import "./styles.css";
 
 initTheme();
 
+/** Clear leftover PWA controllers from older builds (cache-first shells looked like a stuck splash). */
+if (typeof navigator !== "undefined" && "serviceWorker" in navigator) {
+  void navigator.serviceWorker.getRegistrations().then((regs) => {
+    for (const reg of regs) void reg.unregister();
+  });
+  if (typeof caches !== "undefined") {
+    void caches.keys().then((keys) => {
+      for (const key of keys) {
+        if (key.startsWith("renz-fi-admin")) void caches.delete(key);
+      }
+    });
+  }
+}
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {

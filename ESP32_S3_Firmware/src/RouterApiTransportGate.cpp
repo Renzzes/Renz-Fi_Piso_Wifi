@@ -352,7 +352,13 @@ bool RouterApiTransportGate::allowsHotspotActivate() {
 }
 
 bool RouterApiTransportGate::allowsHotspotVerify() {
-  return health() == RouterHealth::Healthy;
+  // Same recovery window as Activate: UNKNOWN must not leave Connected Active
+  // counting forever while HotSpot Active is empty (verify was Healthy-only).
+  // UNAVAILABLE/COOLDOWN still suppress RouterOS verify storms.
+  const RouterHealth h = health();
+  return h == RouterHealth::Healthy || h == RouterHealth::Unknown ||
+         h == RouterHealth::Recovering || h == RouterHealth::Degraded ||
+         h == RouterHealth::Probing || h == RouterHealth::Connecting;
 }
 
 bool RouterApiTransportGate::allowsHotspotDeauth() {

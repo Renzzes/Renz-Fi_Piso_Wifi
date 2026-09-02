@@ -41,6 +41,20 @@ export default defineConfig({
     react(),
     tailwindcss(),
     tsconfigPaths(),
+    {
+      name: "css-before-js",
+      transformIndexHtml: {
+        order: "post",
+        handler(html) {
+          // Vite emits module scripts before stylesheets. On ESP32, concurrent
+          // large /assets/* downloads can drop CSS while JS still mounts → FOUC.
+          return html.replace(
+            /(<script\b[^>]*type="module"[^>]*><\/script>\s*)(<link\b[^>]*rel="stylesheet"[^>]*>)/gi,
+            "$2\n    $1",
+          );
+        },
+      },
+    },
     isEmbeddedBuild && {
       name: "emit-admin-build-json",
       closeBundle() {

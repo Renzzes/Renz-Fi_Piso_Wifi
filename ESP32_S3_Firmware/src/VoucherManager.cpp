@@ -502,20 +502,24 @@ VoucherManager::ReserveResult VoucherManager::reserve(
           result.result = ReserveStatus::Unavailable;
           return result;
         }
-        const bool dateOnly = validUntil.length() == 10;
-        const String comparableNow =
-            dateOnly ? redeemedAt.substring(0, 10) : redeemedAt;
-        if (comparableNow > validUntil) {
-          item["status"] = "expired";
-          item["terminalReason"] = "redemption_deadline";
-          item["updatedAt"] = redeemedAt;
-          if (!saveLocked(doc)) {
-            result.result = ReserveStatus::StorageError;
+        // Uptime markers are not comparable to ISO validUntil — skip deadline
+        // check offline; still enforce when wall clock is present.
+        if (!salesIsUptimeMarker(redeemedAt.c_str())) {
+          const bool dateOnly = validUntil.length() == 10;
+          const String comparableNow =
+              dateOnly ? redeemedAt.substring(0, 10) : redeemedAt;
+          if (comparableNow > validUntil) {
+            item["status"] = "expired";
+            item["terminalReason"] = "redemption_deadline";
+            item["updatedAt"] = redeemedAt;
+            if (!saveLocked(doc)) {
+              result.result = ReserveStatus::StorageError;
+              return result;
+            }
+            appendHistory(item, "expired", redeemedAt);
+            result.result = ReserveStatus::Unavailable;
             return result;
           }
-          appendHistory(item, "expired", redeemedAt);
-          result.result = ReserveStatus::Unavailable;
-          return result;
         }
       }
       // Immutable absolute service expiry: redeemedAt + minutes (validity).
@@ -525,8 +529,12 @@ VoucherManager::ReserveResult VoucherManager::reserve(
         stampedExpiry = salesAddSecondsToIso(
             redeemedAt, static_cast<uint32_t>(minutes) * 60U);
         if (stampedExpiry.isEmpty()) {
-          result.result = ReserveStatus::Unavailable;
-          return result;
+          // Wall clock / uptime marker: still reserve; PortalSessionManager
+          // uses relative minutes until NTP stamps an absolute expiry.
+          Serial.printf(
+              "[voucher-expiry] mac=%s code=%s redeemedAt=%s action=relative "
+              "(wall clock unavailable)\n",
+              normalizedMac.c_str(), result.code.c_str(), redeemedAt.c_str());
         }
       }
       item["status"] = "redeeming";

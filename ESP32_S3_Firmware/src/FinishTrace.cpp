@@ -3,6 +3,16 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include "RenzFiDebug.h"
+
+#if RENZFI_DEBUG_FINISH
+#define FINISH_DBG(...) Serial.printf(__VA_ARGS__)
+#define FINISH_DBGLN(msg) Serial.println(msg)
+#else
+#define FINISH_DBG(...) ((void)0)
+#define FINISH_DBGLN(msg) ((void)0)
+#endif
+
 namespace FinishTrace {
 namespace {
 
@@ -33,40 +43,36 @@ BlockingSlot g_blockingStack[kMaxBlockingDepth];
 int          g_blockingDepth = 0;
 
 void logSlowWarnings(uint32_t elapsedMs) {
+#if RENZFI_DEBUG_FINISH
   if (elapsedMs >= kDeadlockStageMs) {
-    Serial.println(F("[finish-stage] POSSIBLE DEADLOCK"));
+    FINISH_DBGLN(F("[finish-stage] POSSIBLE DEADLOCK"));
   } else if (elapsedMs >= kSlowStageMs) {
-    Serial.println(F("[finish-stage] WARNING SLOW STAGE"));
+    FINISH_DBGLN(F("[finish-stage] WARNING SLOW STAGE"));
   }
+#endif
+  (void)elapsedMs;
 }
 
 void logBlockingBegin(const BlockingSlot &slot) {
-  Serial.printf("[finish-op] BEGIN %s\n", slot.name ? slot.name : "?");
-  Serial.printf("[finish-op] Timeout configured=%ums\n",
-                static_cast<unsigned>(slot.timeoutMs));
-  Serial.printf("[finish-op] Current retry count=%u\n",
-                static_cast<unsigned>(slot.retryCount));
-  Serial.printf("[finish-op] Reason for waiting=%s\n",
-                slot.reason ? slot.reason : "(none)");
-  Serial.printf("[finish-op] Current state=%s\n",
-                slot.state ? slot.state : "(none)");
+  FINISH_DBG("[finish-op] BEGIN %s\n", slot.name ? slot.name : "?");
+  FINISH_DBG("[finish-op] Timeout configured=%ums\n",
+             static_cast<unsigned>(slot.timeoutMs));
+  FINISH_DBG("[finish-op] Current retry count=%u\n",
+             static_cast<unsigned>(slot.retryCount));
+  FINISH_DBG("[finish-op] Reason for waiting=%s\n",
+             slot.reason ? slot.reason : "(none)");
+  FINISH_DBG("[finish-op] Current state=%s\n",
+             slot.state ? slot.state : "(none)");
   if (slot.timeoutMs == 0) {
-    // Diagnostic only: FinishTrace does not cancel or interrupt the call.
-    // Filesystem helpers intentionally pass timeoutMs=0 — Arduino SD/File I/O
-    // is synchronous and cannot be aborted by assigning a non-zero metadata
-    // value here. A hang is a real reliability risk until a separate
-    // enforcement boundary exists (worker policy / FS task).
-    Serial.println(
-        F("[finish-op] WARNING NO TIMEOUT ENFORCEMENT (diagnostic only)"));
-    Serial.println(
-        F("[finish-op] WARNING Underlying sync I/O can still block "
-          "indefinitely; timeoutMs metadata does not interrupt it."));
+    FINISH_DBGLN(F("[finish-op] WARNING NO TIMEOUT ENFORCEMENT (diagnostic only)"));
+    FINISH_DBGLN(F("[finish-op] WARNING Underlying sync I/O can still block "
+                   "indefinitely; timeoutMs metadata does not interrupt it."));
   }
 }
 
 void logBlockingWaiting(const BlockingSlot &slot) {
   const uint32_t elapsed = millis() - slot.beginMs;
-  Serial.printf(
+  FINISH_DBG(
       "[finish-op] WAITING operation=%s elapsed=%ums retry=%u waiting_for=%s\n",
       slot.name ? slot.name : "?", static_cast<unsigned>(elapsed),
       static_cast<unsigned>(slot.retryCount),
@@ -84,9 +90,9 @@ void heartbeatTask(void *) {
     vTaskDelay(pdMS_TO_TICKS(1000));
     if (g_pipelineActive) {
       const uint32_t elapsed = millis() - g_stageStartMs;
-      Serial.printf("[finish-stage] HEARTBEAT stage=%s elapsed=%ums\n",
-                    g_stage ? g_stage : "?",
-                    static_cast<unsigned>(elapsed));
+      FINISH_DBG("[finish-stage] HEARTBEAT stage=%s elapsed=%ums\n",
+                 g_stage ? g_stage : "?",
+                 static_cast<unsigned>(elapsed));
       logSlowWarnings(elapsed);
     }
     BlockingSlot *slot = topBlockingSlot();
@@ -128,11 +134,11 @@ void popBlockingSlot(int index, bool success, const char *error) {
   if (!slot.active) return;
   const uint32_t elapsed = millis() - slot.beginMs;
   if (g_pipelineActive) {
-    Serial.printf("[finish-op] END %s\n", slot.name ? slot.name : "?");
-    Serial.printf("[finish-op] elapsed=%ums\n", static_cast<unsigned>(elapsed));
-    Serial.printf("[finish-op] result=%s\n", success ? "success" : "failure");
-    Serial.printf("[finish-op] error=%s\n",
-                  error ? error : (success ? "(none)" : "unknown"));
+    FINISH_DBG("[finish-op] END %s\n", slot.name ? slot.name : "?");
+    FINISH_DBG("[finish-op] elapsed=%ums\n", static_cast<unsigned>(elapsed));
+    FINISH_DBG("[finish-op] result=%s\n", success ? "success" : "failure");
+    FINISH_DBG("[finish-op] error=%s\n",
+               error ? error : (success ? "(none)" : "unknown"));
   }
   slot.active = false;
   if (index == g_blockingDepth - 1) {
@@ -143,11 +149,13 @@ void popBlockingSlot(int index, bool success, const char *error) {
 }  // namespace
 
 void beginHeartbeatTask() {
+#if RENZFI_DEBUG_FINISH
   if (g_heartbeat) return;
   if (xTaskCreate(heartbeatTask, "finish_hb", 3072, nullptr, 1, &g_heartbeat) !=
       pdPASS) {
     g_heartbeat = nullptr;
   }
+#endif
 }
 
 void enterPipeline() {
@@ -168,8 +176,8 @@ void exitPipeline() {
 bool pipelineActive() { return g_pipelineActive; }
 
 void jobLifecycle(uint32_t jobId, const char *transition) {
-  Serial.printf("[finish-stage] JOB jobId=%u transition=%s\n",
-                static_cast<unsigned>(jobId), transition ? transition : "?");
+  FINISH_DBG("[finish-stage] JOB jobId=%u transition=%s\n",
+             static_cast<unsigned>(jobId), transition ? transition : "?");
 }
 
 const char *currentStage() {
@@ -246,16 +254,16 @@ bool BlockingOpScope::hasActiveBlockingOp() { return topBlockingSlot() != nullpt
 StageScope::StageScope(const char *name)
     : _name(name ? name : "?"), _beginMs(millis()), _success(true) {
   setActiveStage(_name);
-  Serial.printf("[finish-stage] BEGIN %s millis=%u\n", _name,
-                static_cast<unsigned>(_beginMs));
+  FINISH_DBG("[finish-stage] BEGIN %s millis=%u\n", _name,
+             static_cast<unsigned>(_beginMs));
 }
 
 StageScope::~StageScope() {
   const uint32_t elapsed = millis() - _beginMs;
   logSlowWarnings(elapsed);
-  Serial.printf("[finish-stage] END %s millis=%u elapsed=%ums success=%s\n",
-                _name, static_cast<unsigned>(millis()),
-                static_cast<unsigned>(elapsed), _success ? "true" : "false");
+  FINISH_DBG("[finish-stage] END %s millis=%u elapsed=%ums success=%s\n",
+             _name, static_cast<unsigned>(millis()),
+             static_cast<unsigned>(elapsed), _success ? "true" : "false");
 }
 
 void StageScope::setSuccess(bool ok) { _success = ok; }
@@ -268,15 +276,15 @@ OpScope::OpScope(const char *name)
       _success(true),
       _active(name && name[0] && g_pipelineActive) {
   if (_active) {
-    Serial.printf("[finish-op] BEGIN %s\n", _name);
+    FINISH_DBG("[finish-op] BEGIN %s\n", _name);
   }
 }
 
 OpScope::~OpScope() {
   if (!_active) return;
   const uint32_t elapsed = millis() - _beginMs;
-  Serial.printf("[finish-op] END %s elapsed=%ums success=%s\n", _name,
-                static_cast<unsigned>(elapsed), _success ? "true" : "false");
+  FINISH_DBG("[finish-op] END %s elapsed=%ums success=%s\n", _name,
+             static_cast<unsigned>(elapsed), _success ? "true" : "false");
 }
 
 void OpScope::fail() {
@@ -284,23 +292,23 @@ void OpScope::fail() {
 }
 
 void opEvent(const char *msg) {
-  Serial.printf("[finish-op] %s\n", msg ? msg : "");
+  FINISH_DBG("[finish-op] %s\n", msg ? msg : "");
 }
 
 void opReturn(const char *context, bool success) {
-  Serial.printf("[finish-op] RETURN %s success=%s\n", context ? context : "?",
-                success ? "true" : "false");
+  FINISH_DBG("[finish-op] RETURN %s success=%s\n", context ? context : "?",
+             success ? "true" : "false");
 }
 
 void portalHttpGetReceived(const char *filename) {
-  Serial.printf("[finish-op] ESP HTTP GET received file=%s\n",
-                filename ? filename : "?");
+  FINISH_DBG("[finish-op] ESP HTTP GET received file=%s\n",
+             filename ? filename : "?");
   BlockingOpScope::updateActiveState("serving portal asset", "/portal GET");
 }
 
 void portalHttpResponseCompleted(const char *filename) {
-  Serial.printf("[finish-op] ESP HTTP response completed file=%s\n",
-                filename ? filename : "?");
+  FINISH_DBG("[finish-op] ESP HTTP response completed file=%s\n",
+             filename ? filename : "?");
   BlockingOpScope::updateActiveState("portal response sent", "/portal GET");
 }
 

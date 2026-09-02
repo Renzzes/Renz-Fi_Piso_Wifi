@@ -196,7 +196,36 @@ function systemHealthOverview(
   return { label: "Unavailable", tone: "unknown" };
 }
 
-export default function SystemConfigurationPage() {
+const STANDALONE_PAGE_META: Partial<
+  Record<SystemConfigSectionId, { title: string; description: string }>
+> = {
+  "syscfg-network": {
+    title: "Network",
+    description: "Configure the ESP32 Ethernet interface used by Renz-Fi.",
+  },
+  "syscfg-wireless": {
+    title: "Wireless",
+    description: "MikroTik wireless SSID and security (wireless-capable routers only).",
+  },
+  "syscfg-hotspot": {
+    title: "Bandwidth",
+    description: "HotSpot profiles, configured rate limits, and router API credentials.",
+  },
+  "syscfg-storage": {
+    title: "Storage & Firmware",
+    description: "Running firmware, build metadata, and SD card health.",
+  },
+  "syscfg-router": {
+    title: "Router Status",
+    description: "MikroTik connectivity, cache age, and synchronization controls.",
+  },
+};
+
+export default function SystemConfigurationPage({
+  fixedSection,
+}: {
+  fixedSection?: SystemConfigSectionId;
+} = {}) {
   const queryClient = useQueryClient();
   const [form, setForm] = useState<RouterConfig>(defaultFormState);
   const [wirelessForm, setWirelessForm] = useState<RouterWirelessForm>(defaultWirelessState);
@@ -211,8 +240,23 @@ export default function SystemConfigurationPage() {
   });
   const [editingRateLimitName, setEditingRateLimitName] = useState<string | null>(null);
   const [editingRateLimitValue, setEditingRateLimitValue] = useState("");
-  const [activeSection, setActiveSection] = useState<SystemConfigSectionId>(readSystemConfigSection);
+  const [activeSection, setActiveSection] = useState<SystemConfigSectionId>(
+    () => fixedSection ?? readSystemConfigSection(),
+  );
   const profileRefreshAttempted = useRef(false);
+
+  const effectiveSection = fixedSection ?? activeSection;
+  const standaloneMeta = fixedSection ? STANDALONE_PAGE_META[fixedSection] : null;
+
+  // Section-gated loads: opening System Config must not fire every API at once
+  // (proven DMA Guru when SoftAP + health/settings/wifi/cache herd).
+  const sectionNetwork = effectiveSection === "syscfg-network";
+  const sectionWireless = effectiveSection === "syscfg-wireless";
+  const sectionHotspot = effectiveSection === "syscfg-hotspot";
+  const sectionRouter = effectiveSection === "syscfg-router";
+  const sectionOverview = effectiveSection === "syscfg-overview";
+  const sectionStorage = effectiveSection === "syscfg-storage";
+  const needSystemStatus = sectionOverview || sectionRouter || sectionStorage || sectionHotspot;
 
   const {
     data: rawConfig,
@@ -221,6 +265,7 @@ export default function SystemConfigurationPage() {
   } = useQuery({
     queryKey: ["router", "settings"],
     queryFn: () => routerApi.settings(),
+    enabled: sectionHotspot,
     ...CONFIG_QUERY_OPTIONS,
   });
 
@@ -232,6 +277,7 @@ export default function SystemConfigurationPage() {
   } = useQuery({
     queryKey: ["router", "cache"],
     queryFn: () => routerApi.cache(),
+    enabled: sectionRouter || sectionOverview,
     ...CONFIG_QUERY_OPTIONS,
   });
 
@@ -244,6 +290,7 @@ export default function SystemConfigurationPage() {
   } = useQuery({
     queryKey: ["router", "wireless"],
     queryFn: () => routerApi.wireless(),
+    enabled: sectionWireless,
     ...CONFIG_QUERY_OPTIONS,
   });
 
@@ -255,7 +302,10 @@ export default function SystemConfigurationPage() {
   } = useQuery({
     queryKey: ["system", "status"],
     queryFn: () => systemApi.status(),
-    refetchInterval: 30_000,
+    enabled: needSystemStatus,
+    staleTime: 15_000,
+    refetchInterval: false,
+    refetchOnMount: true,
   });
 
   const {
@@ -266,6 +316,7 @@ export default function SystemConfigurationPage() {
   } = useQuery({
     queryKey: ["system", "wifiConfig"],
     queryFn: () => systemApi.wifiConfig(),
+    enabled: sectionNetwork,
     staleTime: 5_000,
     refetchOnMount: true,
   });
@@ -273,7 +324,9 @@ export default function SystemConfigurationPage() {
   const { data: systemHealth, isLoading: healthLoading } = useQuery({
     queryKey: ["system", "health"],
     queryFn: () => healthApi.get(),
-    refetchInterval: 30_000,
+    enabled: sectionOverview,
+    staleTime: 15_000,
+    refetchInterval: false,
   });
 
   const current = wifiConfig?.current;
@@ -312,6 +365,7 @@ export default function SystemConfigurationPage() {
   } = useQuery({
     queryKey: ["router", "profiles"],
     queryFn: () => routerApi.profiles(),
+    enabled: sectionHotspot,
     ...CONFIG_QUERY_OPTIONS,
   });
 
@@ -430,11 +484,10 @@ export default function SystemConfigurationPage() {
     Boolean(systemStatus?.storageStatus?.recoveryInProgress) ||
     Boolean(systemStatus?.storageStatus?.recoveryMode) ||
     systemStatus?.storageStatus?.mounted === false;
+  // Do not gate Sync/Refresh on cacheFetching — under ETH_DMA_LOW the cache GET
+  // can stay "fetching" and leave buttons disabled forever (field report).
   const routerCachePending =
-    refreshCacheMutation.isPending ||
-    syncRouterMutation.isPending ||
-    cacheFetching ||
-    storageRecovering;
+    refreshCacheMutation.isPending || syncRouterMutation.isPending || storageRecovering;
 
   const handleRouterCacheRefresh = () => {
     refreshCacheMutation.mutate();
@@ -611,11 +664,16 @@ export default function SystemConfigurationPage() {
   const tempC = systemHealth?.esp32?.chipTempC;
   const tempAvailable = Boolean(systemHealth?.esp32?.chipTempAvailable && tempC != null);
   const wirelessConfigured = wirelessData?.configured === true;
-  const overviewWirelessSsid =
-    wirelessData?.ssid?.trim() ||
-    routerCache?.productionNetwork?.ssid ||
-    routerCache?.ssid ||
-    "Unavailable";
+  const externalApOnly =
+    wirelessData?.externalApOnly === true ||
+    systemStatus?.networkProvisioning?.externalApOnly === true ||
+    systemStatus?.networkProvisioning?.guestTopologyMode === "external_access_point";
+  const overviewWirelessSsid = externalApOnly
+    ? "Bridge-only — register AP in Networking → Access Points"
+    : wirelessData?.ssid?.trim() ||
+      routerCache?.productionNetwork?.ssid ||
+      routerCache?.ssid ||
+      "Unavailable";
   const overviewInternetIp =
     systemStatus?.wan?.ip ||
     current?.gateway ||
@@ -630,26 +688,37 @@ export default function SystemConfigurationPage() {
   const readOnlyInputClass = "w-full min-w-0 bg-muted/50 font-mono text-[13px]";
   const inputClass = "w-full min-w-0 bg-background";
 
-  const showSection = (id: SystemConfigSectionId) =>
-    cn(activeSection !== id && "hidden");
+  const showSection = (id: SystemConfigSectionId) => cn(effectiveSection !== id && "hidden");
 
   const handleSectionChange = (id: SystemConfigSectionId) => {
+    if (fixedSection) return;
     setActiveSection(id);
     if (typeof window !== "undefined") {
       window.history.replaceState(null, "", `#${id}`);
     }
   };
 
+  const showRouterCacheBanner =
+    !fixedSection ||
+    fixedSection === "syscfg-router" ||
+    fixedSection === "syscfg-hotspot" ||
+    fixedSection === "syscfg-overview";
+
   return (
     <div className="w-full max-w-none space-y-4">
       <div>
-        <h2 className="text-2xl font-semibold leading-tight">System Configuration</h2>
+        <h2 className="text-2xl font-semibold leading-tight">
+          {standaloneMeta?.title ?? "System Configuration"}
+        </h2>
         <p className="mt-0.5 text-[13px] text-muted-foreground">
-          Manage network, wireless, hotspot, storage and router settings.
+          {standaloneMeta?.description ??
+            "Manage network, wireless, bandwidth, storage and router settings."}
         </p>
       </div>
 
-      <ConfigSectionNav active={activeSection} onChange={handleSectionChange} />
+      {fixedSection ? null : (
+        <ConfigSectionNav active={effectiveSection} onChange={handleSectionChange} />
+      )}
 
       {migrationApplied ? (
         <Alert>
@@ -661,11 +730,13 @@ export default function SystemConfigurationPage() {
         </Alert>
       ) : null}
 
-      <RouterCacheStaleBanner
-        cache={routerCache}
-        pending={routerCachePending}
-        onRefresh={handleRouterCacheRefresh}
-      />
+      {showRouterCacheBanner ? (
+        <RouterCacheStaleBanner
+          cache={routerCache}
+          pending={routerCachePending}
+          onRefresh={handleRouterCacheRefresh}
+        />
+      ) : null}
 
       <section
         id="syscfg-overview"
@@ -689,9 +760,15 @@ export default function SystemConfigurationPage() {
           loading={statusLoading}
         />
         <OverviewStatusCard
-          title="Wireless"
-          statusLabel={wirelessConfigured ? "Configured" : "Not configured"}
-          statusTone={wirelessConfigured ? "ok" : "unknown"}
+          title={externalApOnly ? "Guest Wi-Fi" : "Wireless"}
+          statusLabel={
+            externalApOnly
+              ? "External AP / Bridge-only"
+              : wirelessConfigured
+                ? "Configured"
+                : "Not configured"
+          }
+          statusTone={externalApOnly || wirelessConfigured ? "ok" : "unknown"}
           detail={overviewWirelessSsid}
           loading={wirelessLoading}
         />
@@ -916,18 +993,18 @@ export default function SystemConfigurationPage() {
 
       <ConfigCard
         id="syscfg-hotspot"
-        title="Hotspot"
-        description="Router API, profiles and rate limits"
+        title="Bandwidth"
+        description="Router API, HotSpot profiles and configured rate limits"
         className={showSection("syscfg-hotspot")}
       >
         {configError ? (
           <div className="space-y-2 text-[13px] text-muted-foreground">
-            <p>Unable to retrieve hotspot settings.</p>
+            <p>Unable to retrieve bandwidth settings.</p>
           </div>
         ) : null}
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
           <div className="space-y-3 rounded-[14px] border bg-muted/10 p-4">
-            <h4 className="text-[13px] font-semibold">Hotspot Connection</h4>
+            <h4 className="text-[13px] font-semibold">Router Connection</h4>
             <ConfigField
               label="Router IP Address"
               hint="MikroTik RouterOS API address (port 8728). Use the LAN IP on the ESP32 Ethernet segment (for example 10.10.10.1), not the guest hotspot gateway."
@@ -1258,7 +1335,7 @@ export default function SystemConfigurationPage() {
               </div>
               <div className="space-y-2">
                 <h4 className="text-[13px] font-semibold">Router information</h4>
-                <div className="rounded-md border bg-muted/20 px-3">
+                <div className="rounded-md border bg-muted/20 px-3 pr-4">
                   <InfoRow
                     label="Router Identity"
                     value={routerCache?.identity || testResult?.identity || "—"}
@@ -1284,17 +1361,30 @@ export default function SystemConfigurationPage() {
                     value={routerCacheProvisionStatusLabel(routerCache)}
                   />
                   <InfoRow
+                    label="Network Mode"
+                    value={
+                      externalApOnly ? "External Access Point / Bridge-only" : "MikroTik wireless"
+                    }
+                  />
+                  <InfoRow
                     label="Production Wi-Fi"
                     value={routerCacheProductionWifiLabel(
                       routerCache,
                       "Healthy",
-                      productionNetworkReasonLabel(routerCache?.productionNetwork?.reason),
+                      externalApOnly
+                        ? productionNetworkReasonLabel("external-ap-topology")
+                        : productionNetworkReasonLabel(routerCache?.productionNetwork?.reason),
+                      externalApOnly,
                     )}
                   />
                   <InfoRow
                     label="Production SSID"
-                    value={routerCache?.productionNetwork?.ssid || routerCache?.ssid || "—"}
-                    mono
+                    value={
+                      externalApOnly
+                        ? "External AP (configured separately)"
+                        : routerCache?.ssid || routerCache?.productionNetwork?.ssid || "—"
+                    }
+                    mono={!externalApOnly}
                   />
                   <InfoRow
                     label="Hotspot Profile"

@@ -239,6 +239,68 @@ check("24 Wi-Fi selection stays deferred off async_tcp", () => {
     String.raw`wifiSetupComplete[\s\S]*kModeNew[\s\S]*!_wifiSsid\.isEmpty`);
 });
 
+check("25 Communication quiesce while factory reset busy", () => {
+  mustContain("bindFactoryReset", APP, "HttpPlaneGate::bindFactoryReset");
+  const GATE = read(path.join(ROOT, "src", "web", "HttpPlaneGate.cpp"));
+  const GATE_H = read(path.join(ROOT, "src", "web", "HttpPlaneGate.h"));
+  mustContain("ensureNotFactoryResetting", GATE_H, "ensureNotFactoryResetting");
+  mustContain("allow-list status", GATE, "factory-reset/status");
+  mustContain("409 FACTORY_RESET_IN_PROGRESS", GATE, "FACTORY_RESET_IN_PROGRESS");
+  mustContain("gate in ensureProductionPlane", GATE,
+    String.raw`ensureProductionPlane[\s\S]*ensureNotFactoryResetting`);
+  mustContain("gate in ensureSetupPlane", GATE,
+    String.raw`ensureSetupPlane[\s\S]*ensureNotFactoryResetting`);
+  mustContain("gate in ensureAppliancePlane", GATE,
+    String.raw`ensureAppliancePlane[\s\S]*ensureNotFactoryResetting`);
+  mustContain("close SSE on enqueue", API, "closeAllClients");
+  const EVENTS = read(path.join(ROOT, "src", "EventBus.cpp"));
+  mustContain("SSE heartbeat skips when busy", EVENTS,
+    String.raw`heartbeat\(\)[\s\S]*isFactoryResetBusy`);
+  mustContain("SSE emit skips when busy", EVENTS,
+    String.raw`emit\([\s\S]*isFactoryResetBusy`);
+  const FRONT_QUIESCE = read(path.join(REPO, "src", "services", "factoryResetQuiesce.ts"));
+  mustContain("frontend quiesce module", FRONT_QUIESCE, "setFactoryResetQuiesced");
+  mustContain("frontend sets quiesce on reset", FRONT, "setFactoryResetQuiesced\\(true\\)");
+});
+
+check("26 SSE reject before AsyncEventSourceClient construction", () => {
+  const EVENTS = read(path.join(ROOT, "src", "EventBus.cpp"));
+  mustContain(
+    "authorizeConnect pre-construction gate",
+    EVENTS,
+    "authorizeConnect",
+  );
+  mustContain(
+    "log before construction",
+    EVENTS,
+    "SSE rejected before client construction",
+  );
+  mustContain(
+    "busy check in authorizeConnect",
+    EVENTS,
+    String.raw`authorizeConnect[\s\S]*isFactoryResetBusy`,
+  );
+  // Regression: never reintroduce close() from onConnect (ctor reentrancy).
+  const onConnectIdx = EVENTS.indexOf("_source->onConnect(");
+  if (onConnectIdx < 0) throw new Error("onConnect missing");
+  const onConnectEnd = EVENTS.indexOf("});", onConnectIdx);
+  const onConnectBody = EVENTS.slice(
+    onConnectIdx,
+    onConnectEnd > onConnectIdx ? onConnectEnd : onConnectIdx + 800,
+  );
+  mustNotContain(
+    "no client->close in onConnect",
+    onConnectBody,
+    String.raw`client\s*->\s*close\s*\(`,
+  );
+  mustNotContain(
+    "no close() in onConnect busy branch",
+    onConnectBody,
+    String.raw`rejected SSE connect`,
+  );
+  mustContain("closeAllClients retained", EVENTS, "closeAllClients");
+});
+
 const failed = checks.filter((c) => !c).length;
 console.log(
   failed === 0

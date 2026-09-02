@@ -319,8 +319,8 @@ static constexpr const char *PORTAL_BANNER_SPIFFS  = StoragePaths::Spiffs::Porta
 static constexpr const char *PORTAL_MUSIC_SPIFFS   = StoragePaths::Spiffs::PortalCustomMusic;
 static constexpr const char *PORTAL_BANNER_DEFAULT = StoragePaths::Spiffs::PortalDefaultBanner;
 static constexpr const char *PORTAL_MUSIC_DEFAULT  = StoragePaths::Spiffs::PortalDefaultMusic;
-static constexpr size_t      PORTAL_BANNER_MAX_BYTES = 2U * 1024U * 1024U;  // 2 MiB
-static constexpr size_t      PORTAL_MUSIC_MAX_BYTES  = 2U * 1024U * 1024U;  // 2 MiB
+static constexpr size_t      PORTAL_BANNER_MAX_BYTES = 4U * 1024U * 1024U;  // 4 MiB
+static constexpr size_t      PORTAL_MUSIC_MAX_BYTES  = 4U * 1024U * 1024U;  // 4 MiB
 static constexpr size_t      LOG_RAM_BUFFER_SIZE    = 500;
 
 // ── Portal session timing ──────────────────────────────────────────────────────
@@ -362,7 +362,8 @@ static constexpr size_t FB_LIMIT_INSTALLATION       = 4 * 1024;
 static constexpr size_t FB_LIMIT_PROVISIONING       = 4 * 1024;
 static constexpr size_t FB_LIMIT_ROUTER_CONNECTION   = 8 * 1024;
 static constexpr size_t FB_LIMIT_ROUTER_PROVISIONING = 8 * 1024;
-static constexpr size_t FB_LIMIT_ROUTER_CACHE        = 8 * 1024;
+// Sync/Refresh persist while SD is missing — profile inventories need headroom.
+static constexpr size_t FB_LIMIT_ROUTER_CACHE        = 24 * 1024;
 static constexpr size_t FB_LIMIT_EXISTING_NETWORK_SCAN = 24 * 1024;
 static constexpr size_t FB_LIMIT_SETUP_WIZARD        = 4 * 1024;
 static constexpr size_t FB_LIMIT_MANIFEST            = 8 * 1024;
@@ -376,9 +377,15 @@ static constexpr uint32_t STORAGE_HEALTH_POLL_MS   = 60000;
 // After initial remount retries fail, continue low-power presence checks.
 static constexpr uint32_t STORAGE_WATCH_POLL_MS    = 300000;  // 5 minutes
 static constexpr uint32_t STORAGE_LOCK_TIMEOUT_MS  = 5000;
+// HTTP callbacks run on async_tcp (CPU1). Never park that task for the full
+// STORAGE_LOCK_TIMEOUT_MS window — it equals the default TWDT period and causes
+// Guru Meditation when loopTask holds STORAGE_LOCK for SD I/O.
+static constexpr uint32_t STORAGE_LOCK_ASYNC_TCP_WAIT_MS = 80;
 // refreshRuntimeSnapshot() is called from loopTask; throttle heavy SPIFFS walks
 // to avoid starving async_tcp on shared CPU1.
 static constexpr uint32_t STORAGE_SNAPSHOT_HEAVY_INTERVAL_MS = 30000;
+// SD.totalBytes()/usedBytes under STORAGE_LOCK — throttle between light refreshes.
+static constexpr uint32_t STORAGE_SNAPSHOT_CAPACITY_INTERVAL_MS = 10000;
 static constexpr uint8_t SD_RECOVERY_MAX_ATTEMPTS  = 3;
 static constexpr uint8_t STORAGE_CONFLICT_CAP      = 4;
 static constexpr uint8_t STORAGE_REPLAY_FILE_CAP   = 8;

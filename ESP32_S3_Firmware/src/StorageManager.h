@@ -24,6 +24,8 @@ class StorageManager {
   bool sdRecoveryInProgress() const { return _sdRecoveryInProgress; }
   // Stops storage consumers after an integrity-critical boot recovery failure.
   void markDegraded(const String &reason);
+  /** Hot-unplug / dead SD SPI: enter SPIFFS fallback so Sync/Refresh can continue. */
+  void reportSdMediaMissing(const char *reason);
 
   bool isSdPollingDisabled() const;
   bool isWatchMode() const;
@@ -71,6 +73,8 @@ class StorageManager {
 
   bool writeBinary(const char *sdPath, const uint8_t *data, size_t len);
   bool writeBinarySpiffs(const char *spiffsPath, const uint8_t *data, size_t len);
+  /** Stream-copy an SD file into SPIFFS (portal custom banner/music mirror). */
+  bool mirrorSdFileToSpiffs(const char *sdPath, const char *spiffsPath);
   bool removeBinary(const char *sdPath, const char *spiffsPath);
 
   uint64_t getSpiffsUsedBytes() const;
@@ -126,6 +130,11 @@ class StorageManager {
   // Extended diagnostics for admin dashboard (future UI).
   void fillStorageHealth(JsonObject health) const;
 
+  /** True once after SD recovery merged/reconciled sales; clears on read. */
+  bool consumeSalesSummaryStale();
+  /** True once after SD recovery merged portal_sessions; clears on read. */
+  bool consumePortalSessionsStale();
+
  private:
   class ScopedStorageLock {
    public:
@@ -162,9 +171,12 @@ class StorageManager {
   uint32_t _lastFbPortalWriteMs = 0;
   uint32_t _lastSdVerificationMs = 0;
   uint32_t _lastSnapshotHeavyMs = 0;
+  uint32_t _lastSnapshotCapacityMs = 0;
   uint32_t _lastSuccessfulReplayMs = 0;
   bool _hasSuccessfulReplay = false;
   bool _hasSdVerification = false;
+  bool _salesSummaryStale = false;
+  bool _portalSessionsStale = false;
 
   // Internal diagnostic cause (serviceability). Owner UI may stay simplified.
   const char *_diagnosticCause = "UNKNOWN";
@@ -302,12 +314,22 @@ class StorageManager {
   void onSdRecoveryFailed();
   void onSdRecoverySucceeded();
   void handleSdRemoved(const char *reason);
+  void snapshotCriticalSdToSpiffs();
+  bool reconcileSalesFallbackToSd(const char *fbPath, const char *sdPath,
+                                  const String &fbPayload,
+                                  unsigned &filesSynced, size_t &bytesSynced);
+  bool reconcilePortalSessionsFallbackToSd(const char *fbPath,
+                                           const char *sdPath,
+                                           const String &fbPayload,
+                                           unsigned &filesSynced,
+                                           size_t &bytesSynced);
   bool verifySdHealthy();
   void emitStorageChanged();
   void setDiagnosticCause(const char *cause);
   void recordConflict(const char *sdPath, uint32_t generation, uint32_t baseCrc,
                       uint32_t sdCrc, uint32_t fallbackCrc);
   void clearConflicts();
+  void clearConflictForPath(const char *sdPath);
   static const char *fallbackFileLabel(const char *fbPath);
   bool ensureDir(const char *path);
   bool ensureJsonFile(const char *path, const char *contents);
@@ -325,14 +347,20 @@ class StorageManager {
   bool readJsonFromSd(const char *path, JsonDocument &doc);
   bool writeJsonToSd(const char *path, JsonDocument &doc);
   bool writeJsonToSdSerialized(const char *path, const String &serialized);
+  bool writeJsonToSdSerialized(const char *path, const char *serialized,
+                               size_t len);
   bool writeJsonToSdOnce(const char *path, const String &serialized,
+                         const char **failReasonOut = nullptr);
+  bool writeJsonToSdOnce(const char *path, const char *serialized, size_t len,
                          const char **failReasonOut = nullptr);
   bool recoverSdTransaction(const char *path);
   bool recoverSpiffsTransaction(const String &path);
   bool validateJsonPayload(const String &payload) const;
+  bool validateJsonPayload(const char *payload, size_t len) const;
   bool readSdPayload(const char *path, String &payload) const;
   bool readSpiffsPayload(const String &path, String &payload) const;
   uint32_t payloadCrc(const String &payload) const;
+  uint32_t payloadCrc(const char *payload, size_t len) const;
 
   bool readJsonFromSpiffs(const char *sdPath, JsonDocument &doc);
   bool writeJsonToSpiffs(const char *sdPath, const String &serialized,
@@ -362,6 +390,7 @@ class StorageManager {
   bool replayHistorySpools();
   bool removeSdTree(const char *path);
   bool verifySdMatches(const char *sdPath, const String &expected);
+  bool verifySdMatches(const char *sdPath, const char *expected, size_t expectedLen);
   bool createStorageMutex();
   bool lockStorage() const;
   bool tryLockStorage() const;

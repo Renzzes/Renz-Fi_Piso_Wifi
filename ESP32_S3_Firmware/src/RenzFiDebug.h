@@ -66,7 +66,11 @@
 #endif
 
 #if !defined(RENZFI_NETWORK_DIAG)
-#define RENZFI_NETWORK_DIAG 1
+#define RENZFI_NETWORK_DIAG 0
+#endif
+
+#if !defined(RENZFI_DEBUG_FINISH)
+#define RENZFI_DEBUG_FINISH 0
 #endif
 
 #if !defined(RENZFI_BURN_IN_DIAG)

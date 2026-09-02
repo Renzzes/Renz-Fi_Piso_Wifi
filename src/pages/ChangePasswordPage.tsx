@@ -1,4 +1,4 @@
-import logoSrc from "../../public/Logo.png";
+import { BrandLogo } from "@/components/BrandLogo";
 import { ChangeAdminPasswordForm } from "@/components/ChangeAdminPasswordForm";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -11,13 +11,17 @@ type ChangePasswordPageProps = {
 
 export default function ChangePasswordPage({ onComplete, onLogout }: ChangePasswordPageProps) {
   return (
-    <div className="relative flex min-h-screen items-center justify-center bg-muted/40 px-4 py-8">
-      <div className="absolute right-3 top-3">
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-8">
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 bg-primary/10 [mask-image:radial-gradient(ellipse_at_50%_0%,black,transparent_55%)]"
+      />
+      <div className="absolute right-3 top-3 z-10">
         <ThemeToggle />
       </div>
-      <Card className="w-full max-w-md">
-        <CardHeader className="items-center text-center">
-          <img src={logoSrc} alt="Renz-Fi logo" className="mb-2 h-24 w-auto object-contain" />
+      <Card className="relative z-10 w-full max-w-md border-border/80 bg-card/95 shadow-lg backdrop-blur-sm">
+        <CardHeader className="items-center space-y-3 text-center">
+          <BrandLogo height={72} />
           <CardTitle className="text-2xl">Change Password</CardTitle>
           <CardDescription>
             The default admin password must be changed before you can use the dashboard.

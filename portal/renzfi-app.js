@@ -34,8 +34,10 @@
   var EVENTS_BASE        = APPLIANCE_BASE_URL;
   var STORAGE_PREFIX    = "renzFiPortalState";
   var INSERT_TIMEOUT    = 60;
-  var HEARTBEAT_MS      = 10000;
-  var COIN_POLL_MS      = 2000;
+  // Idle standby: no periodic heartbeat. Active paid sessions use a slow sync
+  // only (local countdown owns the display). Coin modal uses COIN_POLL_MS.
+  var ACTIVE_SYNC_MS    = 60000;
+  var COIN_POLL_MS      = 500;
 
   // Consecutive background-request failures before showing the
   // "service temporarily unavailable" notice (see noteApplianceFailure()).
@@ -153,10 +155,21 @@
       activationError:   Boolean(raw.activationError || raw.activation_error),
       activationErrorReason: raw.activationErrorReason ||
                              raw.activation_error_reason || "",
-      pausesRemaining:   raw.pausesRemaining !== undefined
-                            ? Number(raw.pausesRemaining)
-                            : null,
-      pauseLimit:        Number(raw.pauseLimit) || 0,
+      pausesUsed:        raw.pausesUsed !== undefined
+                            ? Number(raw.pausesUsed)
+                            : (raw.pauses_used !== undefined
+                                ? Number(raw.pauses_used)
+                                : undefined),
+      pausesRemaining:   (function () {
+        if (raw.pausesRemaining !== undefined) return Number(raw.pausesRemaining);
+        if (raw.pauses_remaining !== undefined) return Number(raw.pauses_remaining);
+        var used = raw.pausesUsed !== undefined ? Number(raw.pausesUsed)
+                 : (raw.pauses_used !== undefined ? Number(raw.pauses_used) : undefined);
+        var limit = Number(raw.pauseLimit || raw.pause_limit) || 0;
+        if (used !== undefined && limit > 0) return Math.max(0, limit - used);
+        return null;
+      })(),
+      pauseLimit:        Number(raw.pauseLimit || raw.pause_limit) || 0,
       source:             source,
       voucherCode:        raw.voucherCode || raw.voucher_code || "",
       voucherStatus:      raw.voucherStatus || raw.voucher_status || "",
@@ -180,7 +193,11 @@
       grantedSeconds:     Number(raw.grantedSeconds || raw.granted_seconds) || 0,
       authorizedAtMs:     Number(raw.authorizedAtMs || raw.authorized_at_ms) || 0,
       expiresAtMs:        Number(raw.expiresAtMs || raw.expires_at_ms) || 0,
-      serverNowMs:        Number(raw.serverNowMs || raw.server_now_ms) || 0
+      serverNowMs:        Number(raw.serverNowMs || raw.server_now_ms) || 0,
+      sessionNotice:      raw.sessionNotice || raw.session_notice || "",
+      ownerDisconnectNotice: Boolean(
+        raw.ownerDisconnectNotice || raw.owner_disconnect_notice
+      )
     };
   }
 
@@ -235,9 +252,9 @@
       voucherStatus:      "",
       voucherExpiresAt:   "",
       canInsertCoin:      true,
-      canPause:           true,
-      canResume:          true,
-      canTerminate:       true,
+      canPause:           false,
+      canResume:          false,
+      canTerminate:       false,
       canReconnect:       false,
       sessionGeneration:  0,
       grantedSeconds:     0,
@@ -257,23 +274,32 @@
         credits:            Number(saved.credits)           || 0,
         secondsLeft:        Number(saved.secondsLeft)       || 0,
         // Never resume ticking from cache — the countdown stays frozen on the
-        // last known value until the firmware confirms it.
+        // last known value until the firmware confirms timerRunning.
         timerRunning:       false,
         paused:             Boolean(saved.paused),
+        connected:          Boolean(saved.connected),
         coinCountdown:      Number(saved.coinCountdown)     || INSERT_TIMEOUT,
         coinSessionActive:  Boolean(saved.coinSessionActive),
         insertedAmount:     Number(saved.insertedAmount)    || 0,
+        purchasedMinutes:   Number(saved.purchasedMinutes)  || 0,
         sessionState:       saved.sessionState              || "idle",
+        activationError:    Boolean(saved.activationError),
+        activationErrorReason: saved.activationErrorReason || "",
+        pausesRemaining:    saved.pausesRemaining != null
+                              ? Number(saved.pausesRemaining)
+                              : null,
+        pauseLimit:         Number(saved.pauseLimit) || 0,
         source:             saved.source                    || "portal",
         voucherCode:        saved.voucherCode               || "",
         voucherStatus:      saved.voucherStatus             || "",
         voucherExpiresAt:   saved.voucherExpiresAt          || "",
         canInsertCoin:      saved.canInsertCoin !== false,
-        canPause:           saved.canPause !== false,
-        canResume:          saved.canResume !== false,
-        canTerminate:       saved.canTerminate !== false,
+        canPause:           saved.canPause === true,
+        canResume:          saved.canResume === true,
+        canTerminate:       saved.canTerminate === true,
         canReconnect:       Boolean(saved.canReconnect),
-        // Never restore coin-session accumulators from cache
+        sessionGeneration:  Number(saved.sessionGeneration) || 0,
+        grantedSeconds:     Number(saved.grantedSeconds) || 0,
         coinAmount:         0,
         coinMinutes:        0,
         coinVoucherMinutes: 0,
@@ -290,6 +316,7 @@
   }
 
   var state = defaultState();
+  var sessionHydrated = false;
 
   // ── countdown derivation ───────────────────────────────────────────────────
   // Presentation only. Remaining is derived from the firmware expiry
@@ -396,6 +423,9 @@
     state.activationErrorReason = session.activationErrorReason || "";
     if (session.pausesRemaining !== null && session.pausesRemaining !== undefined) {
       state.pausesRemaining = session.pausesRemaining;
+    } else if (session.pausesUsed !== null && session.pausesUsed !== undefined &&
+               state.pauseLimit > 0) {
+      state.pausesRemaining = Math.max(0, state.pauseLimit - session.pausesUsed);
     }
     if (session.pauseLimit) state.pauseLimit = session.pauseLimit;
     state.source            = session.source || "portal";
@@ -446,9 +476,14 @@
         state.coinCountdown = serverRem;
         anchorCoinWindow(serverRem);
       } else {
+        // Monotonic: never climb. Only re-anchor when the server is *earlier*
+        // than the local clock. Re-anchoring to presentRem on every poll would
+        // reset elapsed to 0 under COIN_POLL_MS (500) and freeze the UI at 60.
         var adopt = Math.min(presentRem, serverRem);
         state.coinCountdown = adopt;
-        anchorCoinWindow(adopt);
+        if (adopt < presentRem) {
+          anchorCoinWindow(adopt);
+        }
       }
     } else {
       state.coinCountdown = session.coinCountdown;
@@ -469,13 +504,22 @@
     }
     if (state.sessionState !== "active" || !state.connected ||
         state.secondsLeft <= 0 || state.paused) {
-      hideSessionNotice();
+      if (!session.ownerDisconnectNotice) hideSessionNotice();
     } else {
       updateSessionNotice(previousSeconds, state.secondsLeft);
     }
 
+    if (session.sessionNotice) {
+      showSessionNotice(session.sessionNotice, false);
+      if (session.ownerDisconnectNotice) {
+        sessionNoticeTicks = 600;
+      }
+    }
+
     saveStateCache();
+    sessionHydrated = true;
     render();
+    updateIdleSyncPolicy();
   }
 
   function applySessionData(raw, trustFully) {
@@ -555,21 +599,129 @@
       : "Default-Banner.png";
   }
 
-  function applyBranding(data) {
-    if (!data) return;
-    var bannerEl = document.getElementById("portalBanner");
+  function brandingIsVideo(data) {
+    if (!data || !data.hasCustomBanner) return false;
+    if (data.bannerIsVideo === true || data.banner_is_video === true) return true;
+    var mime = String(data.bannerMime || data.banner_mime || "");
+    if (mime.indexOf("video/") === 0) return true;
+    var url = String(data.bannerUrl || data.banner_url || "");
+    return /\.mp4(\?|$)/i.test(url);
+  }
+
+  function deactivateBannerMedia(bannerEl, videoEl) {
     if (bannerEl) {
-      var fallback = defaultBannerSrc();
-      bannerEl.onerror = function () {
-        bannerEl.onerror = null;
-        bannerEl.src = fallback;
-      };
-      if (data.hasCustomBanner && data.bannerUrl) {
-        bannerEl.src = data.bannerUrl;
-      } else {
-        bannerEl.src = fallback;
-      }
+      bannerEl.classList.remove("banner-active");
+      bannerEl.removeAttribute("src");
     }
+    if (videoEl) {
+      videoEl.classList.remove("banner-active");
+      videoEl.removeAttribute("src");
+      try { videoEl.load(); } catch (e) {}
+    }
+  }
+
+  function revealPortalHero() {
+    var hero = document.getElementById("portalHero");
+    if (hero) hero.classList.remove("branding-pending");
+  }
+
+  function waitForBannerMedia(el, isVideo, timeoutMs, cb) {
+    if (!el) {
+      cb(false);
+      return;
+    }
+    var finished = false;
+    function done(ok) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      cb(ok !== false);
+    }
+    var timer = setTimeout(function () { done(true); }, timeoutMs || 10000);
+    if (isVideo) {
+      el.oncanplay = function () { done(true); };
+      el.onloadeddata = function () { done(true); };
+    } else {
+      el.onload = function () { done(true); };
+      if (el.complete && el.naturalWidth > 0) done(true);
+    }
+    el.onerror = function () { done(false); };
+  }
+
+  function applyBranding(data) {
+    if (!data) {
+      revealPortalHero();
+      return;
+    }
+    var bannerEl = document.getElementById("portalBanner");
+    var videoEl = document.getElementById("portalBannerVideo");
+    var fallback = defaultBannerSrc();
+    var useCustom = Boolean(data.hasCustomBanner && data.bannerUrl);
+    var isVideo = useCustom && brandingIsVideo(data);
+
+    deactivateBannerMedia(bannerEl, videoEl);
+
+    function showImageBanner(src, afterLoad) {
+      if (!bannerEl) {
+        revealPortalHero();
+        return;
+      }
+      bannerEl.src = src;
+      waitForBannerMedia(bannerEl, false, useCustom ? 12000 : 4000, function (ok) {
+        if (!ok && useCustom) {
+          deactivateBannerMedia(bannerEl, videoEl);
+          bannerEl.src = fallback;
+          waitForBannerMedia(bannerEl, false, 4000, function () {
+            bannerEl.classList.add("banner-active");
+            revealPortalHero();
+            if (afterLoad) afterLoad();
+          });
+          return;
+        }
+        bannerEl.classList.add("banner-active");
+        revealPortalHero();
+        if (afterLoad) afterLoad();
+      });
+    }
+
+    function showVideoBanner(src, afterLoad) {
+      if (!videoEl) {
+        showImageBanner(fallback, afterLoad);
+        return;
+      }
+      videoEl.controls = false;
+      videoEl.muted = true;
+      videoEl.defaultMuted = true;
+      videoEl.loop = true;
+      videoEl.autoplay = true;
+      videoEl.playsInline = true;
+      videoEl.setAttribute("playsinline", "");
+      videoEl.setAttribute("webkit-playsinline", "");
+      videoEl.setAttribute("controlslist", "nodownload nofullscreen noremoteplayback");
+      try { videoEl.disablePictureInPicture = true; } catch (e) {}
+      try { videoEl.disableRemotePlayback = true; } catch (e) {}
+      videoEl.src = src;
+      try { videoEl.load(); } catch (e) {}
+      waitForBannerMedia(videoEl, true, 12000, function (ok) {
+        if (!ok) {
+          showImageBanner(fallback, afterLoad);
+          return;
+        }
+        videoEl.classList.add("banner-active");
+        revealPortalHero();
+        try { videoEl.play(); } catch (e) {}
+        if (afterLoad) afterLoad();
+      });
+    }
+
+    if (isVideo) {
+      showVideoBanner(data.bannerUrl);
+    } else if (useCustom) {
+      showImageBanner(data.bannerUrl);
+    } else {
+      showImageBanner(fallback);
+    }
+
     if (dom.bgMusic) {
       var musicSrc = data.hasCustomMusic && data.musicUrl ? data.musicUrl : "bg_music.mp3";
       var current  = dom.bgMusic.getAttribute("src") || dom.bgMusic.currentSrc || "";
@@ -588,15 +740,16 @@
         return r.json();
       })
       .then(function (json) { applyBranding(unwrapPortalResponse(json)); })
-      .catch(function () {});
+      .catch(function () {
+        applyBranding({ hasCustomBanner: false, hasCustomMusic: false });
+      });
   }
 
-  // One EventSource carries both branding and session pushes. Coin credit is
-  // published by the ESP32 the moment the pulse is attributed, so the customer
-  // sees it without waiting for the next poll — and it costs zero extra
-  // RouterOS traffic because the stream is served by the appliance itself.
+  // EventSource is optional and DMA-costly on the appliance. Connect only while
+  // the coin modal is open (live credit) or a paid session is active. Idle
+  // captive tabs stay off the stream (standby).
   function connectPortalEvents() {
-    if (brandingEventSource) { brandingEventSource.close(); brandingEventSource = null; }
+    if (brandingEventSource) return;
     try {
       brandingEventSource = new EventSource(EVENTS_BASE + "/api/events");
       brandingEventSource.addEventListener("portal.changed", function () {
@@ -608,9 +761,52 @@
         });
       });
       brandingEventSource.onerror = function () {
-        // EventSource reconnects on its own; polling remains the safety net.
+        // Do not auto-reconnect forever while idle — policy reconnects when needed.
+        disconnectPortalEvents();
+        if (needsPortalLiveChannel()) {
+          window.setTimeout(function () {
+            if (needsPortalLiveChannel()) connectPortalEvents();
+          }, 5000);
+        }
       };
     } catch (e) {}
+  }
+
+  function disconnectPortalEvents() {
+    if (!brandingEventSource) return;
+    try { brandingEventSource.close(); } catch (e) {}
+    brandingEventSource = null;
+  }
+
+  function needsPortalLiveChannel() {
+    if (document.hidden) return false;
+    if (state.coinSessionActive || coinModalVisible) return true;
+    if (state.connected && displaySeconds() > 0 && !state.paused) return true;
+    return false;
+  }
+
+  function needsActiveSessionSync() {
+    if (document.hidden) return false;
+    if (state.coinSessionActive || coinModalVisible) return false; // coin poll owns this
+    // Active internet grant — rare sync to re-anchor local countdown.
+    if (state.connected && displaySeconds() > 0 && !state.paused) return true;
+    // Activating — keep short-lived sync until settled (waitForActivation also polls).
+    if (state.sessionState === "activating") return true;
+    return false;
+  }
+
+  // Standby when idle: no heartbeat, no SSE. Wake on coin / active session only.
+  function updateIdleSyncPolicy() {
+    if (needsPortalLiveChannel()) {
+      connectPortalEvents();
+    } else {
+      disconnectPortalEvents();
+    }
+    if (needsActiveSessionSync()) {
+      startActiveSessionSync();
+    } else {
+      stopActiveSessionSync();
+    }
   }
 
   // A pushed payload is only applied when it belongs to this device — the
@@ -632,7 +828,11 @@
     if (!session) return;
     noteApplianceSuccess();
     applyNormalizedSession(session, isCoinCredit);
-    if (isCoinCredit) renderCoinModal();
+    if (isCoinCredit) {
+      renderCoinModal();
+    } else {
+      render();
+    }
   }
 
   function apiGet(path) {
@@ -712,8 +912,12 @@
     });
   }
   function donePayingAPI()         { return portalPost("/done-paying",        deviceParams()).then(normalizeSession); }
-  function pauseSessionAPI()       { return portalPost("/pause",              deviceParams()); }
-  function resumeSessionAPI()      { return portalPost("/resume",             deviceParams()); }
+  function pauseSessionAPI() {
+    return portalPost("/pause", deviceParams()).then(normalizeSession);
+  }
+  function resumeSessionAPI() {
+    return portalPost("/resume", deviceParams()).then(normalizeSession);
+  }
   function cancelCoinModalAPI()    { return portalPost("/cancel-modal",       deviceParams()).then(normalizeSession); }
   function heartbeatAPI()          { return portalPost("/heartbeat",          deviceParams()); }
   function fetchRatesAPI()         { return portalGet("/rates").then(normalizeRatesPayload); }
@@ -820,6 +1024,7 @@
       state.coinCountdown = Number(serverCountdown) || state.coinCountdown || INSERT_TIMEOUT;
       anchorCoinWindow(state.coinCountdown);
       renderCoinModal();
+      updateIdleSyncPolicy();
       return;
     }
 
@@ -846,6 +1051,7 @@
     playMusic();
     renderCoinModal();
     startCoinSessionPoll();
+    updateIdleSyncPolicy();
 
     // Repaint only — the window deadline is the ESP32's coinWindowRemaining,
     // re-anchored on every payload, so the modal cannot outlive the firmware
@@ -880,6 +1086,7 @@
     lastWindowInserted       = 0;
     stopMusic();
     saveStateCache();
+    updateIdleSyncPolicy();
   }
 
   function showPortalError(message) {
@@ -1124,8 +1331,9 @@
       dom.statusEl.classList.remove("disconnected");
     }
     apiCall()
-      .then(function () {
+      .then(function (session) {
         noteApplianceSuccess();
+        if (session) applyNormalizedSession(session, false);
         // Pause/resume authorization happens on the router worker; re-read the
         // session so the button and countdown reflect the settled state rather
         // than an optimistic guess.
@@ -1297,7 +1505,15 @@
         setVoucherBusy(false, "Voucher active on this device.", false);
       })
       .catch(function (err) {
-        noteApplianceFailure();
+        var code = (err && err.code) || "";
+        // Known voucher/API reasons are not "appliance dead" — avoid the
+        // generic Payment service banner for CLOCK_NOT_READY / not-found.
+        if (code !== "CLOCK_NOT_READY" && code !== "VOUCHER_NOT_FOUND" &&
+            code !== "VOUCHER_BOUND_TO_ANOTHER_DEVICE" &&
+            code !== "VOUCHER_EXPIRED" && code !== "VOUCHER_UNAVAILABLE" &&
+            code !== "COIN_SESSION_ACTIVE") {
+          noteApplianceFailure();
+        }
         setVoucherBusy(false, err && err.message ? err.message :
           "Voucher activation failed.", true);
       });
@@ -1386,19 +1602,25 @@
     }, 1000);
   }
 
-  function heartbeat() {
+  function activeSessionSyncTick() {
     heartbeatAPI()
       .then(function () {
-        // syncSessionFromServer() already tracks its own success/failure —
-        // swallow here so a sync failure isn't double-counted below.
         return syncSessionFromServer().catch(function () {});
       })
-      .catch(function () { noteApplianceFailure(); });
+      .catch(function () { noteApplianceFailure(); })
+      .finally(function () {
+        updateIdleSyncPolicy();
+      });
   }
 
-  function startHeartbeat() {
+  function startActiveSessionSync() {
+    if (heartbeatTimer) return;
+    heartbeatTimer = setInterval(activeSessionSyncTick, ACTIVE_SYNC_MS);
+  }
+
+  function stopActiveSessionSync() {
     clearInterval(heartbeatTimer);
-    heartbeatTimer = setInterval(heartbeat, HEARTBEAT_MS);
+    heartbeatTimer = null;
   }
 
   // ── render ─────────────────────────────────────────────────────────────────
@@ -1420,7 +1642,10 @@
     var st = state.sessionState || "";
     var label = "Disconnected";
     var disconnected = true;
-    if (st === "activating") {
+    if (!sessionHydrated && state.secondsLeft > 0) {
+      label = "Connecting…";
+      disconnected = false;
+    } else if (st === "activating") {
       label = "Activating…";
       disconnected = false;
     } else if (st === "waiting_coin") {
@@ -1483,7 +1708,8 @@
       dom.pauseButtonText.textContent = label;
     }
     if (dom.pauseButton) {
-      dom.pauseButton.hidden = !state.canPause && !state.canResume;
+      dom.pauseButton.hidden = !sessionHydrated ||
+        (!state.canPause && !state.canResume);
       dom.pauseButton.setAttribute("aria-pressed", state.paused ? "true" : "false");
       if (state.sessionState === "activation_error") {
         dom.pauseButton.title = state.activationErrorReason ||
@@ -1500,7 +1726,7 @@
   function renderTerminateBtn() {
     if (!dom.terminateBtn) return;
     var hasSession = state.secondsLeft > 0 || state.paused;
-    dom.terminateBtn.hidden = !hasSession || !state.canTerminate;
+    dom.terminateBtn.hidden = !sessionHydrated || !hasSession || !state.canTerminate;
   }
 
   function renderVoucherControls() {
@@ -1592,34 +1818,51 @@
 
     storageKey = STORAGE_PREFIX + ":" + getDeviceKey();
     state = loadCachedState();
-    // Show the cached value frozen until the firmware speaks; it is a
-    // placeholder, not a running clock.
     anchorSession(state.secondsLeft, false);
     render();
 
-    // Issue 2: initial fetch uses trustFully=true (fresh load)
-    fetchSession()
-      .then(function (result) {
-        noteApplianceSuccess();
-        var session = applyFetchedSession(result, true);
-        if (session) {
-          if (session.coinSessionActive) restoreCoinSessionUI();
-          return maybeReconnectVoucher(session).then(function () {
+    loadBranding()
+      .finally(function () {
+        fetchSession()
+          .then(function (result) {
+            noteApplianceSuccess();
+            var session = applyFetchedSession(result, true);
+            if (session) {
+              if (session.coinSessionActive) restoreCoinSessionUI();
+              return maybeReconnectVoucher(session).then(function () {
+                startMainTimer();
+                updateIdleSyncPolicy();
+              });
+            }
             startMainTimer();
+            updateIdleSyncPolicy();
+          })
+          .catch(function () {
+            noteApplianceFailure();
+            if (state.secondsLeft > 0) {
+              showServiceNotice();
+            }
+            startMainTimer();
+            render();
+            updateIdleSyncPolicy();
           });
-        }
-        startMainTimer();
-      })
-      .catch(function () {
-        noteApplianceFailure();
-        startMainTimer();
-      });
 
-    bindEvents();
-    loadBranding();
-    connectPortalEvents();
-    setInterval(renderDate, 1000);
-    startHeartbeat();
+        bindEvents();
+        setInterval(renderDate, 1000);
+        // Standby: no heartbeat / SSE until coin modal or active session.
+        updateIdleSyncPolicy();
+        document.addEventListener("visibilitychange", function () {
+          if (document.hidden) {
+            stopActiveSessionSync();
+            disconnectPortalEvents();
+            return;
+          }
+          // One wake sync, then policy decides whether to keep a slow interval.
+          syncSessionFromServer()
+            .catch(function () {})
+            .finally(function () { updateIdleSyncPolicy(); });
+        });
+      });
 
     window.RenzFiPortalCoinDetected = function (amount) {
       syncSessionFromServer().catch(function () {

@@ -1,7 +1,9 @@
 #include "HttpPlaneGate.h"
 
 #include "AuthManager.h"
+#include "DmaMemoryMonitor.h"
 #include "EthernetManager.h"
+#include "FactoryResetWorker.h"
 #include "ManagementApConfig.h"
 #include "WebRequestDiagnostics.h"
 #include "WebResponse.h"
@@ -12,6 +14,7 @@ namespace {
 
 EthernetManager *g_eth = nullptr;
 AuthManager *g_auth = nullptr;
+FactoryResetWorker *g_factoryReset = nullptr;
 
 Plane classifyLocalIp(const IPAddress &local) {
   if (local == ManagementApConfig::IP) return Plane::Setup;
@@ -77,6 +80,19 @@ void rejectCustomerPortal(AsyncWebServerRequest *req) {
       "CUSTOMER_PORTAL_RESTRICTED");
 }
 
+void rejectFactoryResetBusy(AsyncWebServerRequest *req) {
+  if (!req) return;
+  const DmaMemoryMonitor::Snapshot snap = DmaMemoryMonitor::readSnapshot();
+  Serial.printf(
+      "[http-quiesce] rejected method=%s path=%s dma_free=%u dma_largest=%u\n",
+      req->methodToString(), req->url().c_str(),
+      static_cast<unsigned>(snap.freeDma),
+      static_cast<unsigned>(snap.largestDma));
+  // Match existing FACTORY_RESET_IN_PROGRESS contract (409) used by enqueue.
+  WebResponse::serveErrorJson(req, 409, "Factory reset is in progress",
+                              "FACTORY_RESET_IN_PROGRESS");
+}
+
 }  // namespace
 
 void bindEthernet(EthernetManager *eth) {
@@ -85,6 +101,31 @@ void bindEthernet(EthernetManager *eth) {
 
 void bindAuth(AuthManager *auth) {
   g_auth = auth;
+}
+
+void bindFactoryReset(FactoryResetWorker *factoryReset) {
+  g_factoryReset = factoryReset;
+}
+
+bool isFactoryResetBusy() {
+  return g_factoryReset && g_factoryReset->busy();
+}
+
+bool isFactoryResetAllowListed(AsyncWebServerRequest *req) {
+  if (!req) return false;
+  const String &url = req->url();
+  if (url == "/api/system/factory-reset") return true;
+  if (url.startsWith("/api/system/factory-reset?")) return true;
+  if (url == "/api/system/factory-reset/status") return true;
+  if (url.startsWith("/api/system/factory-reset/status?")) return true;
+  return false;
+}
+
+bool ensureNotFactoryResetting(AsyncWebServerRequest *req) {
+  if (!isFactoryResetBusy()) return true;
+  if (isFactoryResetAllowListed(req)) return true;
+  rejectFactoryResetBusy(req);
+  return false;
 }
 
 Plane classify(AsyncWebServerRequest *req) {
@@ -125,12 +166,14 @@ bool isManagementClient(AsyncWebServerRequest *req) {
 }
 
 bool ensureSetupPlane(AsyncWebServerRequest *req) {
+  if (!ensureNotFactoryResetting(req)) return false;
   if (isSetupPlane(req)) return true;
   rejectPlane(req, Plane::Setup);
   return false;
 }
 
 bool ensureProductionPlane(AsyncWebServerRequest *req) {
+  if (!ensureNotFactoryResetting(req)) return false;
   if (isProductionPlane(req)) return true;
   rejectPlane(req, Plane::Production);
   return false;
@@ -193,6 +236,7 @@ bool ensureAdminAccess(AsyncWebServerRequest *req) {
 }
 
 bool ensureAppliancePlane(AsyncWebServerRequest *req) {
+  if (!ensureNotFactoryResetting(req)) return false;
   const Plane plane = classify(req);
   if (plane == Plane::Setup || plane == Plane::Production) return true;
   WebResponse::serveErrorJson(req, 403, "Unknown network interface",

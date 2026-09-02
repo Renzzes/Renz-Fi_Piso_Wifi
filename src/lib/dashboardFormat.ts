@@ -59,3 +59,42 @@ export function formatRouterMemory(freeBytes?: string, totalBytes?: string): str
   const totalMb = total / 1024 / 1024;
   return `${usedMb.toFixed(0)} / ${totalMb.toFixed(0)} MB`;
 }
+
+/** RouterOS HDD fields from /system/resource/print (byte counts as strings). */
+export function formatRouterHddBytes(bytes?: string): string {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return "N/A";
+  return formatStorageFromMb(value / 1024 / 1024);
+}
+
+export function formatRouterHddOverview(
+  freeBytes?: string,
+  totalBytes?: string,
+): {
+  total: string;
+  used: string;
+  available: string;
+  usagePct: string;
+} {
+  const total = Number(totalBytes);
+  const free = Number(freeBytes);
+  if (!Number.isFinite(total) || !Number.isFinite(free) || total <= 0) {
+    return { total: "N/A", used: "N/A", available: "N/A", usagePct: "N/A", usagePctValue: 0 };
+  }
+  const used = Math.max(0, total - free);
+  const pctValue = usagePct(used, total);
+  return {
+    total: formatRouterHddBytes(totalBytes),
+    used: formatRouterHddBytes(String(used)),
+    available: formatRouterHddBytes(freeBytes),
+    usagePct: formatPercentage(pctValue),
+    usagePctValue: pctValue,
+  };
+}
+
+export function formatRouterTemperature(celsius?: string): string {
+  if (!celsius?.trim()) return "N/A";
+  const value = Number(celsius);
+  if (!Number.isFinite(value)) return "N/A";
+  return `${Math.round(value)}°C`;
+}

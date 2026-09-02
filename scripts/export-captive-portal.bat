@@ -79,8 +79,10 @@ if errorlevel 1 (
 echo.
 echo ============================================
 echo  SUCCESS
-echo  Upload ONLY the files in:
+echo  Upload ALL overlay files in:
 echo    %RENZFI_CAPTIVE_EXPORT_DIR%
-echo  to the MikroTik hotspot\ overlay.
+echo  including status.html and renzfi-style.css
+echo  into the MikroTik hotspot\ directory (overwrite matching names).
+echo  Do not skip status.html — /status is a separate Hotspot servlet.
 echo ============================================
 exit /b 0

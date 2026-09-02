@@ -1,4 +1,4 @@
-const CACHE = "renz-fi-admin-v5";
+const CACHE = "renz-fi-admin-v6";
 
 /** Admin React SPA shell paths only — captive portal (/ and /portal/*) is excluded. */
 const ADMIN_SHELL_PATHS = new Set([
@@ -66,15 +66,31 @@ self.addEventListener("fetch", (event) => {
   if (!isNavigation && !isStatic) return;
 
   event.respondWith(
-    caches.match(request).then((cached) => {
+    (async () => {
+      // Navigations must be network-first so a reload cannot stick on a stale shell/splash.
+      if (isNavigation) {
+        try {
+          const response = await fetch(request);
+          if (response && response.ok) {
+            const cache = await caches.open(CACHE);
+            void cache.put(request, response.clone());
+          }
+          return response;
+        } catch {
+          const cached = await caches.match(request);
+          if (cached) return cached;
+          throw new Error("offline");
+        }
+      }
+
+      const cached = await caches.match(request);
       const network = fetch(request).then((response) => {
-        if (response && response.ok && (isStatic || isNavigation)) {
-          caches.open(CACHE).then((cache) => cache.put(request, response.clone()));
+        if (response && response.ok && isStatic) {
+          void caches.open(CACHE).then((cache) => cache.put(request, response.clone()));
         }
         return response;
       });
-
       return cached ?? network;
-    }),
+    })(),
   );
 });

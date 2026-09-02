@@ -77,3 +77,30 @@ class PsramJsonDocument {
  private:
   JsonDocument _doc;
 };
+
+// CPU-side JSON text for SD persist. Never a W5500/WiFi DMA bounce buffer.
+struct PsramBuffer {
+  char *buf = nullptr;
+  size_t len = 0;
+  PsramBuffer() = default;
+  ~PsramBuffer() {
+    if (buf) heap_caps_free(buf);
+  }
+  PsramBuffer(const PsramBuffer &) = delete;
+  PsramBuffer &operator=(const PsramBuffer &) = delete;
+};
+
+inline bool serializeJsonToPsram(const JsonDocument &doc, PsramBuffer &out) {
+  const size_t n = measureJson(doc);
+  out.buf = static_cast<char *>(
+      heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!out.buf) {
+    out.buf = static_cast<char *>(heap_caps_malloc(n + 1, MALLOC_CAP_8BIT));
+  }
+  if (!out.buf) {
+    out.len = 0;
+    return false;
+  }
+  out.len = serializeJson(doc, out.buf, n + 1);
+  return out.len > 0;
+}

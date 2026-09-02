@@ -15,8 +15,9 @@ class StorageManager;
 
 // Optional registry of external LAN coverage APs.
 // Stage B: persist + CRUD + live IP validation.
-// Stage C: single-flight reachability worker (ICMP + TCP).
-// Does not configure APs, does not use RouterOS, does not write SD on check.
+// Stage C Check: MikroTik ARP + RouterOS ping via Router Worker (not ESP32→AP).
+// Sync (legacy): GenericApDriver ESP32 probe — Admin prefers Detect/Check.
+// Does not configure APs and does not write SD on check.
 class ExternalAccessPointManager {
  public:
   static constexpr uint8_t kMaxAccessPoints = ExternalAccessPoint::kMaxAccessPoints;
@@ -56,14 +57,21 @@ class ExternalAccessPointManager {
 
   ExternalAccessPoint::CheckEnqueueStatus enqueueCheck(const String &id,
                                                        uint32_t &jobIdOut);
+  ExternalAccessPoint::CheckEnqueueStatus enqueueSync(const String &id,
+                                                      uint32_t &jobIdOut);
   bool pollCheckJob(uint32_t jobId, CheckJobSnapshot &out) const;
   bool checkBusy() const;
+
+  // Apply result from MikroTik-backed Check (Router Worker). Updates RAM
+  // status only — no SD write.
+  void applyMikroTikCheckResult(const String &id, bool online,
+                                const char *method, uint32_t latencyMs);
 
  private:
   struct Record {
     String id;
     String name;
-    bool enabled = true;
+    bool enabled = false;
     ExternalAccessPoint::Vendor vendor = ExternalAccessPoint::Vendor::Generic;
     String model;
     String managementIp;
@@ -87,6 +95,7 @@ class ExternalAccessPointManager {
   struct CheckJob {
     uint32_t jobId = 0;
     char accessPointId[20] = {};
+    bool activateOnSuccess = false;
     ExternalAccessPoint::CheckJobState state =
         ExternalAccessPoint::CheckJobState::Idle;
     bool ok = false;
@@ -143,5 +152,8 @@ class ExternalAccessPointManager {
                  ExternalAccessPoint::ReachabilityStatus status,
                  bool latencyValid, uint32_t latencyMs, const char *errorCode,
                  const char *message);
+  ExternalAccessPoint::CheckEnqueueStatus enqueueProbeJob(const String &id,
+                                                          bool activateOnSuccess,
+                                                          uint32_t &jobIdOut);
   static void copyId(char *dest, size_t destSize, const String &id);
 };

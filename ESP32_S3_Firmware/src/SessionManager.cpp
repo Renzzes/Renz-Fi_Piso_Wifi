@@ -34,6 +34,30 @@ bool saleIsUptimeUndated(JsonObjectConst sale) {
          (recordedAt[0] == '\0' && salesIsUptimeMarker(timestamp));
 }
 
+String resolveSaleIsoDate(JsonObjectConst sale) {
+  const char *recordedAt  = sale["recorded_at"] | "";
+  const char *reportingAt = sale["reporting_at"] | "";
+  const char *connectedAt = sale["connectedAt"] | "";
+  const char *endedAt     = sale["endedAt"] | "";
+
+  String iso = salesEffectiveIsoStamp(recordedAt, reportingAt);
+  if (!iso.isEmpty()) return iso;
+
+  int y = 0, m = 0, d = 0;
+  if (connectedAt[0] != '\0' && salesParseRecordedAt(connectedAt, y, m, d)) {
+    return String(connectedAt);
+  }
+  if (endedAt[0] != '\0' && salesParseRecordedAt(endedAt, y, m, d)) {
+    return String(endedAt);
+  }
+
+  iso = salesIsoFromUptimeMarker(recordedAt);
+  if (!iso.isEmpty()) return iso;
+
+  const char *timestamp = sale["timestamp"] | "";
+  return salesIsoFromUptimeMarker(timestamp);
+}
+
 struct SalesPeriodBundle {
   SalesTotals today;
   SalesTotals week;
@@ -54,9 +78,8 @@ void accumulateUndated(SalesTotals &totals, int amount) {
 /**
  * Calendar aggregation with offline uptime-marker policy (forensic-proven):
  * - ISO recorded_at / reporting_at: filter normally.
- * - uptime-ms markers: never silently dropped; counted as undated;
- *   when wall clock is ready, also attributed to the current local calendar
- *   day so Today/Week/Month are not ₱0 while COIN rows exist.
+ * Uptime markers: resolve via connectedAt/endedAt when present, else same-boot
+ * conversion when wall clock is ready. Never attribute cross-boot undated sales to Today.
  * Does not rewrite sales.json.
  * One SD read computes all three periods (same semantics as three filters).
  */
@@ -70,17 +93,9 @@ SalesPeriodBundle aggregateAllSales(StorageManager *storage) {
     return bundle;
   }
 
-  const bool clockReady = salesTimeReady();
-  String todayIso;
-  if (clockReady) {
-    todayIso = salesRecordedAtNow();
-  }
-
-  for (JsonObjectConst sale : sales.as<JsonArray>()) {
+  for (JsonObjectConst sale : sales.as<JsonArrayConst>()) {
     const int amount = sale["amount"] | 0;
-    const char *recordedAt  = sale["recorded_at"] | "";
-    const char *reportingAt = sale["reporting_at"] | "";
-    const String iso = salesEffectiveIsoStamp(recordedAt, reportingAt);
+    const String iso = resolveSaleIsoDate(sale);
 
     if (!iso.isEmpty()) {
       accumulatePeriod(bundle.today, amount, salesIsToday(iso.c_str()));
@@ -94,15 +109,6 @@ SalesPeriodBundle aggregateAllSales(StorageManager *storage) {
     accumulateUndated(bundle.today, amount);
     accumulateUndated(bundle.week, amount);
     accumulateUndated(bundle.month, amount);
-
-    // Attribute undated sales to the current local business day once NTP/clock
-    // is ready — sales remain persisted with original uptime marker on disk.
-    if (clockReady && !todayIso.isEmpty()) {
-      // Attribute once into dated totals; undated* fields still record offline origin.
-      accumulatePeriod(bundle.today, amount, true);
-      accumulatePeriod(bundle.week, amount, true);
-      accumulatePeriod(bundle.month, amount, true);
-    }
   }
   return bundle;
 }
@@ -297,6 +303,14 @@ void SessionManager::refreshSalesSummarySnapshot() {
   SalesLock lock(_salesMutex);
   if (!lock) {
     Serial.println("[sales-cache] refresh skipped lock_busy serving_last_snapshot");
+    return;
+  }
+
+  PsramJsonDocument salesProbe;
+  JsonDocument &salesDoc = salesProbe.doc();
+  if (!_storage || !_storage->readJson(RenzFiConfig::SALES_FILE, salesDoc) ||
+      !salesDoc.is<JsonArray>()) {
+    Serial.println("[sales-cache] refresh aborted sd_read_failed");
     return;
   }
 
@@ -539,9 +553,24 @@ bool SessionManager::saveSalesBoundedLocked(JsonDocument &doc) {
   if (!_storage || !doc.is<JsonArray>() || doc.overflowed()) return false;
 
   JsonArray sales = doc.as<JsonArray>();
-  while (sales.size() > kSalesMaxRecords) sales.remove(0);
-  while (measureJson(doc) > kSalesMaxSerializedBytes && sales.size() > 1) {
+  int evictedAmount = 0;
+  int evictedCount = 0;
+  auto evictOldest = [&]() {
+    if (sales.size() == 0) return;
+    JsonObject oldest = sales[0].as<JsonObject>();
+    evictedAmount += oldest["amount"] | 0;
+    evictedCount++;
     sales.remove(0);
+  };
+  while (sales.size() > kSalesMaxRecords) evictOldest();
+  while (measureJson(doc) > kSalesMaxSerializedBytes && sales.size() > 1) {
+    evictOldest();
+  }
+  if (evictedCount > 0) {
+    Serial.printf(
+        "[sales] ring-evict count=%d amount=%d remaining=%u "
+        "(Today/Week/Month lose evicted rows)\n",
+        evictedCount, evictedAmount, (unsigned)sales.size());
   }
   if (measureJson(doc) > kSalesMaxSerializedBytes) return false;
   return _storage->writeJson(RenzFiConfig::SALES_FILE, doc);
@@ -587,14 +616,17 @@ bool SessionManager::upsertSale(const SaleRecord &sale) {
     SalesLock lock(_salesMutex);
     if (!lock) return false;
 
-    HeapJsonDocument salesHeap(RenzFiConfig::JSON_DOC_LARGE);
-    DynamicJsonDocument &salesDoc = salesHeap.doc();
+    PsramJsonDocument salesHeap;
+    JsonDocument &salesDoc = salesHeap.doc();
     if (!loadSalesLocked(salesDoc)) return false;
 
     JsonArray sales = salesDoc.as<JsonArray>();
     for (size_t i = sales.size(); i > 0; --i) {
-      const char *existingId = sales[i - 1]["id"] | "";
-      if (sale.id == existingId) sales.remove(i - 1);
+      JsonObject existing = sales[i - 1].as<JsonObject>();
+      const char *existingId = existing["id"] | "";
+      if (sale.id == existingId) {
+        sales.remove(i - 1);
+      }
     }
 
     JsonObject item = sales.createNestedObject();
@@ -634,8 +666,8 @@ bool SessionManager::markSaleActivated(const String &saleId,
     SalesLock lock(_salesMutex);
     if (!lock) return false;
 
-    HeapJsonDocument salesHeap(RenzFiConfig::JSON_DOC_LARGE);
-    DynamicJsonDocument &salesDoc = salesHeap.doc();
+    PsramJsonDocument salesHeap;
+    JsonDocument &salesDoc = salesHeap.doc();
     if (!loadSalesLocked(salesDoc)) return false;
 
     for (JsonObject sale : salesDoc.as<JsonArray>()) {
@@ -664,8 +696,8 @@ bool SessionManager::markSalesActivatedBySessionId(
   {
     SalesLock lock(_salesMutex);
     if (!lock) return false;
-    HeapJsonDocument salesHeap(RenzFiConfig::JSON_DOC_LARGE);
-    DynamicJsonDocument &salesDoc = salesHeap.doc();
+    PsramJsonDocument salesHeap;
+    JsonDocument &salesDoc = salesHeap.doc();
     if (!loadSalesLocked(salesDoc)) return false;
     for (JsonObject sale : salesDoc.as<JsonArray>()) {
       if (sessionId != (sale["sessionId"] | "")) continue;
@@ -699,8 +731,8 @@ bool SessionManager::recordSessionEvent(const String &sessionId,
   {
     SalesLock lock(_salesMutex);
     if (!lock) return false;
-    HeapJsonDocument salesHeap(RenzFiConfig::JSON_DOC_LARGE);
-    DynamicJsonDocument &salesDoc = salesHeap.doc();
+    PsramJsonDocument salesHeap;
+    JsonDocument &salesDoc = salesHeap.doc();
     if (!loadSalesLocked(salesDoc)) return false;
     for (JsonObject sale : salesDoc.as<JsonArray>()) {
       if (sessionId != (sale["sessionId"] | "")) continue;
@@ -729,8 +761,8 @@ bool SessionManager::completeSaleBySessionId(
     SalesLock lock(_salesMutex);
     if (!lock) return false;
 
-    HeapJsonDocument salesHeap(RenzFiConfig::JSON_DOC_LARGE);
-    DynamicJsonDocument &salesDoc = salesHeap.doc();
+    PsramJsonDocument salesHeap;
+    JsonDocument &salesDoc = salesHeap.doc();
     if (!loadSalesLocked(salesDoc)) return false;
 
     for (JsonObject sale : salesDoc.as<JsonArray>()) {
@@ -845,38 +877,30 @@ bool SessionManager::salesHistory(JsonDocument &doc) {
     }
   }
 
-  for (JsonObject sale : sales.as<JsonArray>()) {
+  for (JsonObjectConst sale : sales.as<JsonArrayConst>()) {
     const int amount = sale["amount"] | 0;
-    const char *recordedAt  = sale["recorded_at"] | "";
-    const char *reportingAt = sale["reporting_at"] | "";
-    const String iso = salesEffectiveIsoStamp(recordedAt, reportingAt);
-    int year = 0, month = 0, day = 0;
+    const String iso = resolveSaleIsoDate(sale);
 
-    if (!iso.isEmpty() && salesParseRecordedAt(iso.c_str(), year, month, day)) {
-      char dateKey[11];
-      snprintf(dateKey, sizeof(dateKey), "%04d-%02d-%02d", year, month, day);
-      if (!buckets[dateKey].is<JsonObject>()) {
-        buckets[dateKey]["date"]     = dateKey;
-        buckets[dateKey]["sessions"] = 0;
-        buckets[dateKey]["revenue"]  = 0;
-      }
-      buckets[dateKey]["sessions"] = (buckets[dateKey]["sessions"] | 0) + 1;
-      buckets[dateKey]["revenue"]  = (buckets[dateKey]["revenue"] | 0) + amount;
+    char dateKey[11];
+    dateKey[0] = '\0';
+    if (!iso.isEmpty() && iso.length() >= 10) {
+      memcpy(dateKey, iso.c_str(), 10);
+      dateKey[10] = '\0';
+    } else if (saleIsUptimeUndated(sale)) {
+      undatedRevenue += amount;
+      undatedSessions++;
+      continue;
+    } else {
       continue;
     }
 
-    if (!saleIsUptimeUndated(sale)) continue;
-    undatedRevenue += amount;
-    undatedSessions++;
-    if (!todayKey.isEmpty()) {
-      if (!buckets[todayKey].is<JsonObject>()) {
-        buckets[todayKey]["date"]     = todayKey;
-        buckets[todayKey]["sessions"] = 0;
-        buckets[todayKey]["revenue"]  = 0;
-      }
-      buckets[todayKey]["sessions"] = (buckets[todayKey]["sessions"] | 0) + 1;
-      buckets[todayKey]["revenue"]  = (buckets[todayKey]["revenue"] | 0) + amount;
+    if (!buckets[dateKey].is<JsonObject>()) {
+      buckets[dateKey]["date"]     = dateKey;
+      buckets[dateKey]["sessions"] = 0;
+      buckets[dateKey]["revenue"]  = 0;
     }
+    buckets[dateKey]["sessions"] = (buckets[dateKey]["sessions"] | 0) + 1;
+    buckets[dateKey]["revenue"]  = (buckets[dateKey]["revenue"] | 0) + amount;
   }
 
   if (undatedSessions > 0 && todayKey.isEmpty()) {
@@ -992,20 +1016,15 @@ bool SessionManager::salesChart(JsonDocument &doc, int days) {
   }
 
   size_t matchedSales = 0;
-  for (JsonObject sale : sales.as<JsonArray>()) {
+  for (JsonObjectConst sale : sales.as<JsonArrayConst>()) {
     const int amount = sale["amount"] | 0;
-    const char *recordedAt  = sale["recorded_at"] | "";
-    const char *reportingAt = sale["reporting_at"] | "";
-    const String iso = salesEffectiveIsoStamp(recordedAt, reportingAt);
+    const String iso = resolveSaleIsoDate(sale);
 
     char dateKey[11];
     dateKey[0] = '\0';
     if (!iso.isEmpty() && iso.length() >= 10) {
       memcpy(dateKey, iso.c_str(), 10);
       dateKey[10] = '\0';
-    } else if (saleIsUptimeUndated(sale)) {
-      // Attribute undated COIN sales to today's chart bucket when clock ready.
-      memcpy(dateKey, dateKeys[days - 1], 11);
     } else {
       continue;
     }
@@ -1081,7 +1100,8 @@ bool SessionManager::buildSalesCsv(String &csvOut, String &filenameOut) {
       "Expires At,Operator,Connected At,Ended At,Connected Seconds,"
       "Termination Reason\n";
 
-  DynamicJsonDocument sales(RenzFiConfig::JSON_DOC_LARGE);
+  PsramJsonDocument salesHeap;
+  JsonDocument &sales = salesHeap.doc();
   if (_storage && _storage->readJson(RenzFiConfig::SALES_FILE, sales) &&
       sales.is<JsonArray>()) {
     for (JsonObject sale : sales.as<JsonArray>()) {

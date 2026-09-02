@@ -1,12 +1,15 @@
 #include "ProductionNetworkTrace.h"
 
 #include "Config.h"
+#include "RenzFiDebug.h"
 #include "RouterOsClient.h"
 
 namespace ProductionNetworkTrace {
 namespace {
 
 bool g_active = false;
+
+#if RENZFI_DEBUG_ROUTER
 
 const char *readFailCategory(RouterOsClient &client) {
   const String &code = client.lastErrorCode();
@@ -26,6 +29,8 @@ void logBoolLine(const char *key, bool value) {
   Serial.printf("[production-network] %s=%s\n", key, value ? "yes" : "no");
 }
 
+#endif  // RENZFI_DEBUG_ROUTER
+
 }  // namespace
 
 void enter() { g_active = true; }
@@ -33,6 +38,8 @@ void enter() { g_active = true; }
 void exit() { g_active = false; }
 
 bool active() { return g_active; }
+
+#if RENZFI_DEBUG_ROUTER
 
 void logSessionState(RouterOsClient &client) {
   if (!g_active) return;
@@ -145,5 +152,19 @@ void logWirelessEnableOutcome(bool disabledAfterConfig, bool enableCommandSent,
   Serial.printf("[production-network] WIRELESS RUNNING=%s\n",
                 runningLabel && runningLabel[0] ? runningLabel : "unknown");
 }
+
+#else  // RENZFI_DEBUG_ROUTER
+
+void logSessionState(RouterOsClient &) {}
+void logCmdBegin(const char *) {}
+void logCmdEnd(RouterOsClient &, const char *, uint32_t,
+               const RouterOsClient::CommandResult &, bool) {}
+void logReturnFalse(const char *, const char *, const char *, const char *,
+                    const char *) {}
+void logStageFailureStatement(const char *) {}
+void logActivationSummary(bool, bool, bool, bool) {}
+void logWirelessEnableOutcome(bool, bool, bool, const char *) {}
+
+#endif  // RENZFI_DEBUG_ROUTER
 
 }  // namespace ProductionNetworkTrace

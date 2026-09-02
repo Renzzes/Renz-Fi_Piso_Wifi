@@ -45,7 +45,9 @@ Failed TWDT task: `async_tcp` (CPU1) while CPU1 was executing `loopTask`.
 **Production-safe correction:**
 
 - Heavy SPIFFS snapshot work throttled (~30 s) via `STORAGE_SNAPSHOT_HEAVY_INTERVAL_MS`
-- Lightweight snapshot fields remain frequent
+- Lightweight snapshot fields still update frequently; **capacity probes** throttled (~10 s) via `STORAGE_SNAPSHOT_CAPACITY_INTERVAL_MS`
+- Router health cache + device friendly-name SD reads throttled (~30 s) — see `docs/ADMIN_LOGIN_FAILED_ASYNCTCP_TWDT_FORENSIC.md` (ELF `260f442c4`)
+- `STORAGE_LOCK` wait for task `async_tcp` capped at `STORAGE_LOCK_ASYNC_TCP_WAIT_MS` (never the full 5 s TWDT window)
 - No durability weakening
 - No TWDT timeout / disable / feed
 - No architectural redesign of StorageManager durability

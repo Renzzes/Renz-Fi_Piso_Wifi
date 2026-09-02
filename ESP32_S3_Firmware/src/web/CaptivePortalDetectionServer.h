@@ -4,6 +4,7 @@
 
 #include "IWebRouteProvider.h"
 
+class RouterProvisioningWorker;
 class WebServerManager;
 
 // Answers the small set of well-known "is there a captive portal?" probe
@@ -16,12 +17,19 @@ class WebServerManager;
 // normal 404/route chain) when the request did not arrive via the
 // Management AP's own IP, so they never interfere with LAN-side clients,
 // the admin app, or the MikroTik-hosted customer captive portal.
+//
+// During RouterOS setup jobs or low DMA headroom, probes return cheap 204
+// instead of 302→wizard HTML so SoftAP WiFi/coex DMA is not stormed while
+// configure / SSID discovery runs (see SETUP_STEP4_SOFTAP_WIFI_DMA_GURU_FORENSIC).
 class CaptivePortalDetectionServer : public IWebRouteProvider {
  public:
+  void begin(RouterProvisioningWorker *routerWorker = nullptr);
   void registerRoutes(WebServerManager &web) override;
   const char *providerName() const override;
 
  private:
   void handleProbe(AsyncWebServerRequest *req);
   bool isManagementApRequest(AsyncWebServerRequest *req) const;
+
+  RouterProvisioningWorker *_routerWorker = nullptr;
 };

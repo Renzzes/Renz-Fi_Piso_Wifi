@@ -39,6 +39,7 @@ const char *ErrorHandler::titleForStatus(int status) {
 
 void ErrorHandler::serve(AsyncWebServerRequest *req, int status) {
   if (!req) return;
+  if (!WebResponse::ensureEthTransmitHeadroom(req, "error-page")) return;
   AsyncWebServerResponse *res =
       req->beginResponse(status, "text/html; charset=utf-8", buildPage(status));
   WebResponse::addCorsHeaders(res);

@@ -33,6 +33,7 @@
 #include "WebServerManager.h"
 #include "ExistingNetworkScanCache.h"
 #include "WifiDiscoveryCache.h"
+#include "DmaMemoryMonitor.h"
 
 namespace {
 
@@ -411,10 +412,11 @@ void serveSetupPage(InstallationStateManager *installation,
         "e.textContent=(res.json&&res.json.error)||'Unlock failed';e.style.display='block';})"
         ".catch(function(){e.textContent='Network error';e.style.display='block';});};"
         "</script></main></body></html>";
-    req->send(200, "text/html; charset=utf-8", FPSTR(kSetupLockedHtml));
+    req->send(200, "text/html; charset=utf-8", kSetupLockedHtml);
     return;
   }
-  req->send(200, "text/html; charset=utf-8", FPSTR(kSetupWizardPageHtml));
+  // Stream PROGMEM HTML (const char*) — do not wrap in FPSTR/String (RAM + SoftAP DMA).
+  req->send(200, "text/html; charset=utf-8", kSetupWizardPageHtml);
 }
 
 bool ensureSetupWizardEnabled(InstallationStateManager *installation,
@@ -550,6 +552,10 @@ bool ensureSetupOwnerOnly(AuthManager *auth, AsyncWebServerRequest *req) {
 
 }  // namespace
 
+void SetupServer::servePage(AsyncWebServerRequest *req) {
+  serveSetupPage(_installation, _provisioning, req);
+}
+
 bool ensureRouterConfigured(InstallationStateManager *installation,
                             AsyncWebServerRequest *req) {
   if (installation &&
@@ -597,9 +603,9 @@ void SetupServer::registerRoutes(WebServerManager &web) {
     WebResponse::serveJson(req, 200, json);
   });
 
-  // GET /, /login, /dashboard are plane-aware and registered once by
-  // WebServerManager::registerAdminEntryRoute (first-match). Do not
-  // re-register here — SetupServer's ensureSetupPlane would reject Ethernet
+  // GET /, /login, /dashboard, /admin are plane-aware and registered once by
+  // WebServerManager::registerAdminEntryRoute (SoftAP -> /admin/setup, ETH -> SPA).
+  // Do not re-register here — SetupServer's ensureSetupPlane would reject Ethernet
   // clients with JSON 403 and steal the production admin entry.
 
   server.on("/admin/setup", HTTP_GET, [this](AsyncWebServerRequest *req) {
@@ -618,6 +624,9 @@ void SetupServer::registerRoutes(WebServerManager &web) {
     WebRequestDiagnostics::RequestTimer timer(req, "SetupServer/api/setup/status");
     if (!HttpPlaneGate::ensureSetupPlane(req)) return;
     if (_provisioning) _provisioning->enforceActiveUnlockSession();
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_DMA) < 4096) {
+      DmaMemoryMonitor::logTrace("setup-status-before-json");
+    }
 
     // Polled every 250 ms after Step 4 Finish. JSON_DOC_MEDIUM (8192) on the
     // default heap is INTERNAL/DMA SRAM (N16R8 remaining-issues class).
@@ -628,6 +637,9 @@ void SetupServer::registerRoutes(WebServerManager &web) {
     JsonObject data        = envelope.createNestedObject("data");
     fillSetupStatusData(_provisioning, _eth, data, _wizardConfig, _networkSettings,
                         _routerProvisioning, _routerWorker);
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_DMA) < 4096) {
+      DmaMemoryMonitor::logTrace("setup-status-after-json");
+    }
     Serial.printf(
         "[setup] status installationState=%s wizardStep=%s productionMode=%s\n",
         _installation ? installationStateLabel(_installation->current()) : "unknown",
@@ -646,7 +658,11 @@ void SetupServer::registerRoutes(WebServerManager &web) {
                                       "INTERNAL_ERROR");
           return;
         }
-        if (!_installation->isReady()) {
+        // Only skip password when Setup is already open. Never short-circuit on
+        // !isReady() alone — lock UI also locks for ownerCreated mid-install
+        // (docs/SETUP_LOCKED_PASSWORD_FAILURE_FORENSIC.md).
+        if (!_provisioning->requiresSetupUnlock() ||
+            _provisioning->hasActiveSetupUnlockSession()) {
           HeapJsonDocument responseDoc(RenzFiConfig::JSON_DOC_SMALL);
           DynamicJsonDocument &envelope = responseDoc.doc();
           envelope["success"]           = true;
@@ -677,9 +693,12 @@ void SetupServer::registerRoutes(WebServerManager &web) {
                                       "SETUP_UNLOCK_INVALID");
           return;
         }
-        if (_installation && _installation->isReady()) {
+        if (_installation->isReady()) {
           _installation->reopenSetupWizard();
         }
+        Serial.printf(
+            "[setup] unlock ok installationState=%s setupLocked=false\n",
+            installationStateLabel(_installation->current()));
         HeapJsonDocument responseDoc(RenzFiConfig::JSON_DOC_SMALL);
         DynamicJsonDocument &envelope = responseDoc.doc();
         envelope["success"]           = true;
@@ -1252,6 +1271,7 @@ void SetupServer::registerRoutes(WebServerManager &web) {
       "/api/setup/router/wifi/selection", HTTP_POST,
       [this](AsyncWebServerRequest *req) {
         WebRequestDiagnostics::RequestTimer timer(req, "SetupServer/wifi/selection");
+        DmaMemoryMonitor::logTrace("wifi-selection-enter");
         if (!HttpPlaneGate::ensureSetupPlane(req)) return;
         if (!ensureSetupWizardEnabled(_installation, _provisioning, req)) return;
         if (!ensureOwnerCreated(_installation, req)) return;
@@ -1302,6 +1322,7 @@ void SetupServer::registerRoutes(WebServerManager &web) {
         envelope["success"] = true;
         envelope["message"] = result.errorMessage;
         timer.finish();
+        DmaMemoryMonitor::logTrace("wifi-selection-before-response");
         // 202 while durable commit is pending — do not claim SD write done.
         WebResponse::serveJsonEnvelope(req, result.httpStatus, envelope);
       },
@@ -1328,9 +1349,11 @@ void SetupServer::registerRoutes(WebServerManager &web) {
         OwnedBodyGuard bodyGuard(static_cast<char *>(req->_tempObject));
         req->_tempObject = nullptr;
 
+        DmaMemoryMonitor::logTrace("configure-existing-before-enqueue");
         const auto outcome =
             _routerWorker->enqueueConfigureExistingNetwork(bodyGuard.body);
         timer.finish();
+        DmaMemoryMonitor::logTrace("configure-existing-after-enqueue");
         if (!outcome.accepted) {
           WebResponse::serveJson(req, 503,
                                  buildSetupErrorJsonBody("Router worker is busy",

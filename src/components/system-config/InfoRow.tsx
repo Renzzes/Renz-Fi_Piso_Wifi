@@ -22,7 +22,7 @@ export function InfoRow({
       ) : (
         <span
           className={cn(
-            "min-w-0 max-w-[65%] truncate text-right font-medium",
+            "min-w-0 max-w-[58%] break-words text-right font-medium leading-snug",
             mono && "font-mono text-[12px] tabular-nums",
           )}
         >

@@ -46,6 +46,8 @@ export const embeddedApi = {
   coin: "/api/coin",
   router: "/api/router",
   accessPoints: "/api/access-points",
+  contentFilter: "/api/content-filter",
+  gamingPriority: "/api/gaming-priority",
   auth: "/api/auth",
   events: "/api/events",
 };

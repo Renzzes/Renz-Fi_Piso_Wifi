@@ -235,7 +235,7 @@ export function StorageUsageCard({
   );
 }
 
-function StorageBar({
+export function StorageBar({
   label,
   value,
   percent,
@@ -277,7 +277,7 @@ const QUICK_ACTIONS: Array<{
   { to: "/system-settings", label: "System Settings", icon: Settings, ownerOnly: true },
 ];
 
-export function QuickActionsCard({
+export function QuickActionsBar({
   isOwner,
   permissions,
 }: {
@@ -292,23 +292,36 @@ export function QuickActionsCard({
     return permissions.includes(key);
   });
   return (
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+      {actions.map((item) => {
+        const Icon = item.icon;
+        return (
+          <Link
+            key={item.to}
+            to={item.to}
+            className="flex min-h-[72px] flex-col items-center justify-center gap-1.5 rounded-lg border border-border/70 bg-card px-2 py-2.5 text-center text-[11px] font-semibold text-foreground shadow-sm transition-colors hover:border-primary/40 hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <Icon className="h-4 w-4 shrink-0 text-primary" aria-hidden />
+            <span className="leading-tight">{item.label}</span>
+          </Link>
+        );
+      })}
+    </div>
+  );
+}
+
+/** @deprecated Use QuickActionsBar — kept for backward compatibility during layout migration. */
+export function QuickActionsCard({
+  isOwner,
+  permissions,
+}: {
+  isOwner: boolean;
+  permissions: OperatorPermission[];
+}) {
+  return (
     <DashboardCard>
       <DashboardCardHeader title="Quick Actions" />
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-        {actions.map((item) => {
-          const Icon = item.icon;
-          return (
-            <Link
-              key={item.to}
-              to={item.to}
-              className="flex min-h-[76px] flex-col items-center justify-center gap-1.5 rounded-xl border bg-muted/40 px-2 py-3 text-center text-[12px] font-medium text-foreground transition-colors hover:border-primary/40 hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <Icon className="h-4 w-4 text-primary" aria-hidden />
-              {item.label}
-            </Link>
-          );
-        })}
-      </div>
+      <QuickActionsBar isOwner={isOwner} permissions={permissions} />
     </DashboardCard>
   );
 }

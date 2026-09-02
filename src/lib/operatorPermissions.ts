@@ -44,15 +44,18 @@ export function pathPermission(path: string): OperatorPermission | null {
     "/captive-portal": "captive-portal",
     "/coin-settings": "coin-settings",
     "/system-configuration": "system-configuration",
+    "/network": "system-configuration",
+    "/router-status": "system-configuration",
+    "/bandwidth": "system-configuration",
+    "/storage": "system-configuration",
+    "/wireless": "system-configuration",
     "/logs": "logs",
     "/firmware": "firmware",
   };
   return map[path] ?? null;
 }
 
-export function normalizeOperatorPermissions(
-  raw: unknown,
-): OperatorPermission[] {
+export function normalizeOperatorPermissions(raw: unknown): OperatorPermission[] {
   if (!Array.isArray(raw)) return [...DEFAULT_OPERATOR_PERMISSIONS];
   const allowed = new Set<string>(OPERATOR_PERMISSION_KEYS);
   const out: OperatorPermission[] = [];

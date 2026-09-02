@@ -6,6 +6,7 @@
 #include <freertos/semphr.h>
 
 #include "EventBus.h"
+#include "JsonHeap.h"
 #include "Logger.h"
 #include "router/RouterPlatform.h"
 #include "PromoManager.h"
@@ -39,6 +40,8 @@ class PortalSessionManager {
              VoucherManager* vouchers = nullptr,
              SessionManager* sessions = nullptr);
   void loop();
+  /** Reload portal_sessions.json from storage after SD/SPIFFS reconcile. */
+  bool reloadFromStorage();
 
   bool getSession(const String& mac, const String& ip, JsonDocument& out);
   bool startCoinWindow(const String& mac, const String& ip);
@@ -46,7 +49,8 @@ class PortalSessionManager {
   bool donePaying(const String& mac, String& errorCode,
                   const String& ip = String());
   // Customer pause is capped at kMaxCustomerPauses per purchased session.
-  // Owner/admin pause passes enforceLimit=false and is never capped.
+  // Owner disconnect/suspend uses enforceLimit=false; admin Pause uses the
+  // same customer budget so the portal button stays accurate.
   bool pause(const String& mac, String* errorCode = nullptr,
              bool enforceLimit = true);
   bool resume(const String& mac, String* errorCode = nullptr);
@@ -71,11 +75,19 @@ class PortalSessionManager {
                         JsonDocument& out, String& errorCode);
   bool administerVoucher(const String& code, const String& action,
                          const String& reason, String& errorCode);
+  /** Owner/admin: drop HotSpot auth and freeze remaining time (coin + voucher). */
+  bool suspendInternet(const String& mac, String* errorCode = nullptr);
+  /** Owner/admin: restore HotSpot auth without adding time. */
+  bool reconnectInternet(const String& mac, String* errorCode = nullptr);
+  /** Owner/admin: end session, zero time, show owner notice on portal reload. */
+  bool ownerTerminateSession(const String& mac, String* errorCode = nullptr);
 
   void onCoinInserted(int pesoAmount);
   void cleanupExpired();
   void appendActiveUsers(JsonArray &out, JsonArray &seenMacs);
   bool hasActiveClientSession() const;
+  /** Any non-idle customer portal work (coin window, activating, active, …). */
+  bool hasOperationalPortalLoad() const;
   bool hasSession(const String &mac);
   void deferRouterDisconnect(const String &mac);
 
@@ -91,7 +103,9 @@ class PortalSessionManager {
   SessionManager* _sessions = nullptr;
   volatile bool _routerIdleNotified = false;
 
-  JsonDocument _doc;
+  // Persistent session store — PSRAM-first pool (see JsonHeap.h / PsramAllocator).
+  // mutable: const query helpers read via JsonDocument& implicit conversion.
+  mutable PsramJsonDocument _doc;
   bool         _dirty       = false;
   uint32_t     _lastTickMs  = 0;
   uint32_t     _lastSaveMs  = 0;

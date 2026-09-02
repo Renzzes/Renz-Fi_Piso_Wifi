@@ -146,7 +146,7 @@ If custom banner/music exist on the ESP32 (owner admin upload), the portal uses
 
 2. Upload all generated files to **`hotspot/`** (overwrite stock RouterOS templates).
 
-3. Ensure **`login.html`**, **`renzfi-app.js`**, **`renzfi-style.css`**, **`md5.js`**,
+3. Ensure **`login.html`**, **`status.html`**, **`renzfi-app.js`**, **`renzfi-style.css`**, **`md5.js`**,
 
    **`Default-Banner.png`**, and audio files are present.
 

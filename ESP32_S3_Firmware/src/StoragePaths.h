@@ -115,6 +115,8 @@ static constexpr const char *SetupWizardFile          = "/config/setup-wizard.js
 static constexpr const char *NetworkAdoptionWorkflowFile =
     "/config/network-adoption-workflow.json";
 static constexpr const char *AccessPointsFile = "/config/access-points.json";
+static constexpr const char *ContentFilterFile = "/config/content-filter.json";
+static constexpr const char *GamingPriorityFile = "/config/gaming-priority.json";
 
 // ── CONTRACT: canonical asset paths (Phase 3 AssetManager) ─────────────────
 
@@ -194,6 +196,7 @@ static constexpr const char *FbSetupWizard        = "/fb/setup-wizard.json";
 static constexpr const char *SalesHistorySpool    = "/fb/hs.ndjson";
 static constexpr const char *SessionsHistorySpool = "/fb/he.ndjson";
 static constexpr const char *VouchersHistorySpool = "/fb/hv.ndjson";
+static constexpr const char *LogsHistorySpool     = "/fb/hl.ndjson";
 
 }  // namespace Spiffs
 

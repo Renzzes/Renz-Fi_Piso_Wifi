@@ -13,10 +13,7 @@ export function DashboardCard({
 }) {
   return (
     <section
-      className={cn(
-        "rounded-[14px] border bg-card p-4 text-card-foreground shadow-sm",
-        className,
-      )}
+      className={cn("rounded-[14px] border bg-card p-4 text-card-foreground shadow-sm", className)}
     >
       {children}
     </section>
@@ -214,18 +211,25 @@ export function Sparkline({ values }: { values: number[] }) {
   const max = Math.max(...values, 1);
   const min = Math.min(...values, 0);
   const range = max - min || 1;
-  const w = 140;
-  const h = 36;
+  const w = 320;
+  const h = 64;
   const pts = values
     .map((v, i) => {
       const x = (i / (values.length - 1)) * w;
-      const y = h - ((v - min) / range) * (h - 6) - 3;
+      const y = h - ((v - min) / range) * (h - 8) - 4;
       return `${x},${y}`;
     })
     .join(" ");
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} className="h-9 w-full" aria-hidden>
-      <polyline fill="none" stroke="#F59E0B" strokeWidth="2" strokeLinejoin="round" points={pts} />
+    <svg viewBox={`0 0 ${w} ${h}`} className="h-full w-full" preserveAspectRatio="none" aria-hidden>
+      <polyline
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinejoin="round"
+        className="text-primary/80"
+        points={pts}
+      />
     </svg>
   );
 }

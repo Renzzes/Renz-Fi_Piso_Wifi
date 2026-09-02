@@ -13,6 +13,8 @@ export type PortalSettings = {
   musicConfigured?: boolean;
   bannerUrl?: string;
   musicUrl?: string;
+  bannerIsVideo?: boolean;
+  bannerMime?: string;
   banner_path?: string;
   music_path?: string;
 };

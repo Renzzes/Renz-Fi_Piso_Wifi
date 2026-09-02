@@ -19,8 +19,25 @@ export type GithubReleaseInfo = {
 function githubApi(path: string, signal: AbortSignal) {
   return fetch(`https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}${path}`, {
     headers: { Accept: "application/vnd.github+json" },
+    cache: "no-store",
     signal,
   });
+}
+
+function githubHttpError(status: number, kind: "release" | "tag"): Error {
+  if (status === 404) {
+    return new Error(
+      "GitHub releases are private. Make the repository public to check for updates.",
+    );
+  }
+  if (status === 403) {
+    return new Error("GitHub rate limit reached. Try Check update again in a few minutes.");
+  }
+  return new Error(
+    kind === "release"
+      ? `Unable to read GitHub latest release (${status})`
+      : `Unable to read GitHub release tags (${status})`,
+  );
 }
 
 export function isGithubOfflineError(error: unknown): boolean {
@@ -57,11 +74,13 @@ export async function fetchLatestGithubRelease(): Promise<GithubReleaseInfo> {
           publishedAt: json.published_at ?? null,
         };
       }
+    } else if (latestRes.status === 403) {
+      throw githubHttpError(latestRes.status, "release");
     }
 
     const tagsRes = await githubApi("/tags?per_page=1", controller.signal);
     if (!tagsRes.ok) {
-      throw new Error("Unable to read GitHub release tags");
+      throw githubHttpError(tagsRes.status, "tag");
     }
     const tags = (await tagsRes.json()) as Array<{ name?: string }>;
     const tag = tags[0]?.name?.trim();

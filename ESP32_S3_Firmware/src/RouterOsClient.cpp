@@ -513,6 +513,50 @@ bool RouterOsClient::parseAttr(const String &word, String &key, String &value) {
   return true;
 }
 
+String RouterOsClient::replyAttr(const CommandResult &result, uint8_t row,
+                                 const char *keyName) {
+  if (row >= result.replyCount || !keyName || !keyName[0]) return String();
+  const auto &record = result.replyAt(row);
+  for (uint8_t i = 0; i < record.attrCount; ++i) {
+    String key;
+    String value;
+    if (parseAttr(record.attr(i), key, value) &&
+        key.equalsIgnoreCase(keyName)) {
+      return value;
+    }
+  }
+  return String();
+}
+
+bool RouterOsClient::replyAttrToBuf(const CommandResult &result, uint8_t row,
+                                    const char *keyName, char *out,
+                                    size_t cap) {
+  if (row >= result.replyCount || !keyName || !out || cap == 0) return false;
+  const auto &record = result.replyAt(row);
+  for (uint8_t i = 0; i < record.attrCount; ++i) {
+    String key;
+    String value;
+    if (parseAttr(record.attr(i), key, value) &&
+        key.equalsIgnoreCase(keyName)) {
+      strncpy(out, value.c_str(), cap - 1);
+      out[cap - 1] = '\0';
+      return true;
+    }
+  }
+  out[0] = '\0';
+  return false;
+}
+
+String RouterOsClient::findReplyAttr(const CommandResult &result,
+                                     const char *keyName) {
+  if (!keyName || !keyName[0]) return String();
+  for (uint8_t row = 0; row < result.replyCount; ++row) {
+    const String value = replyAttr(result, row, keyName);
+    if (value.length() > 0) return value;
+  }
+  return String();
+}
+
 bool RouterOsClient::writeSentence(const String *words, size_t count) {
 #if RENZFI_ROUTER_API_LOG_SENTENCE_WORDS
   // Safe debug mode: logs word count and encoded (wire) length per word.
@@ -824,9 +868,15 @@ bool RouterOsClient::connect() {
     return false;
   }
   if (!DmaMemoryMonitor::hasEthTransmitHeadroom()) {
-    DmaMemoryMonitor::logSnapshot("before tx");
-    setError("Ethernet DMA memory low — defer RouterOS connect", "ETH_DMA_LOW");
-    return false;
+    // Brief recover window (SoftAP captive churn). Still fail soft — never
+    // proceed into W5500 SPI with dma_largest below one frame (Guru).
+    if (!DmaMemoryMonitor::waitForDmaHeadroom(
+            3000, DmaMemoryMonitor::kMinLargestDmaBlockForEthTx)) {
+      DmaMemoryMonitor::logSnapshot("before tx");
+      DmaMemoryMonitor::logTrace("ros-connect-eth-dma-low");
+      setError("Ethernet DMA memory low — defer RouterOS connect", "ETH_DMA_LOW");
+      return false;
+    }
   }
   const uint32_t gateStart = millis();
   if (!RouterApiTransportGate::waitUntilConnectAllowed()) {
@@ -1411,12 +1461,15 @@ bool RouterOsClient::executeCommandImpl(const String &commandPath,
   }
 
   if (!DmaMemoryMonitor::hasEthTransmitHeadroom()) {
-    DmaMemoryMonitor::logSnapshot("before router-write");
-    setError("Ethernet SPI DMA memory low — defer RouterOS command",
-             "SPI_DMA_ALLOCATION_FAILED");
-    Serial.printf("[router-api] END elapsed=%u ms (SPI DMA low)\n",
-                  static_cast<unsigned>(millis() - cmdStartMs));
-    return false;
+    if (!DmaMemoryMonitor::waitForDmaHeadroom(
+            3000, DmaMemoryMonitor::kMinLargestDmaBlockForEthTx)) {
+      DmaMemoryMonitor::logSnapshot("before router-write");
+      setError("Ethernet SPI DMA memory low — defer RouterOS command",
+               "SPI_DMA_ALLOCATION_FAILED");
+      Serial.printf("[router-api] END elapsed=%u ms (SPI DMA low)\n",
+                    static_cast<unsigned>(millis() - cmdStartMs));
+      return false;
+    }
   }
 
   RouterWorkerDiagnostics::logStage("exec-cmd-before-writeSentence");

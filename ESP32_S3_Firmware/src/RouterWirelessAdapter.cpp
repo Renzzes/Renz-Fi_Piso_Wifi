@@ -1,12 +1,22 @@
 #include "RouterWirelessAdapter.h"
 
 #include "Config.h"
+#include "DmaMemoryMonitor.h"
 #include "RouterCommandScratch.h"
 #include "RouterApiTransportGate.h"
 #include "RouterProvisioningTypes.h"
 #include "RouterWorkerDiagnostics.h"
 #include "StorageManager.h"
 #include "StoragePaths.h"
+#include "RenzFiDebug.h"
+
+#if RENZFI_DEBUG_ROUTER
+#define RENZFI_WL_LOG(...) Serial.printf(__VA_ARGS__)
+#define RENZFI_WL_LN(msg)  Serial.println(msg)
+#else
+#define RENZFI_WL_LOG(...) ((void)0)
+#define RENZFI_WL_LN(msg)  ((void)0)
+#endif
 
 namespace {
 
@@ -1064,11 +1074,15 @@ bool parseWifiSelection(JsonObjectConst body, WifiSelection &out, String &errorO
   errorOut = "";
   out      = {};
   const char *mode = body["wifiMode"] | "";
-  if (strcmp(mode, kModeExisting) != 0 && strcmp(mode, kModeNew) != 0) {
-    errorOut = "wifiMode must be existing or new";
+  if (strcmp(mode, kModeExisting) != 0 && strcmp(mode, kModeNew) != 0 &&
+      strcmp(mode, kModeExternalAp) != 0) {
+    errorOut = "wifiMode must be existing, new, or external_ap";
     return false;
   }
   out.mode = mode;
+  if (out.mode == kModeExternalAp) {
+    return true;
+  }
   if (out.mode == kModeExisting) {
     out.interfaceId = body["interfaceId"] | "";
     if (out.interfaceId.isEmpty()) {
@@ -1097,7 +1111,9 @@ bool listNetworks(RouterOsClient &client, JsonArray out, ListNetworksResult &res
   out.clear();
   RouterWorkerDiagnostics::checkStackMargin("wireless-listNetworks-entry");
 
-  Serial.println("[wireless] step 1 detect RouterOS version");
+  (void)DmaMemoryMonitor::waitForRouterOsConnectHeadroom(1500);
+
+  RENZFI_WL_LN(F("[wireless] step 1 detect RouterOS version"));
   {
     RouterOsClient::CommandResult &resource = RouterCommandScratchContext::acquire();
       String routerVersion;
@@ -1106,17 +1122,17 @@ bool listNetworks(RouterOsClient &client, JsonArray out, ListNetworksResult &res
         replyAttr(resource, 0, "version", routerVersion);
       }
       recordCpuLoadFromResource(resource);
-      Serial.printf("[wireless] step 1 version=%s\n",
+      RENZFI_WL_LOG("[wireless] step 1 version=%s\n",
                     routerVersion.isEmpty() ? "(unknown)" : routerVersion.c_str());
   }
 
   RouterOsClient::CommandResult &legacy = RouterCommandScratchContext::acquire();
 
-  Serial.println("[wireless] step 2 legacy probe");
+  RENZFI_WL_LN(F("[wireless] step 2 legacy probe"));
   bool legacyMissing = false;
   bool legacyOk =
       client.executeOptionalCommand("/interface/wireless/print", legacy, legacyMissing);
-  Serial.printf("[wireless] step 3 legacy response ok=%d missing=%d replies=%u\n",
+  RENZFI_WL_LOG("[wireless] step 3 legacy response ok=%d missing=%d replies=%u\n",
                 legacyOk ? 1 : 0, legacyMissing ? 1 : 0,
                 static_cast<unsigned>(legacy.replyCount));
   RouterWorkerDiagnostics::checkStackMargin("wireless-after-legacy-probe");
@@ -1156,12 +1172,12 @@ bool listNetworks(RouterOsClient &client, JsonArray out, ListNetworksResult &res
   bool wifiMissing = false;
   bool wifiOk      = false;
   if (skipWifiWave2Probe) {
-    Serial.println("[wireless] step 4 wifiwave2 probe skipped (legacy interfaces present)");
+    RENZFI_WL_LN(F("[wireless] step 4 wifiwave2 probe skipped (legacy interfaces present)"));
   } else {
-    Serial.println("[wireless] step 4 wifiwave2 probe");
+    RENZFI_WL_LN(F("[wireless] step 4 wifiwave2 probe"));
     RouterOsClient::CommandResult &wifi = RouterCommandScratchContext::acquire();
     wifiOk = client.executeOptionalCommand("/interface/wifi/print", wifi, wifiMissing);
-    Serial.printf("[wireless] step 5 wifiwave2 response ok=%d missing=%d replies=%u\n",
+    RENZFI_WL_LOG("[wireless] step 5 wifiwave2 response ok=%d missing=%d replies=%u\n",
                   wifiOk ? 1 : 0, wifiMissing ? 1 : 0,
                   static_cast<unsigned>(wifi.replyCount));
     RouterWorkerDiagnostics::checkStackMargin("wireless-after-wifiwave2-probe");
@@ -1188,7 +1204,7 @@ bool listNetworks(RouterOsClient &client, JsonArray out, ListNetworksResult &res
     }
   }
 
-  Serial.printf("[wireless] step 6 merge interfaces count=%u\n",
+  RENZFI_WL_LOG("[wireless] step 6 merge interfaces count=%u\n",
                 static_cast<unsigned>(out.size()));
 
   // Task 5/14 (MikroTik CPU protection / safety validation): the per-row
@@ -1198,7 +1214,7 @@ bool listNetworks(RouterOsClient &client, JsonArray out, ListNetworksResult &res
   // extra commands entirely rather than adding more load — default to the
   // safe (non-open) assumption instead of guessing.
   if (RouterApiTransportGate::cpuUnderPressure()) {
-    Serial.println("[wireless] step 7 verify security SKIPPED (MikroTik CPU under pressure)");
+    RENZFI_WL_LN(F("[wireless] step 7 verify security SKIPPED (MikroTik CPU under pressure)"));
     for (JsonVariant v : out) {
       JsonObject row = v.as<JsonObject>();
       if ((row["driver"] | "") != "wireless") continue;
@@ -1206,7 +1222,7 @@ bool listNetworks(RouterOsClient &client, JsonArray out, ListNetworksResult &res
       row["securityOpen"] = profile.isEmpty();
     }
   } else {
-  Serial.println("[wireless] step 7 verify security");
+  RENZFI_WL_LN(F("[wireless] step 7 verify security"));
   {
     // One reusable worker scratch for the whole loop instead of one
     // alloc/free per interface, and a small dedupe cache (interface counts
@@ -1254,7 +1270,7 @@ bool listNetworks(RouterOsClient &client, JsonArray out, ListNetworksResult &res
     result.driver  = "none";
     result.message = "No wireless package is installed on this MikroTik";
     result.ok      = true;
-    Serial.println("[wireless] step 8 return WIFI_NO_WIRELESS_PACKAGE");
+    RENZFI_WL_LN(F("[wireless] step 8 return WIFI_NO_WIRELESS_PACKAGE"));
     return true;
   }
 
@@ -1262,13 +1278,13 @@ bool listNetworks(RouterOsClient &client, JsonArray out, ListNetworksResult &res
     result.error = client.lastError().isEmpty() ? "Unable to scan wireless interfaces"
                                                 : client.lastError();
     result.code  = "WIFI_SCAN_FAILED";
-    Serial.printf("[wireless] step 8 return WIFI_SCAN_FAILED err=%s\n",
+    RENZFI_WL_LOG("[wireless] step 8 return WIFI_SCAN_FAILED err=%s\n",
                   result.error.c_str());
     return false;
   }
 
   summarizeDiscovery(out, result);
-  Serial.printf("[wireless] step 8 return code=%s interfaces=%u\n",
+  RENZFI_WL_LOG("[wireless] step 8 return code=%s interfaces=%u\n",
                 result.code.c_str(), static_cast<unsigned>(result.interfaceCount));
   return true;
 }

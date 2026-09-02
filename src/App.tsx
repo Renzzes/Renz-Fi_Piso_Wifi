@@ -17,8 +17,15 @@ import SalesReportsPage from "@/pages/SalesReportsPage";
 import CaptivePortalPage from "@/pages/CaptivePortalPage";
 import CoinSettingsPage from "@/pages/CoinSettingsPage";
 import RouterSettingsPage from "@/pages/RouterSettingsPage";
-import SystemConfigurationPage from "@/pages/SystemConfigurationPage";
+import SystemConfigurationLegacyRedirect from "@/pages/SystemConfigurationLegacyRedirect";
+import NetworkPage from "@/pages/NetworkPage";
+import RouterStatusPage from "@/pages/RouterStatusPage";
+import BandwidthPage from "@/pages/BandwidthPage";
+import StoragePage from "@/pages/StoragePage";
+import WirelessPage from "@/pages/WirelessPage";
 import AccessPointsPage from "@/pages/AccessPointsPage";
+import ContentFilteringPage from "@/pages/ContentFilteringPage";
+import GamingPriorityPage from "@/pages/GamingPriorityPage";
 import LogsPage from "@/pages/LogsPage";
 import FirmwarePage from "@/pages/FirmwarePage";
 import SystemSettingsPage from "@/pages/SystemSettingsPage";
@@ -115,6 +122,7 @@ export default function App() {
       setRole("none");
       setPermissions([...DEFAULT_OPERATOR_PERMISSIONS]);
       setCoreSyncDone(false);
+      setLiveUpdatesEnabled(false);
       navigate("/login", { replace: true });
     }
   }, [navigate]);
@@ -123,7 +131,8 @@ export default function App() {
     setSyncError(null);
     setSyncPhase("device");
     try {
-      await synchronizeAdminClient((phase) => setSyncPhase(phase));
+      const result = await synchronizeAdminClient((phase) => setSyncPhase(phase));
+      queryClient.setQueryData(["system", "status"], result.status);
       setCoreSyncDone(true);
       return true;
     } catch (err) {
@@ -135,7 +144,7 @@ export default function App() {
       setCoreSyncDone(false);
       return false;
     }
-  }, []);
+  }, [queryClient]);
 
   const handlePasswordChangeComplete = useCallback(async () => {
     setPasswordChangeRequired(false);
@@ -167,12 +176,18 @@ export default function App() {
   );
   useEffect(() => onFactoryResetQuiesce(setFactoryResetQuiescedState), []);
 
+  const [liveUpdatesEnabled, setLiveUpdatesEnabled] = useState(false);
+
   const dashboardEvents = useDashboardEvents(
-    isLoggedIn && !passwordChangeRequired && !factoryResetQuiesced,
+    isLoggedIn &&
+      !passwordChangeRequired &&
+      !factoryResetQuiesced &&
+      liveUpdatesEnabled,
   );
   const { connectionLost, adminApiReachable, retryConnection } = useAdminApiMonitor({
     enabled: isLoggedIn && !passwordChangeRequired && !factoryResetQuiesced,
     sseConnected: dashboardEvents.sseConnected,
+    standbyIdle: !liveUpdatesEnabled,
     onReconnectRequireLogin: handleReconnectRequireLogin,
   });
 
@@ -216,6 +231,8 @@ export default function App() {
     ...dashboardEvents,
     connectionLost,
     adminApiReachable,
+    liveUpdatesEnabled,
+    setLiveUpdatesEnabled,
   };
 
   const { showWarning, stayLoggedIn } = useSessionIdleTimeout({
@@ -527,7 +544,67 @@ export default function App() {
                 permissions={permissions}
                 permission="system-configuration"
               >
-                <SystemConfigurationPage />
+                <SystemConfigurationLegacyRedirect />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="network"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="system-configuration"
+              >
+                <NetworkPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="router-status"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="system-configuration"
+              >
+                <RouterStatusPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="bandwidth"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="system-configuration"
+              >
+                <BandwidthPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="storage"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="system-configuration"
+              >
+                <StoragePage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="wireless"
+            element={
+              <RequirePermission
+                isOwner={isOwner}
+                permissions={permissions}
+                permission="system-configuration"
+              >
+                <WirelessPage />
               </RequirePermission>
             }
           />
@@ -536,6 +613,22 @@ export default function App() {
             element={
               <RequireOwner isOwner={isOwner}>
                 <AccessPointsPage />
+              </RequireOwner>
+            }
+          />
+          <Route
+            path="content-filtering"
+            element={
+              <RequireOwner isOwner={isOwner}>
+                <ContentFilteringPage />
+              </RequireOwner>
+            }
+          />
+          <Route
+            path="gaming-priority"
+            element={
+              <RequireOwner isOwner={isOwner}>
+                <GamingPriorityPage />
               </RequireOwner>
             }
           />

@@ -13,9 +13,10 @@ Owner configures the AP in its own manufacturer web UI (AP/bridge, DHCP off, NAT
 ## Renz-Fi may
 
 - Register metadata (name, management IP, optional credentials, SSID label, location, notes, brand label)
-- Validate management IP against **live** Ethernet LAN
-- Run generic reachability on `ap_check_worker` (ICMP + TCP 80/443, HTTP 202, single-flight)
-- Show RAM status
+- Validate management IP against live Ethernet (same subnet or RFC1918 routed LAN; never hardcode a site subnet)
+- Detect candidates via MikroTik ARP on `RouterProvisioningWorker` (one-time, owner-triggered)
+- Check a **saved** management IP via MikroTik ARP + optional RouterOS `/ping` on `RouterProvisioningWorker` (path: ESP32 → MikroTik → AP)
+- Show RAM status (`online` / Offline)
 - Open `http://{managementIp}` in the browser (no ESP32 proxy, no credential injection)
 
 ## Renz-Fi must not
@@ -28,12 +29,14 @@ Owner configures the AP in its own manufacturer web UI (AP/bridge, DHCP off, NAT
 - Add AP-side bandwidth / promo / rate-limit
 - Add VLAN fields or AP VLAN provisioning
 - Claim seamless roaming (same SSID is allowed)
-- Put AP checks on RouterWorker / MikroTikDriver / RouterOsClient / async_tcp / loopTask
+- Directly ICMP/TCP from the ESP32 to the AP for Admin Check (use MikroTik)
+- Run Check/Detect on `async_tcp` or `loopTask`
 - Read or write SD / take STORAGE_LOCK during a check
 - Run automatic high-frequency or LAN-scan monitoring
 - Merge this feature with `ManagementApManager` (ESP32 SoftAP at 192.168.4.1)
+- Require MikroTik topology changes (bridges, firewall, proxy-arp) for Check to work
 
-`GenericApDriver` is a **reachability probe**, not a configuration driver. Credentials are metadata only.
+`GenericApDriver` is a legacy ESP32 probe (Sync). Admin Check uses MikroTik. Credentials are metadata only.
 
 Source of truth: `docs/EXTERNAL_ACCESS_POINT_ARCHITECTURE.md`.
 Do not move `v0.5.0-fully-operational`. Do not rewrite Stage B/C checkpoints.

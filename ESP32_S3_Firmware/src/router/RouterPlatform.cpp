@@ -193,6 +193,8 @@ bool RouterPlatform::save(JsonObjectConst settings) {
   if (ok) {
     _healthHost = settings["host"] | "";
     _healthConfigured = _healthHost.length() > 0;
+    _healthCacheLoaded = true;
+    _lastHealthCacheMs = millis();
     selectActiveDriver();
     emitProfileUpdated();
     // saveSettings is local SD only (RouterOS API credentials). Do NOT open a
@@ -740,15 +742,34 @@ void RouterPlatform::emitCapabilitiesChanged() {
 }
 
 void RouterPlatform::refreshHealthCache() {
-  _healthConfigured = false;
-  _healthHost = "";
-  if (!_active) return;
+  if (!_active) {
+    _healthConfigured = false;
+    _healthHost = "";
+    _healthCacheLoaded = true;
+    _lastHealthCacheMs = millis();
+    return;
+  }
+
+  // Called every 2s from FirmwareApp::refreshHealthSnapshots. load() →
+  // readJson(ROUTER_FILE) under STORAGE_LOCK on that cadence starves async_tcp
+  // on shared CPU1 during Admin login/dashboard HTTP storms.
+  const uint32_t now = millis();
+  if (_healthCacheLoaded &&
+      (now - _lastHealthCacheMs) <
+          RenzFiConfig::STORAGE_SNAPSHOT_HEAVY_INTERVAL_MS) {
+    return;
+  }
 
   DynamicJsonDocument routerDoc(RenzFiConfig::JSON_DOC_SMALL);
   if (load(routerDoc)) {
     _healthHost = routerDoc["host"] | "";
     _healthConfigured = _healthHost.length() > 0;
+  } else {
+    _healthConfigured = false;
+    _healthHost = "";
   }
+  _healthCacheLoaded = true;
+  _lastHealthCacheMs = now;
 }
 
 void RouterPlatform::fillHealthStatus(JsonObject routerObj) const {

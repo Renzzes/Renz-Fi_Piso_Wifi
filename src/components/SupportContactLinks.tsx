@@ -48,26 +48,26 @@ export function SupportContactLinks({
   return (
     <div
       className={cn(
-        "rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground space-y-1.5",
+        "rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground space-y-1.5 text-center",
         className,
       )}
     >
       <p className={cn("font-medium text-foreground", compact && "text-[11px]")}>
         Need help or want to report a problem?
       </p>
-      <div className="flex flex-col gap-1">
+      <div className="flex flex-col items-center gap-1">
         <a
           href={SUPPORT_FB_URL}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1.5 hover:text-foreground underline-offset-2 hover:underline"
+          className="inline-flex items-center justify-center gap-1.5 hover:text-foreground underline-offset-2 hover:underline"
         >
           <Facebook className="h-3.5 w-3.5 shrink-0" />
           FB: {SUPPORT_FB_NAME}
         </a>
         <a
           href={SUPPORT_PHONE_HREF}
-          className="inline-flex items-center gap-1.5 hover:text-foreground underline-offset-2 hover:underline"
+          className="inline-flex items-center justify-center gap-1.5 hover:text-foreground underline-offset-2 hover:underline"
         >
           <Phone className="h-3.5 w-3.5 shrink-0" />
           {SUPPORT_PHONE}

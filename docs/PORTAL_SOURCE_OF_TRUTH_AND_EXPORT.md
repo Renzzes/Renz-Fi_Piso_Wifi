@@ -21,7 +21,7 @@ scripts\export-captive-portal.bat
 ```
 
 3. Open `C:\Captive_Portal_BAT\`
-4. Upload those files as an **overlay** into the router’s existing `hotspot/` directory.
+4. Upload **every** file in that folder as an overlay into the router’s existing `hotspot/` directory. **Overwrite `status.html`**. RouterOS serves `/login` from `login.html` and `/status` from `status.html` as two different files. Skipping `status.html` leaves the old light portal on the authenticated status page.
 
 The BAT always builds first (`RENZFI_APPLIANCE_BASE_URL=http://10.10.10.2 npm run build:mikrotik-portal`). If the build fails, the previous export package is left untouched.
 

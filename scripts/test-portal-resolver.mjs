@@ -63,7 +63,7 @@ const statusSrc = readFileSync(
   "utf8",
 );
 assert.deepEqual(validateStatusHtml(statusSrc), []);
-assert.ok(statusSrc.includes('src="renzfi-app.js"'));
+assert.ok(/src=["']\/?renzfi-app\.js/.test(statusSrc));
 assert.ok(statusSrc.includes("renzfi-style.css"));
 assert.ok(statusSrc.includes("$(ip)"));
 assert.ok(statusSrc.includes("$(mac)"));

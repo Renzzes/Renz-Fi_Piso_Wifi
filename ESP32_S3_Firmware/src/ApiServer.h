@@ -8,6 +8,8 @@
 #include "AssetManager.h"
 #include "BackupManager.h"
 #include "BuildMetadata.h"
+#include "ContentFilterManager.h"
+#include "GamingPriorityManager.h"
 #include "CoinManager.h"
 #include "EthernetManager.h"
 #include "ExternalAccessPointManager.h"
@@ -58,7 +60,9 @@ class ApiServer : public IWebRouteProvider {
              NetworkSettingsManager *networkSettings = nullptr,
              RouterProvisioningWorker *routerWorker = nullptr,
              FactoryResetWorker *factoryReset = nullptr,
-             ExternalAccessPointManager *accessPoints = nullptr);
+             ExternalAccessPointManager *accessPoints = nullptr,
+             ContentFilterManager *contentFilter = nullptr,
+             GamingPriorityManager *gamingPriority = nullptr);
 
   void registerSetupRoutes(WebServerManager &web,
                            SetupProvisioningManager *setupProvisioning = nullptr,
@@ -94,6 +98,8 @@ class ApiServer : public IWebRouteProvider {
   RouterProvisioningWorker *_routerWorker  = nullptr;
   FactoryResetWorker       *_factoryReset  = nullptr;
   ExternalAccessPointManager *_accessPoints = nullptr;
+  ContentFilterManager *_contentFilter = nullptr;
+  GamingPriorityManager *_gamingPriority = nullptr;
   WebServerManager         *_web                = nullptr;
   SetupProvisioningManager *_setupProvisioning  = nullptr;
   RouterProvisioningManager *_routerProvisioning = nullptr;
@@ -114,6 +120,8 @@ class ApiServer : public IWebRouteProvider {
   void sendOk(AsyncWebServerRequest *req, JsonDocument &data, int httpStatus,
                const String &message);
   void sendOk(AsyncWebServerRequest *req, const String &message = "OK");
+  /** Session liveness — bypasses paced JSON concurrency slot (/api/health). */
+  void sendOkLiveness(AsyncWebServerRequest *req, JsonDocument &data);
 
   // Send JSON error envelope.
   void sendError(AsyncWebServerRequest *req, int status,
@@ -142,4 +150,21 @@ class ApiServer : public IWebRouteProvider {
   void appendAssetInfoJson(JsonObject obj, const AssetInfo &info) const;
   void appendUploadResultJson(JsonObject root,
                               const AssetOperationResult &result) const;
+
+  void enqueueContentFilterSyncOrError(
+      AsyncWebServerRequest *req, const char *okMessage,
+      ContentFilterManager::SyncEnqueueStatus mutationStatus =
+          ContentFilterManager::SyncEnqueueStatus::Ok,
+      const char *extraFieldKey = nullptr,
+      const String *extraFieldValue = nullptr);
+
+  void enqueueGamingPrioritySyncOrError(AsyncWebServerRequest *req,
+                                        const char *okMessage);
+
+  bool pollWorkerJobOrError(AsyncWebServerRequest *req, const char *urlPrefix,
+                              const char *opType, const char *notFoundMessage,
+                              RouterProvisioningWorker::JobRecord &job);
+
+  void sendWorkerJobPollOk(AsyncWebServerRequest *req,
+                           const RouterProvisioningWorker::JobRecord &job);
 };

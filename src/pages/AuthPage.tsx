@@ -1,5 +1,5 @@
 import { type FormEvent, useState } from "react";
-import logoSrc from "../../public/Logo.png";
+import { BrandLogo } from "@/components/BrandLogo";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -31,15 +31,23 @@ export default function AuthPage({ onConnect, connecting }: AuthPageProps) {
   };
 
   return (
-    <div className="relative flex min-h-screen items-center justify-center bg-muted/40 px-4 py-8">
-      <div className="absolute right-3 top-3">
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-8">
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 bg-primary/10 [mask-image:radial-gradient(ellipse_at_50%_0%,black,transparent_55%)]"
+      />
+      <div className="absolute right-3 top-3 z-10">
         <ThemeToggle />
       </div>
-      <Card className="w-full max-w-md">
-        <CardHeader className="items-center text-center">
-          <img src={logoSrc} alt="Renz-Fi logo" className="mb-2 h-32 w-auto object-contain" />
-          <CardTitle className="text-2xl">Connect to Your Renz-Fi Appliance</CardTitle>
-          <CardDescription>Enter your appliance&rsquo;s IP address and password to continue.</CardDescription>
+      <Card className="relative z-10 w-full max-w-md border-border/80 bg-card/95 shadow-lg backdrop-blur-sm dark:shadow-[0_0_40px_rgba(37,99,235,0.1)]">
+        <CardHeader className="items-center space-y-3 text-center">
+          <BrandLogo height={88} className="mb-1" />
+          <div className="space-y-1.5">
+            <CardTitle className="text-2xl tracking-tight">Connect to Your Renz-Fi Appliance</CardTitle>
+            <CardDescription>
+              Enter your appliance&rsquo;s IP address and password to continue.
+            </CardDescription>
+          </div>
         </CardHeader>
         <CardContent>
           <form className="space-y-4" onSubmit={handleSubmit}>

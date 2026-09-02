@@ -283,10 +283,14 @@ export type SystemStatus = {
     lastSynchronizedMillis?: number;
     routerOs?: {
       version?: string;
+      boardName?: string;
       cpuLoad?: string;
       freeMemory?: string;
       totalMemory?: string;
       uptime?: string;
+      totalHddSpace?: string;
+      freeHddSpace?: string;
+      cpuTemperature?: string;
     };
     observation?: {
       connectivity?: string;
@@ -370,6 +374,17 @@ export type SystemStatus = {
     };
   };
   sync: { pending: number; lastSyncAt: string | null };
+  networkProvisioning?: {
+    externalApOnly?: boolean;
+    noWirelessCapabilityDetected?: boolean;
+    guestTopologyMode?: "external_access_point" | "mikrotik_wireless" | string;
+    guestBridgeName?: string;
+    guestNetwork?: string;
+    guestGateway?: string;
+    dhcpPool?: string;
+    wifiSetupComplete?: boolean;
+    foundationApplied?: boolean;
+  };
 };
 
 export type ChartData = { labels: string[]; data: number[] };

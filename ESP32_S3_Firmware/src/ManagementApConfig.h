@@ -22,6 +22,7 @@ static const IPAddress SUBNET (255, 255, 255, 0);
 // app's exact-match detection.
 static constexpr const char *SSID         = "Renz-Fi Setup";
 static constexpr const char *PORTAL_URL  = "http://192.168.4.1";
+static constexpr const char *SETUP_PATH  = "/admin/setup";
 static constexpr const char *SETUP_URL   = "http://192.168.4.1/admin/setup";
 static constexpr uint8_t     CHANNEL       = 6;
 static constexpr uint8_t     MAX_CLIENTS   = 4;

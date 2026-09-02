@@ -18,6 +18,16 @@
 
 #include "JsonHeap.h"
 #include "MemoryDiagnostics.h"
+#include "DmaMemoryMonitor.h"
+#include "RenzFiDebug.h"
+
+#if RENZFI_DEBUG_ROUTER
+#define RP_LOG(...) Serial.printf(__VA_ARGS__)
+#define RP_LN(msg) Serial.println(msg)
+#else
+#define RP_LOG(...) ((void)0)
+#define RP_LN(msg) ((void)0)
+#endif
 
 namespace {
 
@@ -250,28 +260,28 @@ class RouterSession {
     _client.setCredentials(input.host, input.username, input.password,
                           input.apiPort);
     _client.setCredentialSource("setup-provisioning");
-    Serial.printf("[router-plan] session open host=%s port=%u user=%s\n",
+    RP_LOG("[router-plan] session open host=%s port=%u user=%s\n",
                   input.host.c_str(), static_cast<unsigned>(input.apiPort),
                   input.username.c_str());
     if (!_client.connect()) {
       errorOut     = _client.lastError();
       errorCodeOut = _client.lastErrorCode().isEmpty() ? "TCP_CONNECT_FAILED"
                                                        : _client.lastErrorCode();
-      Serial.printf("[router-plan] session connect failed code=%s msg=%s\n",
+      RP_LOG("[router-plan] session connect failed code=%s msg=%s\n",
                     errorCodeOut.c_str(), errorOut.c_str());
       return false;
     }
-    Serial.println(F("[router-plan] session connect ok"));
+    RP_LN(F("[router-plan] session connect ok"));
     if (!_client.login()) {
       errorOut     = _client.lastError();
       errorCodeOut = _client.lastErrorCode().isEmpty() ? "API_LOGIN_FAILED"
                                                        : _client.lastErrorCode();
-      Serial.printf("[router-plan] session login failed code=%s msg=%s\n",
+      RP_LOG("[router-plan] session login failed code=%s msg=%s\n",
                     errorCodeOut.c_str(), errorOut.c_str());
       _client.disconnect();
       return false;
     }
-    Serial.println(F("[router-plan] session login ok"));
+    RP_LN(F("[router-plan] session login ok"));
     _open = true;
     return true;
   }
@@ -409,7 +419,7 @@ bool runPrint(RouterOsClient &ros, const char *commandPath, const String &query,
   errorOut.clear();
   errorCodeOut.clear();
   const uint32_t cmdStart = millis();
-  Serial.printf("[router-plan] inspect cmd=%s query=%s\n", commandPath,
+  RP_LOG("[router-plan] inspect cmd=%s query=%s\n", commandPath,
                 query.isEmpty() ? "(none)" : query.c_str());
   bool ok = false;
   if (query.isEmpty()) {
@@ -429,7 +439,7 @@ bool runPrint(RouterOsClient &ros, const char *commandPath, const String &query,
   if (!ok) {
     errorOut     = formatInspectError(ros.lastError().c_str());
     errorCodeOut = mapInspectFailureCode(ros, out);
-    Serial.printf("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
+    RP_LOG("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
                   commandPath, errorCodeOut.c_str(), errorOut.c_str(), elapsedMs);
     return false;
   }
@@ -437,7 +447,7 @@ bool runPrint(RouterOsClient &ros, const char *commandPath, const String &query,
     errorOut     = formatInspectError(out.fatalMessage.isEmpty() ? "RouterOS fatal reply"
                                                                  : out.fatalMessage.c_str());
     errorCodeOut = "ROUTEROS_API_FATAL";
-    Serial.printf("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
+    RP_LOG("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
                   commandPath, errorCodeOut.c_str(), errorOut.c_str(), elapsedMs);
     return false;
   }
@@ -445,18 +455,18 @@ bool runPrint(RouterOsClient &ros, const char *commandPath, const String &query,
     errorOut     = formatInspectError(out.trapMessage.isEmpty() ? "RouterOS API trap"
                                                                 : out.trapMessage.c_str());
     errorCodeOut = "API_TRAP";
-    Serial.printf("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
+    RP_LOG("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
                   commandPath, errorCodeOut.c_str(), errorOut.c_str(), elapsedMs);
     return false;
   }
   if (out.replyLimitReached) {
     errorOut     = formatInspectError("RouterOS reply exceeded supported record limit");
     errorCodeOut = "ROUTER_INSPECTION_LIMIT";
-    Serial.printf("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
+    RP_LOG("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
                   commandPath, errorCodeOut.c_str(), errorOut.c_str(), elapsedMs);
     return false;
   }
-  Serial.printf("[router-plan] inspect cmd=%s ok replyCount=%u elapsedMs=%u\n",
+  RP_LOG("[router-plan] inspect cmd=%s ok replyCount=%u elapsedMs=%u\n",
                 commandPath, static_cast<unsigned>(out.replyCount), elapsedMs);
   return true;
 }
@@ -468,7 +478,7 @@ bool runPrintWithAttributes(RouterOsClient &ros, const char *commandPath,
   errorOut.clear();
   errorCodeOut.clear();
   const uint32_t cmdStart = millis();
-  Serial.printf("[router-plan] inspect cmd=%s attrs=%u\n", commandPath,
+  RP_LOG("[router-plan] inspect cmd=%s attrs=%u\n", commandPath,
                 static_cast<unsigned>(attributeCount));
   const bool ok =
       ros.executeCommand(commandPath, attributes, attributeCount, out);
@@ -484,7 +494,7 @@ bool runPrintWithAttributes(RouterOsClient &ros, const char *commandPath,
   if (!ok) {
     errorOut     = formatInspectError(ros.lastError().c_str());
     errorCodeOut = mapInspectFailureCode(ros, out);
-    Serial.printf("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
+    RP_LOG("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
                   commandPath, errorCodeOut.c_str(), errorOut.c_str(), elapsedMs);
     return false;
   }
@@ -492,7 +502,7 @@ bool runPrintWithAttributes(RouterOsClient &ros, const char *commandPath,
     errorOut     = formatInspectError(out.fatalMessage.isEmpty() ? "RouterOS fatal reply"
                                                                  : out.fatalMessage.c_str());
     errorCodeOut = "ROUTEROS_API_FATAL";
-    Serial.printf("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
+    RP_LOG("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
                   commandPath, errorCodeOut.c_str(), errorOut.c_str(), elapsedMs);
     return false;
   }
@@ -500,11 +510,11 @@ bool runPrintWithAttributes(RouterOsClient &ros, const char *commandPath,
     errorOut     = formatInspectError(out.trapMessage.isEmpty() ? "RouterOS API trap"
                                                                 : out.trapMessage.c_str());
     errorCodeOut = "API_TRAP";
-    Serial.printf("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
+    RP_LOG("[router-plan] inspect cmd=%s failed code=%s msg=%s elapsedMs=%u\n",
                   commandPath, errorCodeOut.c_str(), errorOut.c_str(), elapsedMs);
     return false;
   }
-  Serial.printf("[router-plan] inspect cmd=%s ok replyCount=%u elapsedMs=%u\n",
+  RP_LOG("[router-plan] inspect cmd=%s ok replyCount=%u elapsedMs=%u\n",
                 commandPath, static_cast<unsigned>(out.replyCount), elapsedMs);
   return true;
 }
@@ -516,7 +526,7 @@ bool inspectFirewallApiRules(RouterOsClient &ros,
   limitedOut = false;
   filterRulesOut = RouterOsClient::CommandResult{};
 
-  Serial.println(F("[router-plan] inspect firewall api-rule query scoped"));
+  RP_LN(F("[router-plan] inspect firewall api-rule query scoped"));
   ros.setCommandReplyLimits(kFirewallApiRuleReplyCap, true);
 
   const String attrs[] = {
@@ -534,7 +544,7 @@ bool inspectFirewallApiRules(RouterOsClient &ros,
 
   ros.resetCommandReplyLimits();
 
-  Serial.printf("[router-plan] inspect firewall api-rule replyCount=%u elapsedMs=%u\n",
+  RP_LOG("[router-plan] inspect firewall api-rule replyCount=%u elapsedMs=%u\n",
                 static_cast<unsigned>(filterRulesOut.replyCount), elapsedMs);
 
   if (!ok) {
@@ -542,7 +552,7 @@ bool inspectFirewallApiRules(RouterOsClient &ros,
   }
   if (filterRulesOut.replyLimitReached) {
     limitedOut = true;
-    Serial.printf("[router-plan] inspect firewall api-rule limit reached replyCount=%u\n",
+    RP_LOG("[router-plan] inspect firewall api-rule limit reached replyCount=%u\n",
                   static_cast<unsigned>(filterRulesOut.replyCount));
     return true;
   }
@@ -958,7 +968,7 @@ void buildActionsFromInspection(const RouterProvisioning::Settings &settings,
   bool apiRuleManaged = false;
   const bool apiRuleSatisfied =
       apiAccessRuleSatisfied(inspection.filterRulesRef(), espIp, apiRuleManaged);
-  Serial.printf("[router-plan] firewall api rule satisfied=%s\n",
+  RP_LOG("[router-plan] firewall api rule satisfied=%s\n",
                 apiRuleSatisfied ? "true" : "false");
 
   if (inspection.firewallInspectionLimited) {
@@ -1060,6 +1070,9 @@ void RouterProvisioningManager::begin(StorageManager *storage,
 
 bool RouterProvisioningManager::wifiSetupComplete() const {
   if (!_wifiSelectionConfigured) return false;
+  if (_externalApOnly || _wifiMode == RouterWireless::kModeExternalAp) {
+    return true;
+  }
   if (_wifiMode == RouterWireless::kModeNew) {
     return !_wifiSsid.isEmpty();
   }
@@ -1069,7 +1082,7 @@ bool RouterProvisioningManager::wifiSetupComplete() const {
 void RouterProvisioningManager::clearForFactoryReset() {
   applyDefaults();
   _factoryResetQuiesced = true;
-  Serial.println(
+  RP_LN(
       "[router-provisioning] factory reset: RAM cleared, durable commit cancelled");
 }
 
@@ -1093,6 +1106,9 @@ bool RouterProvisioningManager::wifiSelectionMatches(
     const String &selectedSsidHint) const {
   if (!_wifiSelectionConfigured) return false;
   if (_wifiMode != selection.mode) return false;
+  if (selection.mode == RouterWireless::kModeExternalAp) {
+    return _externalApOnly;
+  }
   if (selection.mode == RouterWireless::kModeExisting) {
     if (_wifiInterfaceId != selection.interfaceId) return false;
     const String wantSsid =
@@ -1119,7 +1135,8 @@ void RouterProvisioningManager::loop() {
   if (_durableCommitPhase != DurableCommitPhase::Queued) return;
 
   _durableCommitPhase = DurableCommitPhase::Persisting;
-  Serial.println("[router-provisioning] durable commit PERSISTING");
+  RP_LN("[router-provisioning] durable commit PERSISTING");
+  DmaMemoryMonitor::logTrace("durable-persist-before");
   if (!persist()) {
     _durableCommitPhase = DurableCommitPhase::Failed;
     _durableNeedsReschedule = false;
@@ -1128,17 +1145,19 @@ void RouterProvisioningManager::loop() {
     }
     Serial.printf("[router-provisioning] durable commit FAILED: %s\n",
                   _durableCommitError.c_str());
+    DmaMemoryMonitor::logTrace("durable-persist-failed");
     return;
   }
+  DmaMemoryMonitor::logTrace("durable-persist-after");
   // persist() settled Idle. If RAM changed mid-write, queue exactly one more.
   if (_durableNeedsReschedule) {
     _durableNeedsReschedule = false;
     _durableCommitPhase = DurableCommitPhase::Queued;
-    Serial.println(
+    RP_LN(
         "[router-provisioning] durable commit rescheduled after mid-write change");
     return;
   }
-  Serial.println("[router-provisioning] durable commit PERSISTED");
+  RP_LN("[router-provisioning] durable commit PERSISTED");
 }
 
 const char *RouterProvisioningManager::durableCommitStatus() const {
@@ -1176,6 +1195,7 @@ void RouterProvisioningManager::applyDefaults() {
   _updatedAt                = 0;
   _schemaVersion            = SCHEMA_VERSION;
   _wifiSelectionConfigured  = false;
+  _externalApOnly           = false;
   _wifiMode                 = "";
   _wifiInterfaceId          = "";
   _wifiSsid                 = "";
@@ -1211,6 +1231,11 @@ bool RouterProvisioningManager::migrateDocument(JsonDocument &doc) {
     doc["schemaVersion"]         = SCHEMA_VERSION;
     changed                      = true;
   }
+  if (version < 4) {
+    doc["externalApOnly"] = doc["externalApOnly"] | false;
+    doc["schemaVersion"]  = SCHEMA_VERSION;
+    changed               = true;
+  }
   return changed;
 }
 
@@ -1235,6 +1260,7 @@ void RouterProvisioningManager::applyDocument(JsonObjectConst doc) {
   _adoptedAt               = doc["adoptedAt"] | 0U;
   _updatedAt               = doc["updatedAt"] | 0U;
   _wifiSelectionConfigured = doc["wifiSelectionConfigured"] | false;
+  _externalApOnly          = doc["externalApOnly"] | false;
   _wifiMode                = doc["wifiMode"] | "";
   _wifiInterfaceId         = doc["wifiInterfaceId"] | "";
   _wifiSsid                = doc["wifiSsid"] | "";
@@ -1262,6 +1288,7 @@ void RouterProvisioningManager::buildDocument(JsonDocument &doc) const {
   doc["adoptedAt"]               = _adoptedAt;
   doc["updatedAt"]               = _updatedAt;
   doc["wifiSelectionConfigured"] = _wifiSelectionConfigured;
+  doc["externalApOnly"]          = _externalApOnly;
   doc["wifiMode"]                = _wifiMode;
   doc["wifiInterfaceId"]         = _wifiInterfaceId;
   doc["wifiSsid"]                = _wifiSsid;
@@ -1276,30 +1303,52 @@ bool RouterProvisioningManager::load() {
   applyDefaults();
   if (!_storage) return false;
   if (!_storage->exists(StoragePaths::RouterProvisioningFile)) {
-    Serial.println(F("[router-provisioning] first-run defaults (no persistence file)"));
+    RP_LN(F("[router-provisioning] first-run defaults (no persistence file)"));
     return true;
   }
   DynamicJsonDocument doc(kPersistDocCapacity);
   if (!_storage->readJson(StoragePaths::RouterProvisioningFile, doc)) {
-    Serial.println(F("[router-provisioning] persistence unreadable, using defaults"));
+    RP_LN(F("[router-provisioning] persistence unreadable, using defaults"));
     return true;
   }
   if (migrateDocument(doc)) {
     applyDocument(doc.as<JsonObjectConst>());
+    if (!_externalApOnly && _foundationApplied && _wifiInterfaceId.isEmpty() &&
+        isExistingNetworkAdopted() && _installation && _installation->isReady()) {
+      _externalApOnly = true;
+      if (_wifiMode.isEmpty()) {
+        _wifiMode = RouterWireless::kModeExternalAp;
+      }
+      if (!_wifiSelectionConfigured) {
+        _wifiSelectionConfigured = true;
+      }
+    }
     persist();
     return true;
   }
   applyDocument(doc.as<JsonObjectConst>());
+  if (!_externalApOnly && _foundationApplied && _wifiInterfaceId.isEmpty() &&
+      isExistingNetworkAdopted() && _installation && _installation->isReady()) {
+    _externalApOnly = true;
+    if (_wifiMode.isEmpty()) {
+      _wifiMode = RouterWireless::kModeExternalAp;
+    }
+    if (!_wifiSelectionConfigured) {
+      _wifiSelectionConfigured = true;
+    }
+  }
   return true;
 }
 
 bool RouterProvisioningManager::persist() {
   if (_factoryResetQuiesced) {
-    Serial.println("[router-provisioning] persist suppressed (factory reset)");
+    RP_LN("[router-provisioning] persist suppressed (factory reset)");
     return false;
   }
   if (!_storage) return false;
-  DynamicJsonDocument doc(kPersistDocCapacity);
+  // CPU JSON — PSRAM. Must not occupy INTERNAL/DMA while SoftAP requests 1624.
+  PsramJsonDocument heap;
+  JsonDocument &doc = heap.doc();
   buildDocument(doc);
   _updatedAt = millis();
   doc["updatedAt"] = _updatedAt;
@@ -1418,11 +1467,11 @@ RouterProvisioningManager::ensureLocalPreviewPreconditions() const {
 
 RouterProvisioningManager::OperationResult RouterProvisioningManager::buildLocalPlan(
     JsonObject dataOut, JsonObjectConst settingsBody) {
-  Serial.println(F("[router-plan] local preview start"));
+  RP_LN(F("[router-plan] local preview start"));
 
   OperationResult result = ensureLocalPreviewPreconditions();
   if (!result.success) {
-    Serial.printf("[router-plan] local preview rejected code=%s\n",
+    RP_LOG("[router-plan] local preview rejected code=%s\n",
                   result.errorCode.c_str());
     return result;
   }
@@ -1476,7 +1525,7 @@ RouterProvisioningManager::OperationResult RouterProvisioningManager::buildLocal
   result.success      = true;
   result.httpStatus   = 200;
   result.errorMessage = "Local router provisioning plan";
-  Serial.println(F("[router-plan] local preview complete"));
+  RP_LN(F("[router-plan] local preview complete"));
   return result;
 }
 
@@ -1892,7 +1941,7 @@ RouterProvisioningManager::applyConfiguration(JsonObjectConst settingsBody,
       result.errorMessage = "Router configured but installation state update failed";
       return result;
     }
-    Serial.printf("[setup] installation state synchronized: %s\n",
+    RP_LOG("[setup] installation state synchronized: %s\n",
                   installationStateLabel(_installation->current()));
   }
 
@@ -1906,7 +1955,7 @@ RouterProvisioningManager::applyConfiguration(JsonObjectConst settingsBody,
   result.success = true;
   result.httpStatus = 200;
   result.errorMessage = "MikroTik guest-network foundation saved";
-  Serial.println("[setup] router foundation apply complete (Hotspot deferred)");
+  RP_LN("[setup] router foundation apply complete (Hotspot deferred)");
   return result;
 }
 
@@ -1967,7 +2016,12 @@ RouterProvisioningManager::saveWifiSelection(JsonObjectConst body,
   _wifiMode                = selection.mode;
   _wifiInterfaceId         = selection.interfaceId;
   _wifiSsid                = selection.ssid;
-  if (_wifiMode == RouterWireless::kModeExisting) {
+  if (selection.mode == RouterWireless::kModeExternalAp) {
+    _externalApOnly    = true;
+    _wifiInterfaceId   = "";
+    _wifiSsid          = "";
+    _wifiPassword      = "";
+  } else if (_wifiMode == RouterWireless::kModeExisting) {
     if (selectedSsidHint.length() > 0) _wifiSsid = selectedSsidHint;
   }
   _wifiPassword = selection.password;
@@ -2030,7 +2084,15 @@ RouterProvisioningManager::configureExistingNetwork(JsonObjectConst body,
 
   RouterWireless::WifiSelection wifiSelection;
   String wifiError;
-  if (!RouterWireless::parseWifiSelection(body, wifiSelection, wifiError)) {
+  const bool externalApOnly =
+      (body["externalApOnly"] | false) ||
+      strcmp(body["wifiMode"] | "", RouterWireless::kModeExternalAp) == 0 ||
+      _externalApOnly;
+
+  if (externalApOnly) {
+    wifiSelection.mode = RouterWireless::kModeExternalAp;
+    _externalApOnly    = true;
+  } else if (!RouterWireless::parseWifiSelection(body, wifiSelection, wifiError)) {
     markRouterPlanFailed(result);
     result.httpStatus   = 400;
     result.errorCode    = "INVALID_WIFI_SELECTION";
@@ -2041,10 +2103,12 @@ RouterProvisioningManager::configureExistingNetwork(JsonObjectConst body,
   String wirelessIface = wifiSelection.interfaceId;
   String ssidPolicy    = "keep";
   String targetSsid    = wifiSelection.ssid;
-  if (wifiSelection.mode == RouterWireless::kModeNew) {
+  if (!externalApOnly && wifiSelection.mode == RouterWireless::kModeNew) {
     wirelessIface = "renzfi-wifi";
     ssidPolicy    = "rename";
-  } else if (!wirelessIface.isEmpty()) {
+  } else if (!externalApOnly && !wirelessIface.isEmpty()) {
+    // SoftAP + wireless/print needs contiguous INTERNAL DMA; wait briefly.
+    (void)DmaMemoryMonitor::waitForRouterOsConnectHeadroom(1500);
     std::unique_ptr<RouterOsClient::CommandResult> wirelessPtr(
         new (std::nothrow) RouterOsClient::CommandResult());
     RouterOsClient::CommandResult *wireless = wirelessPtr.get();
@@ -2065,7 +2129,8 @@ RouterProvisioningManager::configureExistingNetwork(JsonObjectConst body,
     }
   }
 
-  if (routerClient) {
+  if (routerClient && !externalApOnly) {
+    (void)DmaMemoryMonitor::waitForRouterOsConnectHeadroom(1500);
     String applyError, applyStage;
     if (!RouterWireless::applyWifiSelection(*routerClient, wifiSelection,
                                             candidate.bridgeName, applyError,
@@ -2088,8 +2153,11 @@ RouterProvisioningManager::configureExistingNetwork(JsonObjectConst body,
 
   _wifiSelectionConfigured = true;
   _wifiMode                = wifiSelection.mode;
-  _wifiInterfaceId         = wirelessIface;
-  if (!targetSsid.isEmpty()) {
+  _wifiInterfaceId         = externalApOnly ? String("") : wirelessIface;
+  if (externalApOnly) {
+    _wifiSsid     = "";
+    _wifiPassword = "";
+  } else if (!targetSsid.isEmpty()) {
     _wifiSsid = targetSsid;
   } else if (!wifiSelection.ssid.isEmpty()) {
     _wifiSsid = wifiSelection.ssid;
@@ -2129,6 +2197,7 @@ RouterProvisioningManager::configureExistingNetwork(JsonObjectConst body,
   dataOut["adoptedAt"]             = _adoptedAt;
   dataOut["wifiSelectionConfigured"] = _wifiSelectionConfigured;
   dataOut["wifiMode"]                 = _wifiMode;
+  dataOut["externalApOnly"]           = _externalApOnly;
   dataOut["interfaceId"]              = _wifiInterfaceId;
   if (!_wifiSsid.isEmpty()) dataOut["ssid"] = _wifiSsid;
   dataOut["installationState"] =
@@ -2146,6 +2215,7 @@ void RouterProvisioningManager::fillWirelessStatus(JsonObject dataOut) const {
   dataOut["interfaceId"]   = _wifiInterfaceId;
   dataOut["ssid"]          = _wifiSsid;
   dataOut["configured"]    = wifiSetupComplete();
+  dataOut["externalApOnly"] = _externalApOnly;
   dataOut["security"]      = "wpa2-psk";
   if (!_wifiPassword.isEmpty()) dataOut["password"] = _wifiPassword;
 }
@@ -2208,6 +2278,7 @@ void RouterProvisioningManager::fillNetworkModeStatus(JsonObject dataOut) {
   network["hotspotDetected"]          = _hotspotDetected;
   network["wifiSelectionConfigured"]  = _wifiSelectionConfigured;
   network["wifiSetupComplete"]        = wifiSetupComplete();
+  network["externalApOnly"]           = _externalApOnly;
   network["durableCommitStatus"]      = durableCommitStatus();
   network["wifiSelectionDurablePending"] = wifiSelectionDurablePending();
   if (_durableCommitPhase == DurableCommitPhase::Failed &&
@@ -2226,4 +2297,14 @@ void RouterProvisioningManager::fillNetworkModeStatus(JsonObject dataOut) {
   network["dhcpPool"]                   = _dhcpPool;
   network["dhcpServerName"]             = _dhcpServerName;
   network["poolName"]                   = _poolName;
+}
+
+void routerProvisioningFillNetworkModeStatus(RouterProvisioningManager *mgr,
+                                             JsonObject dataOut) {
+  if (mgr) mgr->fillNetworkModeStatus(dataOut);
+}
+
+void routerProvisioningFillWirelessStatus(RouterProvisioningManager *mgr,
+                                          JsonObject dataOut) {
+  if (mgr) mgr->fillWirelessStatus(dataOut);
 }

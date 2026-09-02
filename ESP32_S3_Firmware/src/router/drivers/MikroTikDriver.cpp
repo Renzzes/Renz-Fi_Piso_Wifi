@@ -167,15 +167,34 @@ bool MikroTikDriver::loadRouterCredentials(String &host, String &username,
                                            String &password,
                                            String &profile) const {
   HeapJsonDocument heap(RenzFiConfig::JSON_DOC_SMALL);
-  if (!_storage || !_storage->readJson(RenzFiConfig::ROUTER_FILE, heap.doc())) {
-    return false;
+  if (_storage && _storage->readJson(RenzFiConfig::ROUTER_FILE, heap.doc())) {
+    JsonDocument &stored = heap;
+    host     = stored["host"] | "";
+    username = stored["username"] | "";
+    password = stored["password"] | "";
+    profile  = stored["profile"] | "default";
+    if (!host.isEmpty() && !username.isEmpty() && !password.isEmpty()) {
+      _cachedHost = host;
+      _cachedUsername = username;
+      _cachedPassword = password;
+      _cachedProfile = profile;
+      _routerCredsCached = true;
+    }
+    return true;
   }
-  JsonDocument &stored = heap;
-  host     = stored["host"] | "";
-  username = stored["username"] | "";
-  password = stored["password"] | "";
-  profile  = stored["profile"] | "default";
-  return true;
+
+  // SD hot-removal / lock timeout: reuse last successful load so Admin
+  // Synchronize / Refresh can still open a live MikroTik session.
+  if (_routerCredsCached && !_cachedHost.isEmpty() && !_cachedUsername.isEmpty() &&
+      !_cachedPassword.isEmpty()) {
+    host = _cachedHost;
+    username = _cachedUsername;
+    password = _cachedPassword;
+    profile = _cachedProfile.isEmpty() ? String("default") : _cachedProfile;
+    Serial.println("[router-config] source=ram-credential-cache");
+    return true;
+  }
+  return false;
 }
 
 void MikroTikDriver::mergeSettings(JsonObjectConst overrideSettings,
@@ -290,48 +309,33 @@ bool MikroTikDriver::profileExistsInResult(
   return false;
 }
 
-String MikroTikDriver::idFromResult(const RouterOsClient::CommandResult &result) {
-  for (uint8_t i = 0; i < result.replyCount; ++i) {
-    const RouterOsClient::ReplyRecord &record = result.replyAt(i);
-    for (uint8_t j = 0; j < record.attrCount; ++j) {
-      String key;
-      String value;
-      if (RouterOsClient::parseAttr(record.attr(j), key, value) &&
-          key == ".id" && !value.isEmpty()) {
-        return value;
-      }
-    }
-  }
-  return "";
-}
+void MikroTikDriver::populateRouterOsResourceFields(
+    JsonObject routerOs,
+    const RouterOsClient::CommandResult &resourceResult,
+    String *versionOut) {
+  const String version = RouterOsClient::findReplyAttr(resourceResult, "version");
+  routerOs["version"]     = version;
+  routerOs["cpuLoad"]     = RouterOsClient::findReplyAttr(resourceResult, "cpu-load");
+  routerOs["freeMemory"]  = RouterOsClient::findReplyAttr(resourceResult, "free-memory");
+  routerOs["totalMemory"] = RouterOsClient::findReplyAttr(resourceResult, "total-memory");
+  routerOs["uptime"]      = RouterOsClient::findReplyAttr(resourceResult, "uptime");
 
-String MikroTikDriver::attrFromResult(const RouterOsClient::CommandResult &result,
-                                      const char *attrName) {
-  for (uint8_t i = 0; i < result.replyCount; ++i) {
-    const RouterOsClient::ReplyRecord &record = result.replyAt(i);
-    for (uint8_t j = 0; j < record.attrCount; ++j) {
-      String key;
-      String value;
-      if (RouterOsClient::parseAttr(record.attr(j), key, value) && key == attrName) {
-        return value;
-      }
+  const char *optionalFields[][2] = {
+      {"board-name", "boardName"},
+      {"total-hdd-space", "totalHddSpace"},
+      {"free-hdd-space", "freeHddSpace"},
+      {"cpu-temperature", "cpuTemperature"},
+  };
+  for (const auto &field : optionalFields) {
+    const String value = RouterOsClient::findReplyAttr(resourceResult, field[0]);
+    if (!value.isEmpty()) {
+      routerOs[field[1]] = value;
     }
   }
-  return "";
-}
 
-static String attrFromReply(const RouterOsClient::CommandResult &result,
-                            uint8_t replyIdx, const char *attrName) {
-  if (replyIdx >= result.replyCount) return "";
-  const RouterOsClient::ReplyRecord &record = result.replyAt(replyIdx);
-  for (uint8_t j = 0; j < record.attrCount; ++j) {
-    String key;
-    String value;
-    if (RouterOsClient::parseAttr(record.attr(j), key, value) && key == attrName) {
-      return value;
-    }
+  if (versionOut) {
+    *versionOut = version;
   }
-  return "";
 }
 
 String MikroTikDriver::macToHotspotUsername(const String &mac) {
@@ -597,7 +601,7 @@ bool MikroTikDriver::setUserProfileRateLimit(const String &name,
     return false;
   }
 
-  const String id = idFromResult(printResult);
+  const String id = RouterOsClient::findReplyAttr(printResult, ".id");
   if (id.isEmpty()) {
     out["error"] = "Profile id missing";
     closeRouterSession();
@@ -624,7 +628,7 @@ bool MikroTikDriver::setUserProfileRateLimit(const String &name,
     closeRouterSession();
     return false;
   }
-  const String verified = attrFromResult(verify, "rate-limit");
+  const String verified = RouterOsClient::findReplyAttr(verify, "rate-limit");
   closeRouterSession();
 
   out["rateLimit"] = verified;
@@ -686,8 +690,8 @@ bool MikroTikDriver::ensureManagedSpeedProfile(uint16_t downloadMbps,
   }
 
   if (printResult.replyCount > 0) {
-    const String id           = idFromResult(printResult);
-    const String existingRate = attrFromResult(printResult, "rate-limit");
+    const String id           = RouterOsClient::findReplyAttr(printResult, ".id");
+    const String existingRate = RouterOsClient::findReplyAttr(printResult, "rate-limit");
     // Ownership is the deterministic renzfi-speed-* name — do not send
     // unsupported RouterOS "comment" on user-profile add/set.
     if (existingRate == rateLimit) {
@@ -747,7 +751,7 @@ bool MikroTikDriver::ensureManagedSpeedProfile(uint16_t downloadMbps,
     closeRouterSession();
     return false;
   }
-  const String verified = attrFromResult(verify, "rate-limit");
+  const String verified = RouterOsClient::findReplyAttr(verify, "rate-limit");
   closeRouterSession();
   out["rateLimit"] = verified;
   out["ok"]        = true;
@@ -836,11 +840,11 @@ bool MikroTikDriver::fillWireless(JsonDocument &out) {
     return canonical.configured && !out["ssid"].as<String>().isEmpty();
   }
 
-  const String ssid             = attrFromResult(wirelessResult, "ssid");
-  const String interfaceName    = attrFromResult(wirelessResult, "name");
-  const String securityProfile  = attrFromResult(wirelessResult, "security-profile");
-  const String bandRaw          = attrFromResult(wirelessResult, "band");
-  const String frequency        = attrFromResult(wirelessResult, "frequency");
+  const String ssid             = RouterOsClient::findReplyAttr(wirelessResult, "ssid");
+  const String interfaceName    = RouterOsClient::findReplyAttr(wirelessResult, "name");
+  const String securityProfile  = RouterOsClient::findReplyAttr(wirelessResult, "security-profile");
+  const String bandRaw          = RouterOsClient::findReplyAttr(wirelessResult, "band");
+  const String frequency        = RouterOsClient::findReplyAttr(wirelessResult, "frequency");
   out["ssid"]      = ssid;
   out["interface"] = interfaceName;
   if (!bandRaw.isEmpty()) {
@@ -867,8 +871,8 @@ bool MikroTikDriver::fillWireless(JsonDocument &out) {
     return true;
   }
 
-  const String authTypes = attrFromResult(secResult, "authentication-types");
-  const String psk        = attrFromResult(secResult, "wpa2-pre-shared-key");
+  const String authTypes = RouterOsClient::findReplyAttr(secResult, "authentication-types");
+  const String psk        = RouterOsClient::findReplyAttr(secResult, "wpa2-pre-shared-key");
   out["security"] = authTypes.isEmpty() ? "none" : authTypes;
   if (!psk.isEmpty()) out["password"] = psk;
 
@@ -989,13 +993,13 @@ bool MikroTikDriver::queryWirelessInterfaceState(RouterOsClient &client,
   out.attrLimitReached = wirelessResult.replyLimitReached;
   out.attrsStored =
       wirelessResult.replyCount > 0 ? wirelessResult.replyAt(0).attrCount : 0;
-  out.id       = attrFromReply(wirelessResult, 0, ".id");
-  out.disabled = attrFromReply(wirelessResult, 0, "disabled");
-  out.running  = attrFromReply(wirelessResult, 0, "running");
-  out.ssid     = attrFromReply(wirelessResult, 0, "ssid");
-  out.mode     = attrFromReply(wirelessResult, 0, "mode");
-  out.frequency = attrFromReply(wirelessResult, 0, "frequency");
-  out.channel   = attrFromReply(wirelessResult, 0, "channel");
+  out.id       = RouterOsClient::replyAttr(wirelessResult, 0, ".id");
+  out.disabled = RouterOsClient::replyAttr(wirelessResult, 0, "disabled");
+  out.running  = RouterOsClient::replyAttr(wirelessResult, 0, "running");
+  out.ssid     = RouterOsClient::replyAttr(wirelessResult, 0, "ssid");
+  out.mode     = RouterOsClient::replyAttr(wirelessResult, 0, "mode");
+  out.frequency = RouterOsClient::replyAttr(wirelessResult, 0, "frequency");
+  out.channel   = RouterOsClient::replyAttr(wirelessResult, 0, "channel");
   out.disabledAttrPresent = replyHasAttr(wirelessResult, 0, "disabled");
   out.runningAttrPresent  = replyHasAttr(wirelessResult, 0, "running");
   out.runtimeSource       = "print";
@@ -1082,7 +1086,7 @@ bool MikroTikDriver::queryWirelessRuntimeOnce(RouterOsClient &client,
     return false;
   }
 
-  inout.runtimeStatus = attrFromReply(monitorResult, 0, "status");
+  inout.runtimeStatus = RouterOsClient::replyAttr(monitorResult, 0, "status");
   inout.runtimeSource = "monitor";
   String statusLower  = inout.runtimeStatus;
   statusLower.toLowerCase();
@@ -1604,7 +1608,8 @@ bool MikroTikDriver::productionNetworkActive(JsonDocument &result) {
   return ok;
 }
 
-void MikroTikDriver::observeAndRepairWan(JsonObject observationOut) {
+void MikroTikDriver::observeAndRepairWan(JsonObject observationOut,
+                                         bool allowRepair) {
   // Explicit Sync/Test only (caller already holds one RouterOS session).
   // Command budget target: ~3–6 targeted prints/sets. No reconnect. No loops.
   constexpr const char *kWanIface = "ether1-WAN";
@@ -1641,10 +1646,12 @@ void MikroTikDriver::observeAndRepairWan(JsonObject observationOut) {
         Serial.printf("[router-budget] operation=wan-observe commands=%u "
                       "session=reuse note=no-iface\n",
                       (unsigned)commands);
+        observeEthernetPorts(observationOut);
+        observeNetworkAddresses(observationOut);
         return;
       }
-      const String disabled = attrFromResult(ifaceResult, "disabled");
-      const String running  = attrFromResult(ifaceResult, "running");
+      const String disabled = RouterOsClient::findReplyAttr(ifaceResult, "disabled");
+      const String running  = RouterOsClient::findReplyAttr(ifaceResult, "running");
       if (disabled == "true") {
         wan["link"] = "down";
       } else if (running == "true") {
@@ -1679,16 +1686,16 @@ void MikroTikDriver::observeAndRepairWan(JsonObject observationOut) {
       commands++;
       bool dhcpAddDefaultRoute = false;
       for (uint8_t i = 0; i < dhcpResult.replyCount; ++i) {
-        const String iface = attrFromReply(dhcpResult, i, "interface");
+        const String iface = RouterOsClient::replyAttr(dhcpResult, i, "interface");
         if (iface != kWanIface) continue;
         dhcpFound = true;
-        dhcpId = attrFromReply(dhcpResult, i, ".id");
-        dhcpStatus = attrFromReply(dhcpResult, i, "status");
-        dhcpAddress = attrFromReply(dhcpResult, i, "address");
-        dhcpGateway = attrFromReply(dhcpResult, i, "gateway");
-        dhcpDisabled = attrFromReply(dhcpResult, i, "disabled");
-        dhcpComment = attrFromReply(dhcpResult, i, "comment");
-        const String addDef = attrFromReply(dhcpResult, i, "add-default-route");
+        dhcpId = RouterOsClient::replyAttr(dhcpResult, i, ".id");
+        dhcpStatus = RouterOsClient::replyAttr(dhcpResult, i, "status");
+        dhcpAddress = RouterOsClient::replyAttr(dhcpResult, i, "address");
+        dhcpGateway = RouterOsClient::replyAttr(dhcpResult, i, "gateway");
+        dhcpDisabled = RouterOsClient::replyAttr(dhcpResult, i, "disabled");
+        dhcpComment = RouterOsClient::replyAttr(dhcpResult, i, "comment");
+        const String addDef = RouterOsClient::replyAttr(dhcpResult, i, "add-default-route");
         dhcpAddDefaultRoute = (addDef == "true" || addDef == "yes");
         (void)dhcpAddDefaultRoute;
         break;
@@ -1702,7 +1709,7 @@ void MikroTikDriver::observeAndRepairWan(JsonObject observationOut) {
     if (dhcpDisabled == "true") {
       wan["dhcp"] = "disabled";
       // Enable only Renz-Fi-owned disabled clients.
-      if (dhcpComment.startsWith("RENZFI:") && !dhcpId.isEmpty()) {
+      if (allowRepair && dhcpComment.startsWith("RENZFI:") && !dhcpId.isEmpty()) {
         RouterOsClient::CommandResult &setResult =
             RouterCommandScratchContext::acquire();
         const String setAttrs[] = {"=.id=" + dhcpId, "=disabled=no"};
@@ -1734,12 +1741,12 @@ void MikroTikDriver::observeAndRepairWan(JsonObject observationOut) {
         !addrResult.trapReceived) {
       commands++;
       for (uint8_t i = 0; i < addrResult.replyCount; ++i) {
-        const String dyn = attrFromReply(addrResult, i, "dynamic");
-        const String dis = attrFromReply(addrResult, i, "disabled");
+        const String dyn = RouterOsClient::replyAttr(addrResult, i, "dynamic");
+        const String dis = RouterOsClient::replyAttr(addrResult, i, "disabled");
         if (dis == "true") continue;
         if (dyn != "true") {
           staticWan = true;
-          wan["ip"] = attrFromReply(addrResult, i, "address");
+          wan["ip"] = RouterOsClient::replyAttr(addrResult, i, "address");
           break;
         }
       }
@@ -1748,7 +1755,7 @@ void MikroTikDriver::observeAndRepairWan(JsonObject observationOut) {
     if (staticWan) {
       wan["dhcp"] = "disabled";
       wan["note"] = "Static WAN address present — DHCP client not created";
-    } else {
+    } else if (allowRepair) {
       RouterOsClient::CommandResult &addResult =
           RouterCommandScratchContext::acquire();
       const String addAttrs[] = {
@@ -1767,6 +1774,11 @@ void MikroTikDriver::observeAndRepairWan(JsonObject observationOut) {
       } else {
         wan["dhcp"] = "unknown";
         wan["note"] = "Unable to create WAN DHCP client";
+      }
+    } else {
+      wan["dhcp"] = "unknown";
+      if (String(wan["note"] | "").length() == 0) {
+        wan["note"] = "No WAN DHCP client (observe-only)";
       }
     }
   }
@@ -1798,10 +1810,10 @@ void MikroTikDriver::observeAndRepairWan(JsonObject observationOut) {
     if (routeQueryOk) {
       commands++;
       for (uint8_t i = 0; i < routeResult.replyCount; ++i) {
-        const String active = attrFromReply(routeResult, i, "active");
-        const String gateway = attrFromReply(routeResult, i, "gateway");
-        const String comment = attrFromReply(routeResult, i, "comment");
-        const String id = attrFromReply(routeResult, i, ".id");
+        const String active = RouterOsClient::replyAttr(routeResult, i, "active");
+        const String gateway = RouterOsClient::replyAttr(routeResult, i, "gateway");
+        const String comment = RouterOsClient::replyAttr(routeResult, i, "comment");
+        const String id = RouterOsClient::replyAttr(routeResult, i, ".id");
         if (comment == kTempRouteComment && !id.isEmpty()) {
           tempRouteId = id;
         }
@@ -1828,7 +1840,7 @@ void MikroTikDriver::observeAndRepairWan(JsonObject observationOut) {
   }
 
   // Remove ONLY the exact Renz-Fi-legacy temporary static when DHCP owns routing.
-  if (!tempRouteId.isEmpty() &&
+  if (allowRepair && !tempRouteId.isEmpty() &&
       (strcmp(wan["dhcp"] | "", "bound") == 0) &&
       activeDefault) {
     RouterOsClient::CommandResult &rm = RouterCommandScratchContext::acquire();
@@ -1866,7 +1878,7 @@ void MikroTikDriver::observeAndRepairWan(JsonObject observationOut) {
       if (_routerOs.executeCommand("/ping", pingAttrs, 2, pingResult) &&
           !pingResult.trapReceived) {
         commands++;
-        const String received = attrFromResult(pingResult, "received");
+        const String received = RouterOsClient::findReplyAttr(pingResult, "received");
         if (received.length() > 0) {
           wan["internet"] = (received.toInt() > 0) ? "online" : "offline";
         } else if (pingResult.replyCount > 0) {
@@ -1907,6 +1919,97 @@ void MikroTikDriver::observeAndRepairWan(JsonObject observationOut) {
   Serial.printf(
       "[router-budget] operation=wan-observe commands=%u session=reuse\n",
       (unsigned)commands);
+  observeEthernetPorts(observationOut);
+  observeNetworkAddresses(observationOut);
+}
+
+void MikroTikDriver::observeEthernetPorts(JsonObject observationOut) {
+  JsonArray ports = observationOut["ethernetPorts"].to<JsonArray>();
+  observationOut["ethernetPortsKnown"] = false;
+
+  RouterOsClient::CommandResult &ifaceResult =
+      RouterCommandScratchContext::acquire();
+  const String ifaceProps[] = {
+      "=.proplist=name,default-name,running,disabled,comment,type"};
+  if (!_routerOs.executeCommand("/interface/print", ifaceProps, 1, ifaceResult) ||
+      ifaceResult.trapReceived) {
+    return;
+  }
+
+  RouterOsClient::CommandResult &bridgeResult =
+      RouterCommandScratchContext::acquire();
+  const String bridgeProps[] = {"=.proplist=interface,bridge"};
+  const bool bridgeOk =
+      _routerOs.executeCommand("/interface/bridge/port/print", bridgeProps, 1,
+                               bridgeResult) &&
+      !bridgeResult.trapReceived;
+
+  for (uint8_t i = 0; i < ifaceResult.replyCount; ++i) {
+    const String type = RouterOsClient::replyAttr(ifaceResult, i, "type");
+    const String name = RouterOsClient::replyAttr(ifaceResult, i, "name");
+    const String defaultName = RouterOsClient::replyAttr(ifaceResult, i, "default-name");
+    const bool isEther =
+        type == "ether" || name.startsWith("ether") ||
+        (!defaultName.isEmpty() && defaultName.startsWith("ether"));
+    if (!isEther) continue;
+    if (name.isEmpty()) continue;
+
+    JsonObject row = ports.add<JsonObject>();
+    row["name"] = name;
+    if (!defaultName.isEmpty()) row["defaultName"] = defaultName;
+    const String running = RouterOsClient::replyAttr(ifaceResult, i, "running");
+    const String disabled = RouterOsClient::replyAttr(ifaceResult, i, "disabled");
+    if (running == "true") {
+      row["running"] = true;
+    } else if (running == "false") {
+      row["running"] = false;
+    }
+    if (disabled == "true") {
+      row["disabled"] = true;
+    } else if (disabled == "false") {
+      row["disabled"] = false;
+    }
+    const String comment = RouterOsClient::replyAttr(ifaceResult, i, "comment");
+    if (!comment.isEmpty()) row["comment"] = comment;
+
+    if (bridgeOk) {
+      for (uint8_t j = 0; j < bridgeResult.replyCount; ++j) {
+        if (RouterOsClient::replyAttr(bridgeResult, j, "interface") == name) {
+          const String bridge = RouterOsClient::replyAttr(bridgeResult, j, "bridge");
+          if (!bridge.isEmpty()) row["bridge"] = bridge;
+          break;
+        }
+      }
+    }
+  }
+  observationOut["ethernetPortsKnown"] = ports.size() > 0;
+}
+
+void MikroTikDriver::observeNetworkAddresses(JsonObject observationOut) {
+  JsonArray addrs = observationOut["networkAddresses"].to<JsonArray>();
+  observationOut["networkAddressesKnown"] = false;
+
+  RouterOsClient::CommandResult &result =
+      RouterCommandScratchContext::acquire();
+  const String props[] = {"=.proplist=interface,address,network,actual-interface"};
+  if (!_routerOs.executeCommand("/ip/address/print", props, 1, result) ||
+      result.trapReceived) {
+    return;
+  }
+
+  for (uint8_t i = 0; i < result.replyCount; ++i) {
+    const String iface = RouterOsClient::replyAttr(result, i, "interface");
+    const String address = RouterOsClient::replyAttr(result, i, "address");
+    if (iface.isEmpty() || address.isEmpty()) continue;
+    JsonObject row = addrs.add<JsonObject>();
+    row["interface"] = iface;
+    row["address"] = address;
+    const String network = RouterOsClient::replyAttr(result, i, "network");
+    if (!network.isEmpty()) row["network"] = network;
+    const String actualIface = RouterOsClient::replyAttr(result, i, "actual-interface");
+    if (!actualIface.isEmpty()) row["actualInterface"] = actualIface;
+  }
+  observationOut["networkAddressesKnown"] = addrs.size() > 0;
 }
 
 bool MikroTikDriver::collectCacheSnapshot(JsonDocument &out,
@@ -1975,12 +2078,8 @@ bool MikroTikDriver::collectCacheSnapshot(JsonDocument &out,
       !resourceResult.trapReceived) {
     resourceOk = true;
     JsonObject routerOs = out["routerOs"].to<JsonObject>();
-    const String version = attrFromResult(resourceResult, "version");
-    routerOs["version"]     = version;
-    routerOs["cpuLoad"]     = attrFromResult(resourceResult, "cpu-load");
-    routerOs["freeMemory"]  = attrFromResult(resourceResult, "free-memory");
-    routerOs["totalMemory"] = attrFromResult(resourceResult, "total-memory");
-    routerOs["uptime"]      = attrFromResult(resourceResult, "uptime");
+    String version;
+    populateRouterOsResourceFields(routerOs, resourceResult, &version);
     if (!version.isEmpty()) out["routerOsVersion"] = version;
   }
 
@@ -2001,8 +2100,8 @@ bool MikroTikDriver::collectCacheSnapshot(JsonDocument &out,
     if (_routerOs.executeCommand("/ip/hotspot/print", hotspotAttrs, 1,
                                  hotspotResult) &&
         !hotspotResult.trapReceived && hotspotResult.replyCount > 0) {
-      const String hsName = attrFromResult(hotspotResult, "name");
-      const String hsIface = attrFromResult(hotspotResult, "interface");
+      const String hsName = RouterOsClient::findReplyAttr(hotspotResult, "name");
+      const String hsIface = RouterOsClient::findReplyAttr(hotspotResult, "interface");
       if (!hsName.isEmpty()) {
         out["hotspotServer"] = hsName;
         observation["hotspotStatus"] = "available";
@@ -2015,11 +2114,52 @@ bool MikroTikDriver::collectCacheSnapshot(JsonDocument &out,
       observation["hotspotStatus"] = "unknown";
     }
     Serial.println("[router-refresh] hotspot-status");
+    observeAndRepairWan(observation, false);
+    Serial.println("[router-refresh] wan-status");
     closeRouterSession();
     Serial.printf("[router-refresh] completed duration=%lums\n",
                   static_cast<unsigned long>(millis() - t0));
     return true;
   }
+
+  if (!resourceOk) {
+    out["error"] = "Unable to read RouterOS resource telemetry";
+    closeRouterSession();
+    return false;
+  }
+
+  // Configuration Sync — probe hotspot/WAN early while job budget remains for
+  // ICMP ping. Late observe after profiles often skips ping and makes Admin
+  // show Hotspot Unavailable / Internet Unable to verify until Refresh.
+  JsonObject observation = out["observation"].to<JsonObject>();
+  observation["connectivity"] = "online";
+  Serial.println("[router-sync] early-hotspot");
+  {
+    RouterOsClient::CommandResult &hotspotResult =
+        RouterCommandScratchContext::acquire();
+    const String hotspotAttrs[] = {"=.proplist=name,interface,disabled"};
+    if (_routerOs.executeCommand("/ip/hotspot/print", hotspotAttrs, 1,
+                                 hotspotResult) &&
+        !hotspotResult.trapReceived && hotspotResult.replyCount > 0) {
+      const String hsName = RouterOsClient::findReplyAttr(hotspotResult, "name");
+      const String hsIface = RouterOsClient::findReplyAttr(hotspotResult, "interface");
+      if (!hsName.isEmpty()) {
+        out["hotspotServer"] = hsName;
+        observation["hotspotStatus"] = "available";
+        observation["hotspotServer"] = hsName;
+        if (!hsIface.isEmpty()) {
+          observation["hotspotInterface"] = hsIface;
+          if (bridgeHint.isEmpty()) out["bridge"] = hsIface;
+        }
+      } else {
+        observation["hotspotStatus"] = "unavailable";
+      }
+    } else {
+      observation["hotspotStatus"] = "unknown";
+    }
+  }
+  observeAndRepairWan(observation, false);
+  Serial.println("[router-sync] early-wan-status");
 
   // —— Configuration Sync (no WAN repair, no captive reconcile) ——
   Serial.println("[router-sync] identity");
@@ -2069,7 +2209,7 @@ bool MikroTikDriver::collectCacheSnapshot(JsonDocument &out,
       uint8_t chosenIdx = 0;
       if (!selectedWireless.isEmpty()) {
         for (uint8_t i = 0; i < wirelessResult.replyCount; ++i) {
-          const String name = attrFromReply(wirelessResult, i, "name");
+          const String name = RouterOsClient::replyAttr(wirelessResult, i, "name");
           if (name == selectedWireless) {
             chosenIdx = i;
             break;
@@ -2077,13 +2217,13 @@ bool MikroTikDriver::collectCacheSnapshot(JsonDocument &out,
         }
       }
 
-      const String ifaceName = attrFromReply(wirelessResult, chosenIdx, "name");
-      const String ssid      = attrFromReply(wirelessResult, chosenIdx, "ssid");
+      const String ifaceName = RouterOsClient::replyAttr(wirelessResult, chosenIdx, "name");
+      const String ssid      = RouterOsClient::replyAttr(wirelessResult, chosenIdx, "ssid");
       const String secProfile =
-          attrFromReply(wirelessResult, chosenIdx, "security-profile");
-      const String bandRaw = attrFromReply(wirelessResult, chosenIdx, "band");
+          RouterOsClient::replyAttr(wirelessResult, chosenIdx, "security-profile");
+      const String bandRaw = RouterOsClient::replyAttr(wirelessResult, chosenIdx, "band");
       const String frequency =
-          attrFromReply(wirelessResult, chosenIdx, "frequency");
+          RouterOsClient::replyAttr(wirelessResult, chosenIdx, "frequency");
       out["wirelessInterface"] = ifaceName;
       out["ssid"]              = ssid;
       if (!bandRaw.isEmpty()) {
@@ -2110,7 +2250,7 @@ bool MikroTikDriver::collectCacheSnapshot(JsonDocument &out,
                 secResult) &&
             !secResult.trapReceived && secResult.replyCount > 0) {
           const String authTypes =
-              attrFromResult(secResult, "authentication-types");
+              RouterOsClient::findReplyAttr(secResult, "authentication-types");
           out["security"] = authTypes.isEmpty() ? "none" : authTypes;
         } else {
           out["security"] = "unknown";
@@ -2126,24 +2266,6 @@ bool MikroTikDriver::collectCacheSnapshot(JsonDocument &out,
   // Intentionally NOT calling reconcileCaptiveHotspotPath — retained for
   // future Diagnostics/Repair only (Phase 3).
 
-  Serial.println("[router-sync] hotspot");
-  {
-    RouterOsClient::CommandResult &hotspotResult =
-        RouterCommandScratchContext::acquire();
-    const String hotspotAttrs[] = {"=.proplist=name,interface,disabled"};
-    if (_routerOs.executeCommand("/ip/hotspot/print", hotspotAttrs, 1,
-                                 hotspotResult) &&
-        !hotspotResult.trapReceived && hotspotResult.replyCount > 0) {
-      out["hotspotServer"] = attrFromResult(hotspotResult, "name");
-      const String hsInterface = attrFromResult(hotspotResult, "interface");
-      if (bridgeHint.isEmpty() && !hsInterface.isEmpty()) {
-        out["bridge"] = hsInterface;
-      }
-    }
-  }
-
-  // Intentionally NOT fetching html-directory via hotspot profile print.
-
   Serial.println("[router-sync] profiles");
   RouterOsClient::CommandResult &userProfiles =
       RouterCommandScratchContext::acquire();
@@ -2157,22 +2279,29 @@ bool MikroTikDriver::collectCacheSnapshot(JsonDocument &out,
     if (userProfiles.replyLimitReached) out["truncated"] = true;
   }
 
-  JsonObject observation = out["observation"].to<JsonObject>();
-  observation["connectivity"] = "online";
-  const char *hsServer = out["hotspotServer"] | "";
-  const String hsIfaceObs = out["bridge"] | "";
-  if (hsServer && strlen(hsServer) > 0) {
-    observation["hotspotStatus"] = "available";
-    observation["hotspotServer"] = hsServer;
-    if (!hsIfaceObs.isEmpty()) {
-      observation["hotspotInterface"] = hsIfaceObs;
+  Serial.println("[router-sync] hotspot");
+  {
+    RouterOsClient::CommandResult &hotspotResult =
+        RouterCommandScratchContext::acquire();
+    const String hotspotAttrs[] = {"=.proplist=name,interface,disabled"};
+    if (_routerOs.executeCommand("/ip/hotspot/print", hotspotAttrs, 1,
+                                 hotspotResult) &&
+        !hotspotResult.trapReceived && hotspotResult.replyCount > 0) {
+      const String hsName = RouterOsClient::findReplyAttr(hotspotResult, "name");
+      const String hsIface = RouterOsClient::findReplyAttr(hotspotResult, "interface");
+      if (!hsName.isEmpty()) {
+        out["hotspotServer"] = hsName;
+        observation["hotspotStatus"] = "available";
+        observation["hotspotServer"] = hsName;
+        if (!hsIface.isEmpty()) {
+          observation["hotspotInterface"] = hsIface;
+          if (bridgeHint.isEmpty()) out["bridge"] = hsIface;
+        }
+      }
+      // Late print empty/failed: keep early-hotspot observation — do not
+      // downgrade to unavailable after a long sync command burst.
     }
-  } else {
-    observation["hotspotStatus"] = "unavailable";
   }
-
-  // Intentionally NOT calling observeAndRepairWan — retained for future
-  // Diagnostics/Repair only (Phase 3). No /ip/route/print on Sync/Refresh.
 
   closeRouterSession();
   Serial.println("[router-sync] cache-save pending");
@@ -2342,11 +2471,7 @@ bool MikroTikDriver::testSettings(JsonObjectConst overrideSettings,
   if (_routerOs.executeCommand("/system/resource/print", resourceResult) &&
       !resourceResult.trapReceived) {
     JsonObject routerOs = out["routerOs"].to<JsonObject>();
-    routerOs["version"]     = attrFromResult(resourceResult, "version");
-    routerOs["cpuLoad"]     = attrFromResult(resourceResult, "cpu-load");
-    routerOs["freeMemory"]  = attrFromResult(resourceResult, "free-memory");
-    routerOs["totalMemory"] = attrFromResult(resourceResult, "total-memory");
-    routerOs["uptime"]      = attrFromResult(resourceResult, "uptime");
+    populateRouterOsResourceFields(routerOs, resourceResult, nullptr);
   }
 
   // Same-session bounded Hotspot User Profile inventory (name + rate-limit).
@@ -2395,10 +2520,10 @@ bool MikroTikDriver::testSettings(JsonObjectConst overrideSettings,
   if (_routerOs.executeCommand("/ip/hotspot/print", hotspotAttrs, 1, hotspotResult) &&
       !hotspotResult.trapReceived) {
     for (uint8_t i = 0; i < hotspotResult.replyCount; ++i) {
-      const String disabled = attrFromReply(hotspotResult, i, "disabled");
+      const String disabled = RouterOsClient::replyAttr(hotspotResult, i, "disabled");
       if (disabled == "true") continue;
-      const String hsName = attrFromReply(hotspotResult, i, "name");
-      const String hsIface = attrFromReply(hotspotResult, i, "interface");
+      const String hsName = RouterOsClient::replyAttr(hotspotResult, i, "name");
+      const String hsIface = RouterOsClient::replyAttr(hotspotResult, i, "interface");
       if (!hsName.isEmpty()) observation["hotspotServer"] = hsName;
       if (!hsIface.isEmpty()) observation["hotspotInterface"] = hsIface;
       hotspotAvailable = true;
@@ -2464,7 +2589,7 @@ bool MikroTikDriver::removeHotspotActiveByMac(const String &mac) {
                                 activeResult)) {
     return false;
   }
-  const String activeId = idFromResult(activeResult);
+  const String activeId = RouterOsClient::findReplyAttr(activeResult, ".id");
   if (activeId.isEmpty()) return true;
   const String removeAttrs[] = {"=.id=" + activeId};
   RouterOsClient::CommandResult &removeResult = RouterCommandScratchContext::acquire();
@@ -2488,7 +2613,7 @@ bool MikroTikDriver::removeHotspotCookiesByMac(const String &mac) {
       return;
     }
     for (uint8_t i = 0; i < cookieResult.replyCount && idCount < 8; ++i) {
-      const String id = attrFromReply(cookieResult, i, ".id");
+      const String id = RouterOsClient::replyAttr(cookieResult, i, ".id");
       if (id.isEmpty()) continue;
       bool dup = false;
       for (uint8_t j = 0; j < idCount; ++j) {
@@ -2542,11 +2667,11 @@ bool MikroTikDriver::loginHotspotActive(const HotspotUser &user,
         RouterCommandScratchContext::acquire();
     if (_routerOs.executeCommand("/ip/hotspot/active/print",
                                  "?mac-address=" + user.mac, activePrint)) {
-      activeId = idFromResult(activePrint);
+      activeId = RouterOsClient::findReplyAttr(activePrint, ".id");
       existingActiveUptime =
-          parseRouterOsDurationSeconds(attrFromResult(activePrint, "uptime"));
+          parseRouterOsDurationSeconds(RouterOsClient::findReplyAttr(activePrint, "uptime"));
       existingActiveLeft = parseRouterOsDurationSeconds(
-          attrFromResult(activePrint, "session-time-left"));
+          RouterOsClient::findReplyAttr(activePrint, "session-time-left"));
     }
   }
 
@@ -2573,30 +2698,88 @@ bool MikroTikDriver::loginHotspotActive(const HotspotUser &user,
     return true;
   }
 
-  String loginAttrs[4];
-  uint8_t attrCount = 0;
-  loginAttrs[attrCount++] = "=user=" + hotspotUser;
-  loginAttrs[attrCount++] = "=password=" + hotspotPassword;
+  // RouterOS active/login requires the client in /ip/hotspot/host when ip= is
+  // supplied. Portal-stored ipAddress can lag DHCP / deauth — TRAP unknown host IP.
+  String loginIp;
   if (!user.mac.isEmpty()) {
-    loginAttrs[attrCount++] = "=mac-address=" + user.mac;
-  }
-  if (!user.ip.isEmpty()) {
-    loginAttrs[attrCount++] = "=ip=" + user.ip;
+    for (uint8_t attempt = 0; attempt < 4; ++attempt) {
+      RouterOsClient::CommandResult &hostPrint =
+          RouterCommandScratchContext::acquire();
+      if (_routerOs.executeCommand("/ip/hotspot/host/print",
+                                   "?mac-address=" + user.mac, hostPrint) &&
+          !hostPrint.trapReceived && hostPrint.replyCount > 0) {
+        const String hostAddr = RouterOsClient::findReplyAttr(hostPrint, "address");
+        if (!hostAddr.isEmpty()) {
+          loginIp = hostAddr;
+          break;
+        }
+      }
+      if (attempt < 3) vTaskDelay(pdMS_TO_TICKS(400));
+    }
+    if (loginIp.isEmpty() && !user.ip.isEmpty()) {
+      Serial.printf(
+          "[activate] hotspot-host miss mac=%s portal_ip=%s — active/login "
+          "without ip=\n",
+          user.mac.c_str(), user.ip.c_str());
+    }
+  } else if (!user.ip.isEmpty()) {
+    loginIp = user.ip;
   }
 
-  RouterOsClient::CommandResult &loginResult = RouterCommandScratchContext::acquire();
-  const bool ok =
-      _routerOs.executeCommand("/ip/hotspot/active/login", loginAttrs, attrCount,
-                               loginResult) &&
-      !loginResult.trapReceived;
-  if (!ok) {
-    const String reason = loginResult.trapMessage.isEmpty() ? _routerOs.lastError()
-                                                            : loginResult.trapMessage;
-    Serial.printf("[activate] operation=active_login mac=%s result=fail reason=%s\n",
-                  user.mac.c_str(), reason.c_str());
-    if (_logger) {
-      _logger->error("router", "Hotspot active login failed: " + reason);
+  auto attemptActiveLogin = [&](const String &ipArg, bool includeIp) -> bool {
+    String loginAttrs[4];
+    uint8_t attrCount = 0;
+    loginAttrs[attrCount++] = "=user=" + hotspotUser;
+    loginAttrs[attrCount++] = "=password=" + hotspotPassword;
+    if (!user.mac.isEmpty()) {
+      loginAttrs[attrCount++] = "=mac-address=" + user.mac;
     }
+    if (includeIp && !ipArg.isEmpty()) {
+      loginAttrs[attrCount++] = "=ip=" + ipArg;
+    }
+
+    RouterOsClient::CommandResult &loginResult =
+        RouterCommandScratchContext::acquire();
+    const bool cmdOk =
+        _routerOs.executeCommand("/ip/hotspot/active/login", loginAttrs, attrCount,
+                                 loginResult) &&
+        !loginResult.trapReceived;
+    if (!cmdOk) {
+      const String reason = loginResult.trapMessage.isEmpty()
+                                ? _routerOs.lastError()
+                                : loginResult.trapMessage;
+      Serial.printf(
+          "[activate] operation=active_login mac=%s result=fail reason=%s "
+          "include_ip=%s\n",
+          user.mac.c_str(), reason.c_str(), includeIp ? "yes" : "no");
+      if (_logger) {
+        _logger->error("router", "Hotspot active login failed: " + reason);
+      }
+    }
+    return cmdOk;
+  };
+
+  bool ok = false;
+  if (!loginIp.isEmpty()) {
+    ok = attemptActiveLogin(loginIp, true);
+    if (!ok) {
+      RouterOsClient::CommandResult &retryHost =
+          RouterCommandScratchContext::acquire();
+      if (_routerOs.executeCommand("/ip/hotspot/host/print",
+                                   "?mac-address=" + user.mac, retryHost) &&
+          !retryHost.trapReceived && retryHost.replyCount > 0) {
+        const String refreshed = RouterOsClient::findReplyAttr(retryHost, "address");
+        if (!refreshed.isEmpty() && refreshed != loginIp) {
+          loginIp = refreshed;
+          ok = attemptActiveLogin(loginIp, true);
+        }
+      }
+    }
+  }
+  if (!ok) {
+    ok = attemptActiveLogin(String(), false);
+  }
+  if (!ok) {
     return false;
   }
 
@@ -2609,7 +2792,7 @@ bool MikroTikDriver::loginHotspotActive(const HotspotUser &user,
         RouterCommandScratchContext::acquire();
     if (_routerOs.executeCommand("/ip/hotspot/active/print",
                                  "?mac-address=" + user.mac, verify)) {
-      const String verifiedId = idFromResult(verify);
+      const String verifiedId = RouterOsClient::findReplyAttr(verify, ".id");
       if (verifiedId.isEmpty()) {
         Serial.printf(
             "[activate] operation=active_login mac=%s result=fail "
@@ -2624,9 +2807,9 @@ bool MikroTikDriver::loginHotspotActive(const HotspotUser &user,
       }
       _lastActivateTrace.activeVerifySuccess = true;
       _lastActivateTrace.activeUptime =
-          parseRouterOsDurationSeconds(attrFromResult(verify, "uptime"));
+          parseRouterOsDurationSeconds(RouterOsClient::findReplyAttr(verify, "uptime"));
       _lastActivateTrace.activeSessionTimeLeft = parseRouterOsDurationSeconds(
-          attrFromResult(verify, "session-time-left"));
+          RouterOsClient::findReplyAttr(verify, "session-time-left"));
       Serial.printf(
           "[activate] operation=active_login mac=%s result=ok active_id=%s "
           "session_limit=%s active_uptime=%u session_time_left=%u\n",
@@ -2720,11 +2903,11 @@ bool MikroTikDriver::createHotspotUser(const HotspotUser &user) {
   commandCount++;
   logRouterStack("after hotspot user print");
 
-  const String existingId = idFromResult(printResult);
+  const String existingId = RouterOsClient::findReplyAttr(printResult, ".id");
   const uint32_t existingUptime =
-      parseRouterOsDurationSeconds(attrFromResult(printResult, "uptime"));
+      parseRouterOsDurationSeconds(RouterOsClient::findReplyAttr(printResult, "uptime"));
   const uint32_t existingLimit =
-      parseRouterOsDurationSeconds(attrFromResult(printResult, "limit-uptime"));
+      parseRouterOsDurationSeconds(RouterOsClient::findReplyAttr(printResult, "limit-uptime"));
 
   // Lifetime cap must cover historical uptime + new entitlement from now.
   // Saturating add avoids wrap on pathological RouterOS values.
@@ -2930,7 +3113,7 @@ bool MikroTikDriver::queryHotspotActivePresent(const String &mac,
   const bool ok = _routerOs.executeCommand("/ip/hotspot/active/print",
                                            "?mac-address=" + mac, activeResult);
   if (ok) {
-    presentOut = !idFromResult(activeResult).isEmpty();
+    presentOut = !RouterOsClient::findReplyAttr(activeResult, ".id").isEmpty();
   }
   closeRouterSession();
   Serial.printf("[activate] operation=verify_active mac=%s query_ok=%s "
@@ -2967,7 +3150,7 @@ bool MikroTikDriver::deauthorizeUser(const String &mac) {
   RouterOsClient::CommandResult &printResult = RouterCommandScratchContext::acquire();
   if (_routerOs.executeCommand("/ip/hotspot/user/print", "?name=" + hotspotUser,
                                printResult)) {
-    const String userId = idFromResult(printResult);
+    const String userId = RouterOsClient::findReplyAttr(printResult, ".id");
     if (!userId.isEmpty()) {
       const String removeAttrs[] = {"=.id=" + userId};
       RouterOsClient::CommandResult &removeResult = RouterCommandScratchContext::acquire();

@@ -14,6 +14,10 @@ namespace {
 DynamicJsonDocument g_cachedProfile(RenzFiConfig::JSON_DOC_MEDIUM);
 bool g_profileValid = false;
 
+String g_cachedFriendlyName = "Renz-Fi Appliance";
+bool g_friendlyNameValid = false;
+uint32_t g_friendlyNameMs = 0;
+
 String resolveMacAddress(EthernetManager *eth) {
   if (eth && eth->driverReady()) {
     const String ethMac = eth->macAddress();
@@ -48,12 +52,28 @@ String formatDeviceId(const String &macAddress) {
 String readFriendlyName(StorageManager *storage) {
   if (!storage) return String("Renz-Fi Appliance");
 
+  // FirmwareApp::refreshHealthSnapshots calls refreshRuntimeProfile every 2s.
+  // Re-reading settings.json under STORAGE_LOCK each cycle is a proven
+  // async_tcp TWDT amplifier on shared CPU1 (login/dashboard storms).
+  const uint32_t now = millis();
+  if (g_friendlyNameValid &&
+      (now - g_friendlyNameMs) <
+          RenzFiConfig::STORAGE_SNAPSHOT_HEAVY_INTERVAL_MS) {
+    return g_cachedFriendlyName;
+  }
+
   DynamicJsonDocument doc(RenzFiConfig::JSON_DOC_SMALL);
   if (!storage->readJson(RenzFiConfig::SETTINGS_FILE, doc)) {
-    return String("Renz-Fi Appliance");
+    g_cachedFriendlyName = "Renz-Fi Appliance";
+    g_friendlyNameValid = true;
+    g_friendlyNameMs = now;
+    return g_cachedFriendlyName;
   }
   const char *name = doc["device"]["name"] | "Renz-Fi Appliance";
-  return String(name);
+  g_cachedFriendlyName = String(name);
+  g_friendlyNameValid = true;
+  g_friendlyNameMs = now;
+  return g_cachedFriendlyName;
 }
 
 String stableChipMacAddress() {
@@ -122,7 +142,10 @@ void refreshRuntimeProfile(EthernetManager *eth, StorageManager *storage,
   g_profileValid = true;
 }
 
-void invalidateRuntimeProfile() { g_profileValid = false; }
+void invalidateRuntimeProfile() {
+  g_profileValid = false;
+  g_friendlyNameValid = false;
+}
 
 void fillRuntimeProfile(JsonObject out) {
   if (!g_profileValid) return;

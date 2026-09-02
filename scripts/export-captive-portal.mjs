@@ -140,7 +140,9 @@ const lines = [
   "  - Edit ONLY portal/ in the repo.",
   "  - Never hand-edit this export folder as source.",
   "  - Upload these files as an OVERLAY into the router's existing hotspot/",
-  "    directory. Do not delete native Hotspot servlets (alogin.html, etc.).",
+  "    directory. You MUST overwrite status.html (it is the Renz-Fi /status page).",
+  "  - Do not delete native Hotspot servlets: alogin.html, redirect.html,",
+  "    logout.html, error.html.",
   "",
   "Files exported:",
 ];

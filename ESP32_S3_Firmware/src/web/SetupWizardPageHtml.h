@@ -115,6 +115,26 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     .install-important strong{display:block;margin-bottom:4px;color:#e2e8f0}
     .install-actions{display:flex;flex-direction:column;gap:8px;margin-top:16px}
     .install-actions button.secondary{margin-top:0}
+    .busy-overlay{position:fixed;inset:0;background:rgba(15,23,42,.88);display:flex;
+                  align-items:center;justify-content:center;padding:20px;z-index:2000}
+    .busy-overlay.hidden-block{display:none}
+    .busy-card{background:#1e293b;border:1px solid #475569;border-radius:14px;padding:22px 18px;
+               max-width:360px;width:100%;text-align:center;box-shadow:0 12px 40px rgba(0,0,0,.45)}
+    .busy-spinner{width:36px;height:36px;margin:0 auto 14px;border:3px solid #334155;
+                  border-top-color:#3b82f6;border-radius:50%;animation:spin .75s linear infinite}
+    .busy-card h2{margin:0 0 8px;font-size:1.05rem;font-weight:700;color:#e2e8f0}
+    .busy-detail{margin:0 0 16px;font-size:.9rem;line-height:1.45;color:#cbd5e1;min-height:2.6em}
+    .busy-progress-track{height:8px;background:#0f172a;border-radius:999px;overflow:hidden;
+                         border:1px solid #334155;margin-bottom:12px}
+    .busy-progress-bar{height:100%;width:18%;background:linear-gradient(90deg,#2563eb,#38bdf8);
+                       border-radius:999px;transition:width .35s ease}
+    .busy-progress-bar.indeterminate{width:40%;animation:busy-slide 1.2s ease-in-out infinite}
+    @keyframes busy-slide{0%{transform:translateX(-120%)}100%{transform:translateX(280%)}}
+    .busy-hint{margin:0;font-size:.78rem;line-height:1.4;color:#94a3b8}
+    .busy-actions{display:flex;gap:8px;margin-top:14px}
+    .busy-actions button{flex:1;margin-top:0}
+    .busy-card.busy-error .busy-spinner{display:none}
+    .busy-card.busy-error .busy-progress-track{display:none}
   </style>
 </head>
 <body>
@@ -214,27 +234,36 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
           <button id="adoptExistingBtn" type="button" disabled>Confirm</button>
         </div>
 
-        <div id="adoptProgressModal" class="modal-backdrop hidden-block" role="dialog" aria-modal="true">
-          <div class="modal-card">
-            <h2 id="adoptProgressTitle" style="margin:0 0 12px;font-size:1rem">Installing Network</h2>
-            <div id="adoptProgressBody" class="notice">Preparing...</div>
-            <div id="adoptProgressActions" class="modal-actions hidden-block"></div>
-          </div>
-        </div>
-
         <button id="reviewBackBtn" type="button" class="secondary">Back</button>
       </div>
     </div>
 
     <div id="panelWifi" class="panel">
       <div class="card">
-        <h2>Step 4 &mdash; Wi-Fi Configuration</h2>
-        <p class="sub" style="margin-bottom:12px">
+        <h2 id="wifiStepTitle">Step 4 &mdash; Wi-Fi Configuration</h2>
+        <p id="wifiStepSub" class="sub" style="margin-bottom:12px">
           Choose an existing SSID on your MikroTik or create a dedicated Piso Wi-Fi network.
         </p>
         <div id="wifiFormError" class="form-error"></div>
         <div id="wifiNetworksNotice" class="notice">Loading available SSIDs&hellip;</div>
 
+        <div id="wifiExternalApSection" style="display:none">
+          <div class="notice" style="margin-bottom:12px">
+            <strong>External Access Point</strong><br>
+            No MikroTik Wi-Fi. Renz-Fi uses the guest bridge and HotSpot; Wi-Fi comes from a LAN AP.
+          </div>
+          <ul class="scan-checklist" style="margin:0 0 12px;padding-left:18px">
+            <li>Guest bridge: <strong id="externalApBridgeLabel">&mdash;</strong></li>
+            <li>Guest network: <strong id="externalApNetworkLabel">&mdash;</strong></li>
+            <li>HotSpot / DHCP / NAT on MikroTik</li>
+          </ul>
+          <p class="sub" style="margin-bottom:12px">
+            Register the AP after install under <strong>Networking &rarr; Access Points</strong>.
+            Configure the AP first (bridge mode, DHCP off, NAT off).
+          </p>
+        </div>
+
+        <div id="wifiMikrotikWirelessSection">
         <div class="network-mode-group">
           <label class="network-mode-choice">
             <input type="radio" name="wifiModeChoice" id="wifiModeExisting" value="existing" checked>
@@ -257,6 +286,7 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
               </span>
             </span>
           </label>
+        </div>
         </div>
 
         <button id="wifiNextBtn" type="button">Finish</button>
@@ -347,6 +377,23 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
 
     <div id="globalLoading" class="loading" style="display:none">Loading&hellip;</div>
   </main>
+
+  <div id="busyOverlay" class="busy-overlay hidden-block" role="dialog" aria-modal="true"
+       aria-labelledby="busyTitle" aria-describedby="busyDetail">
+    <div id="busyCard" class="busy-card">
+      <div class="busy-spinner" aria-hidden="true"></div>
+      <h2 id="busyTitle">Working&hellip;</h2>
+      <p id="busyDetail" class="busy-detail">Please wait.</p>
+      <div class="busy-progress-track" aria-hidden="true">
+        <div id="busyProgressBar" class="busy-progress-bar indeterminate"></div>
+      </div>
+      <p id="busyHint" class="busy-hint">
+        Do not close this page or leave the Management Wi-Fi network.
+      </p>
+      <div id="busyActions" class="busy-actions hidden-block"></div>
+    </div>
+  </div>
+
   <script>
     var setupStatus = null;
     var submitting = false;
@@ -366,11 +413,13 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     var dashboardRedirectStarted = false;
     var scanSubmitting = false;
     var applyExistingNetworkInFlight = false;
+    var wifiAdoptionDmaRetries = 0;
     var wifiNetworksLoading = false;
     var wifiNetworksLoaded = false;
     var wifiDiscoveryRetryTimer = null;
     var wifiSaveInFlight = false;
     var wifiSelection = { mode: 'existing', interfaceId: '', ssid: '', password: '', selectedSsid: '' };
+    var externalApWizardMode = false;
     var availableWifiNetworks = [];
     var currentJobState = 'idle';
     var currentJobType = null;
@@ -383,44 +432,20 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     // from a single failed/missing-job poll alone.
     var existingScanRestartFlagged = false;
 
-    // ROOT-CAUSE TRACE INSTRUMENTATION (temporary — do not ship).
-    // Monotonically increasing id assigned to every write of lastExistingScanData,
-    // so the console log order gives an unambiguous chronological timeline of
-    // every place that touched scan state before the Confirm button was rendered.
+    // Monotonic counter for scan-state writes (used by stale-update guards).
     var scanTraceId = 0;
     var existingScanStateUpdateCounter = 0;
 
-    function setCurrentJobState(newState, reason) {
-      var oldState = currentJobState;
-      if (newState !== oldState) {
+    function setCurrentJobState(newState) {
+      if (newState !== currentJobState) {
         currentJobState = newState;
-        console.log("[JOB STATE]", oldState, "->", newState, reason || '');
       }
     }
 
-    function setCurrentJobType(newType, reason) {
+    function setCurrentJobType(newType) {
       if (newType !== currentJobType) {
-        console.log("[JOB TYPE]", currentJobType, "->", newType, reason || '');
         currentJobType = newType;
       }
-    }
-
-    function traceScan(source, data) {
-      scanTraceId++;
-      console.log(
-        "[SCAN TRACE #" + scanTraceId + "]",
-        {
-          source: source,
-          confirmAllowed: data && data.confirmAllowed,
-          expired: data && data.expired,
-          status: data && data.status,
-          scanStatus: data && data.scanStatus,
-          compatibility: data && data.compatibility,
-          confidence: data && data.confidence,
-          invalidatedReason: data && data.invalidatedReason,
-          candidateCount: data && data.candidateCount
-        }
-      );
     }
 
     function parseScanJobId(scanId) {
@@ -484,17 +509,6 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
       var incomingScanId = incomingData && incomingData.scanId || null;
       var decision = evaluateExistingScanUpdate(lastExistingScanData, incomingData);
 
-      console.log(
-        "[SCAN STATE]",
-        {
-          source: source,
-          currentScanId: currentScanId,
-          incomingScanId: incomingScanId,
-          accepted: decision.accept,
-          reason: decision.reason
-        }
-      );
-
       if (!decision.accept) {
         return false;
       }
@@ -506,7 +520,6 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
         lastExistingScanData = Object.assign({}, incomingData);
         lastExistingScanData._stateUpdateCounter = existingScanStateUpdateCounter;
       }
-      traceScan(source, lastExistingScanData);
       return true;
     }
     var savedRouterHost = '';
@@ -525,42 +538,42 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
       status = status || setupStatus || {};
       var np = status.networkProvisioning || {};
       if (np.wifiSetupComplete) return true;
+      if (np.externalApOnly && np.wifiSelectionConfigured) return true;
       return !!(np.wifiSelectionConfigured && np.interfaceId);
+    }
+
+    function setExternalApWizardMode(on) {
+      externalApWizardMode = !!on;
+      var ext = document.getElementById('wifiExternalApSection');
+      var mik = document.getElementById('wifiMikrotikWirelessSection');
+      var title = document.getElementById('wifiStepTitle');
+      var sub = document.getElementById('wifiStepSub');
+      if (ext) ext.style.display = on ? 'block' : 'none';
+      if (mik) mik.style.display = on ? 'none' : 'block';
+      if (title) {
+        title.textContent = on
+          ? 'Step 4 \u2014 External AP / Guest Network'
+          : 'Step 4 \u2014 Wi-Fi Configuration';
+      }
+      if (sub) {
+        sub.textContent = on
+          ? 'Confirm bridge-only guest networking. Register the LAN access point after install.'
+          : 'Choose an existing SSID on your MikroTik or create a dedicated Piso Wi-Fi network.';
+      }
+      var notice = document.getElementById('wifiNetworksNotice');
+      if (on && notice) {
+        notice.textContent = 'No MikroTik wireless detected. External AP mode is required.';
+      }
+      var c = selectedExistingCandidate || {};
+      var bridgeEl = document.getElementById('externalApBridgeLabel');
+      var netEl = document.getElementById('externalApNetworkLabel');
+      if (bridgeEl) bridgeEl.textContent = c.bridgeName || '\u2014';
+      if (netEl) netEl.textContent = c.guestNetwork || c.gatewayCidr || '\u2014';
+      updateWifiNextButtonState();
     }
 
     function isApplyInFlight() {
       return applyExistingNetworkInFlight;
-    }
-
-    var networkModeRequestCounter = 0;
-    var latestNetworkModeRequestId = 0;
-    var networkModeTraceOriginMs = performance.now();
-    var currentWorkflowRenderRequestId = null;
-
-    function networkModeTimeline(event, detail) {
-      var entry = {
-        tMs: Math.round(performance.now() - networkModeTraceOriginMs),
-        event: event,
-        detail: detail || {}
-      };
-      if (typeof window !== 'undefined') {
-        window.__renzfiNetworkModeTimeline = window.__renzfiNetworkModeTimeline || [];
-        window.__renzfiNetworkModeTimeline.push(entry);
-      }
-      return entry;
-    }
-
-    function printNetworkModeTimeline() {
-      var tl = (typeof window !== 'undefined' && window.__renzfiNetworkModeTimeline) || [];
-      console.group('[NETWORK MODE TIMELINE]');
-      tl.forEach(function (entry) {
-        console.log('T+' + entry.tMs + 'ms', entry.event, entry.detail);
-      });
-      console.groupEnd();
-      return tl;
-    }
-    if (typeof window !== 'undefined') {
-      window.printNetworkModeTimeline = printNetworkModeTimeline;
     }
 
     var SCAN_PROGRESS_LABELS = {
@@ -647,6 +660,11 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
       panel.style.display = on ? 'flex' : 'none';
       if (label) {
         document.getElementById('existingScanProgressLabel').textContent = label;
+      }
+      if (on) {
+        showBusyOverlay('Router Scan', label || 'Scanning router configuration\u2026');
+      } else if (!isApplyInFlight() && !wifiSaveInFlight && !routerSubmitting) {
+        hideBusyOverlay();
       }
     }
 
@@ -783,10 +801,9 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
       options = options || {};
       if (!setupWizardEnabled()) return;
       if (scanSubmitting || activeExistingScanJobId || isApplyInFlight()) return;
-      console.log("[SCAN SUBMITTING]", scanSubmitting, "->", true, "startExistingNetworkScan");
       scanSubmitting = true;
-      setCurrentJobState('scan-starting', 'startExistingNetworkScan');
-      setCurrentJobType('existing-network-scan', 'startExistingNetworkScan');
+      setCurrentJobState('scan-starting');
+      setCurrentJobType('existing-network-scan');
       existingScanRestartFlagged = false;
       showFormError('existingScanError', '');
       updateExistingScanButtonState();
@@ -809,11 +826,11 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
           if (res.json && res.json.success && res.json.data) {
             if (res.json.data.jobId) {
               activeExistingScanJobId = res.json.data.jobId;
-              setCurrentJobState('scan-queued', 'startExistingNetworkScan:job-enqueued');
+              setCurrentJobState('scan-queued');
               pollExistingNetworkJob(activeExistingScanJobId, handleExistingScanJobDone, function (job) {
                 var jobState = typeof job === 'string' ? job : (job && job.state);
                 if (jobState) {
-                  setCurrentJobState('scan-' + jobState, 'pollExistingNetworkJob:onProgress');
+                  setCurrentJobState('scan-' + jobState);
                 }
                 var label = typeof job === 'string' ? scanProgressLabel({ state: job }) : scanProgressLabel(job);
                 setScanProgressVisible(true, label);
@@ -825,10 +842,9 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
             handleExistingScanJobDone({ status: res.status, json: res.json });
             return;
           }
-          console.log("[SCAN SUBMITTING]", scanSubmitting, "->", false, "startExistingNetworkScan:enqueue-failed");
           scanSubmitting = false;
           activeExistingScanJobId = null;
-          setCurrentJobState('idle', 'startExistingNetworkScan:enqueue-failed');
+          setCurrentJobState('idle');
           setScanProgressVisible(false);
           updateExistingScanButtonState();
           showFormError('existingScanError', (res.json && res.json.error) || 'Unable to start scan');
@@ -836,10 +852,9 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
             'Scan required — save the router connection to scan automatically.';
         })
         .catch(function () {
-          console.log("[SCAN SUBMITTING]", scanSubmitting, "->", false, "startExistingNetworkScan:network-error");
           scanSubmitting = false;
           activeExistingScanJobId = null;
-          setCurrentJobState('idle', 'startExistingNetworkScan:network-error');
+          setCurrentJobState('idle');
           setScanProgressVisible(false);
           updateExistingScanButtonState();
           showFormError('existingScanError', 'Unable to start scan');
@@ -854,49 +869,121 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
         busy || isApplyInFlight();
     }
 
+    var busyOverlayPulseTimer = null;
+    var busyOverlayPulsePct = 12;
+
+    function stopBusyOverlayPulse() {
+      if (busyOverlayPulseTimer) {
+        clearInterval(busyOverlayPulseTimer);
+        busyOverlayPulseTimer = null;
+      }
+    }
+
+    function startBusyOverlayPulse() {
+      stopBusyOverlayPulse();
+      busyOverlayPulsePct = 12;
+      var bar = document.getElementById('busyProgressBar');
+      if (!bar) return;
+      bar.classList.remove('indeterminate');
+      bar.style.width = busyOverlayPulsePct + '%';
+      busyOverlayPulseTimer = setInterval(function () {
+        if (busyOverlayPulsePct < 88) {
+          busyOverlayPulsePct += 2;
+          bar.style.width = busyOverlayPulsePct + '%';
+        }
+      }, 700);
+    }
+
+    function showBusyOverlay(title, detail, options) {
+      options = options || {};
+      var overlay = document.getElementById('busyOverlay');
+      var card = document.getElementById('busyCard');
+      var bar = document.getElementById('busyProgressBar');
+      var actions = document.getElementById('busyActions');
+      var hint = document.getElementById('busyHint');
+      if (!overlay) return;
+      card.classList.remove('busy-error');
+      document.getElementById('busyTitle').textContent = title || 'Working\u2026';
+      document.getElementById('busyDetail').textContent =
+        detail || 'Please wait. This can take a moment.';
+      actions.classList.add('hidden-block');
+      actions.innerHTML = '';
+      if (hint) {
+        hint.style.display = options.hideHint ? 'none' : 'block';
+        if (options.hint) hint.textContent = options.hint;
+      }
+      if (typeof options.progress === 'number') {
+        stopBusyOverlayPulse();
+        bar.classList.remove('indeterminate');
+        bar.style.width = Math.max(0, Math.min(100, options.progress)) + '%';
+      } else if (options.indeterminate) {
+        stopBusyOverlayPulse();
+        bar.classList.add('indeterminate');
+        bar.style.width = '';
+      } else {
+        startBusyOverlayPulse();
+      }
+      overlay.classList.remove('hidden-block');
+    }
+
+    function updateBusyOverlay(detail, progress) {
+      var detailEl = document.getElementById('busyDetail');
+      if (detailEl && detail) detailEl.textContent = detail;
+      if (typeof progress === 'number') {
+        stopBusyOverlayPulse();
+        var bar = document.getElementById('busyProgressBar');
+        if (bar) {
+          bar.classList.remove('indeterminate');
+          bar.style.width = Math.max(0, Math.min(100, progress)) + '%';
+        }
+      }
+    }
+
+    function hideBusyOverlay() {
+      stopBusyOverlayPulse();
+      var overlay = document.getElementById('busyOverlay');
+      var actions = document.getElementById('busyActions');
+      if (actions) {
+        actions.classList.add('hidden-block');
+        actions.innerHTML = '';
+      }
+      if (overlay) overlay.classList.add('hidden-block');
+    }
+
     function hideAdoptProgressModal() {
-      document.getElementById('adoptProgressModal').classList.add('hidden-block');
-      document.getElementById('adoptProgressActions').classList.add('hidden-block');
-      document.getElementById('adoptProgressActions').innerHTML = '';
-      document.getElementById('adoptProgressTitle').textContent = 'Installing Network';
+      hideBusyOverlay();
     }
 
     function showAdoptProgressModal(label) {
-      document.getElementById('adoptProgressTitle').textContent = 'Installing Network';
-      document.getElementById('adoptProgressBody').textContent =
-        label || 'Applying Configuration...';
-      document.getElementById('adoptProgressActions').classList.add('hidden-block');
-      document.getElementById('adoptProgressActions').innerHTML = '';
-      document.getElementById('adoptProgressModal').classList.remove('hidden-block');
+      showBusyOverlay('Applying Configuration', label || 'Applying configuration on your router\u2026');
     }
 
     function showAdoptFailureModal(message) {
-      document.getElementById('adoptProgressTitle').textContent = 'Configuration failed';
-      document.getElementById('adoptProgressBody').innerHTML =
-        'RouterOS returned:<br><br><code style="word-break:break-all;display:block">' +
+      stopBusyOverlayPulse();
+      var overlay = document.getElementById('busyOverlay');
+      var card = document.getElementById('busyCard');
+      var actions = document.getElementById('busyActions');
+      card.classList.add('busy-error');
+      document.getElementById('busyTitle').textContent = 'Configuration failed';
+      document.getElementById('busyDetail').innerHTML =
+        'RouterOS returned:<br><br><code style="word-break:break-all;display:block;text-align:left">' +
         escapeHtml(message || 'Unknown error') + '</code>';
-      var actions = document.getElementById('adoptProgressActions');
       actions.classList.remove('hidden-block');
       actions.innerHTML =
         '<button id="adoptRetryBtn" type="button">Retry</button>' +
         '<button id="adoptBackBtn" type="button" class="secondary">Back</button>';
-      document.getElementById('adoptProgressModal').classList.remove('hidden-block');
+      overlay.classList.remove('hidden-block');
       document.getElementById('adoptRetryBtn').addEventListener('click', function () {
-        hideAdoptProgressModal();
+        hideBusyOverlay();
         executeAdoption();
       });
       document.getElementById('adoptBackBtn').addEventListener('click', function () {
-        hideAdoptProgressModal();
+        hideBusyOverlay();
         showPanel('panelWifi');
       });
     }
 
     function restoreExistingScanUi() {
-      console.log(
-        "[RESTORE UI]",
-        JSON.stringify(lastExistingScanData, null, 2)
-      );
-      // Scan restoration must never resume configure preview.
       if (existingScanRestartFlagged) return;
       if (lastExistingScanData) {
         renderExistingScanResults(lastExistingScanData);
@@ -914,29 +1001,7 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
       var applyBusy = isApplyInFlight();
       var buttonDisabled =
         !confirmEnabled || scanSubmitting || applyBusy;
-      console.log(
-        "[CONFIRM DIAGNOSTIC]",
-        {
-          buttonDisabled: buttonDisabled,
-          confirmAllowed: lastExistingScanData?.confirmAllowed,
-          expired: lastExistingScanData?.expired,
-          invalidatedReason: lastExistingScanData?.invalidatedReason,
-          scanSubmitting: scanSubmitting,
-          applyBusy: applyBusy,
-          selectedCandidate: selectedExistingCandidate
-            ? selectedExistingCandidate.id
-            : null,
-          currentJobState: currentJobState,
-          currentJobType: currentJobType,
-          lastScanStatus: lastExistingScanData?.status,
-          scanTraceId: scanTraceId
-        }
-      );
       confirmButton.disabled = buttonDisabled;
-      console.log(
-        "[BUTTON DOM]",
-        confirmButton.disabled
-      );
     }
 
     function scanBlockingSummary(data) {
@@ -967,16 +1032,8 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     }
 
     function renderExistingScanResults(data) {
-      console.log(
-        "[RENDER INPUT]",
-        JSON.stringify(data, null, 2)
-      );
       updateExistingScanState("renderExistingScanResults", data);
       data = lastExistingScanData || data;
-      console.log(
-        "[RENDER ASSIGNED]",
-        JSON.stringify(lastExistingScanData, null, 2)
-      );
       showFormError('existingScanError', '');
       setScanProgressVisible(false);
       renderScanSummary(data);
@@ -1055,10 +1112,6 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
             bootInstanceAfter: bootInstanceAfter
           });
           if (restartDetected) {
-            console.log(
-              "[CLEAR EXISTING SCAN]",
-              JSON.stringify(lastExistingScanData, null, 2)
-            );
             existingScanRestartFlagged = true;
             updateExistingScanState("confirmExistingScanRestart", null);
             onDone({
@@ -1133,10 +1186,6 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
             // Completed/failed scan jobs may also return the worker payload
             // directly (no job-status wrapper) to avoid double serialization.
             var response = resp.json || {};
-            console.log(
-              "[JOB RAW]",
-              JSON.stringify(response, null, 2)
-            );
             var job = response.data || {};
             var result = job.result;
 
@@ -1144,28 +1193,17 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
               if (response.success === true &&
                   (job.scanStatus || job.status || job.schemaVersion ||
                    job.confirmAllowed !== undefined || job.candidates)) {
-                setCurrentJobState('scan-completed',
-                  'pollExistingNetworkJob:passthrough-success');
+                setCurrentJobState('scan-completed');
                 onDone({ status: resp.status || 200, json: response });
                 return;
               }
               if (response.success === false &&
                   (response.code || response.error)) {
-                setCurrentJobState('scan-failed',
-                  'pollExistingNetworkJob:passthrough-failed');
+                setCurrentJobState('scan-failed');
                 onDone({ status: resp.status || 500, json: response });
                 return;
               }
             }
-
-            console.log(
-              "[JOB RESULT]",
-              JSON.stringify(result, null, 2)
-            );
-            console.log(
-              "[JOB DATA]",
-              JSON.stringify(result && result.data, null, 2)
-            );
 
             logExistingScanDebug({
               jobId: jobId,
@@ -1194,13 +1232,13 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
             // and is checked BEFORE any failure/restart branch below.
             if (response.success === true && job.state === 'completed' &&
                 result && result.success === true && result.data) {
-              setCurrentJobState('scan-completed', 'pollExistingNetworkJob:completed');
+              setCurrentJobState('scan-completed');
               onDone({ status: job.httpStatus || resp.status || 200, json: result });
               return;
             }
 
             if (job.state === 'failed') {
-              setCurrentJobState('scan-failed', 'pollExistingNetworkJob:failed');
+              setCurrentJobState('scan-failed');
               onDone({
                 status: job.httpStatus || 500,
                 json: result || {
@@ -1257,10 +1295,9 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     }
 
     function handleExistingScanJobDone(finalRes) {
-      console.log("[SCAN SUBMITTING]", scanSubmitting, "->", false, "handleExistingScanJobDone");
       scanSubmitting = false;
       activeExistingScanJobId = null;
-      setCurrentJobState('scan-complete', 'handleExistingScanJobDone');
+      setCurrentJobState('scan-complete');
       updateExistingScanButtonState();
       setScanProgressVisible(false);
 
@@ -1487,9 +1524,9 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
 
     function showSetupCompletePanel(statusJson) {
       applyExistingNetworkInFlight = false;
-      showAdoptProgressModal('Configuration applied.');
+      showBusyOverlay('Configuration Applied', 'Moving to the next step\u2026', { progress: 100 });
       setTimeout(function () {
-        hideAdoptProgressModal();
+        hideBusyOverlay();
         // Prefer a fresh status read so Step 5 only opens when backend
         // lifecycle (including Wi-Fi complete) actually allows it.
         loadSetupStatus(function (json) {
@@ -1515,6 +1552,15 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     // Part 6: "Creating Accounts" already happened (Operator was created or
     // explicitly skipped) before finishSetup() is ever called, so it is
     // shown as done from the start — this is not a fabricated checkmark.
+    function setFinishProgressLabel(text) {
+      var msg = text || 'Applying Configuration\u2026';
+      var el = document.getElementById('finishActiveStepLabel');
+      if (el) el.textContent = msg;
+      var fallback = document.getElementById('globalLoading');
+      if (fallback) fallback.textContent = msg;
+      updateBusyOverlay(msg);
+    }
+
     function showFinishingUi() {
       document.getElementById('operatorOptionalSection').classList.add('hidden-block');
       var notice = document.getElementById('productionReadyNotice');
@@ -1527,6 +1573,7 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
         '<span class="scan-progress-spinner" style="flex-shrink:0" aria-hidden="true"></span>' +
         '<span id="finishActiveStepLabel">Applying Configuration&hellip;</span>' +
         '</li></ul>';
+      showBusyOverlay('Finishing Setup', 'Applying Configuration\u2026');
     }
 
     function escapeHtml(text) {
@@ -1563,8 +1610,10 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
         (document.getElementById('routerHost') &&
           document.getElementById('routerHost').value.trim()) ||
         '\u2014';
-      var productionSsid = np.selectedSsidHint || wifiSelection.selectedSsid ||
-        wifiSelection.ssid || '\u2014';
+      var productionSsid = np.externalApOnly
+        ? 'External AP (register after install)'
+        : (np.selectedSsidHint || wifiSelection.selectedSsid ||
+          wifiSelection.ssid || '\u2014');
       var hotspotStatus = np.hotspotDetected ? 'Active' : 'Configured';
       var firmwareLabel = formatFirmwareVersion(data.firmwareVersion);
       var installStateRaw = String(data.installationState || 'provisioned');
@@ -1633,7 +1682,9 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
       var wifiMode = np.wifiMode || wifiSelection.mode || 'existing';
       var wifiSsid = np.selectedSsidHint || wifiSelection.selectedSsid ||
         wifiSelection.ssid || '';
-      var wifiModeLabel = wifiMode === 'new' ? 'Create New SSID' : 'Using Existing SSID';
+      var wifiModeLabel = np.externalApOnly || wifiMode === 'external_ap'
+        ? 'External AP / Bridge-only'
+        : (wifiMode === 'new' ? 'Create New SSID' : 'Using Existing SSID');
       var firmwareLabel = formatFirmwareVersion(data.firmwareVersion);
       var dashboardUrl = adminUrl || resolveDashboardUrl(data) || '\u2014';
       var operatorSection = wizard.operatorConfigured
@@ -1778,16 +1829,6 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
       fetchHandoffHealth().then(renderSummary);
     }
 
-    function setFinishProgressLabel(text) {
-      var el = document.getElementById('finishActiveStepLabel');
-      if (el) {
-        el.textContent = text || 'Applying Configuration\u2026';
-        return;
-      }
-      var fallback = document.getElementById('globalLoading');
-      if (fallback) fallback.textContent = text || 'Loading\u2026';
-    }
-
     function finishProgressLabel(job) {
       if (!job) return FINISH_PROGRESS_LABELS.running;
       if (typeof job === 'string') {
@@ -1838,16 +1879,19 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
           finishSucceeded;
         if (ready) {
           finishSetupSubmitting = false;
+          hideBusyOverlay();
           showSetupCompleteUi(data);
           return;
         }
         // Finish reported success but lifecycle is not provisioned yet — allow retry.
         finishSetupSubmitting = false;
+        hideBusyOverlay();
         setFinishButtonsDisabled(false);
         resumeWizardFromStatus(json);
       }
       function failFinalize(res) {
         finishSetupSubmitting = false;
+        hideBusyOverlay();
         setFinishButtonsDisabled(false);
         document.getElementById('productionReadyNotice').classList.add('hidden-block');
         document.getElementById('operatorOptionalSection').classList.remove('hidden-block');
@@ -1998,6 +2042,10 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
       }
       if (name === 'panelWifi') {
         if (!setupWizardEnabled()) return;
+        var np = (setupStatus && setupStatus.networkProvisioning) || {};
+        if (np.externalApOnly) {
+          setExternalApWizardMode(true);
+        }
         loadWifiNetworks();
       }
       if (name === 'panelReview') {
@@ -2029,6 +2077,12 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     function setLoading(on) {
       document.getElementById('globalLoading').style.display = on ? 'block' : 'none';
       document.getElementById('createBtn').disabled = on || submitting;
+      if (on) {
+        showBusyOverlay('Loading Setup', 'Loading your setup progress\u2026');
+      } else if (!submitting && !routerSubmitting && !isApplyInFlight() &&
+                 !wifiSaveInFlight && !scanSubmitting && !finishSetupSubmitting) {
+        hideBusyOverlay();
+      }
     }
 
     function updateMikrotikEthernetStatus(data) {
@@ -2101,9 +2155,7 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     }
 
     function isWifiConfiguredFromStatus(data) {
-      data = data || setupStatus || {};
-      var np = data.networkProvisioning || {};
-      return !!(np.wifiSetupComplete || np.wifiSelectionConfigured);
+      return isWifiSetupComplete(data);
     }
 
     function panelForWizardStep(step, data) {
@@ -2136,6 +2188,11 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
         wifiSelection.ssid = np.selectedSsidHint || '';
         wifiNetworksLoaded = false;
         wifiNetworksRetryCount = 0;
+      }
+      if (np.externalApOnly) {
+        setExternalApWizardMode(true);
+      } else {
+        setExternalApWizardMode(false);
       }
       if (data.networkProvisioning) {
         networkModeState = data.networkProvisioning;
@@ -2179,10 +2236,6 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     }
 
     function resumeWizardFromStatus(json, options) {
-      console.log(
-        "[STATUS API]",
-        JSON.stringify(json, null, 2)
-      );
       var data = (json && json.data) || json || {};
       applyWizardStepFromStatus(data, options || {});
     }
@@ -2203,6 +2256,14 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     }
 
     function validateWifiStep() {
+      if (externalApWizardMode) {
+        wifiSelection.mode = 'external_ap';
+        wifiSelection.interfaceId = '';
+        wifiSelection.ssid = '';
+        wifiSelection.selectedSsid = '';
+        wifiSelection.password = '';
+        return '';
+      }
       var existingChecked = document.getElementById('wifiModeExisting').checked;
       var newChecked = document.getElementById('wifiModeNew').checked;
       if (!existingChecked && !newChecked) {
@@ -2310,8 +2371,8 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     }
 
     var wifiNetworksRetryCount = 0;
-    var WIFI_NETWORKS_MAX_RETRIES = 8;
-    var WIFI_NETWORKS_RETRY_MS = 2000;
+    var WIFI_NETWORKS_MAX_RETRIES = 12;
+    var WIFI_NETWORKS_RETRY_MS = 2500;
 
     function loadWifiNetworks() {
       if (wifiNetworksLoading || wifiNetworksLoaded) return;
@@ -2321,21 +2382,29 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
       var notice = document.getElementById('wifiNetworksNotice');
       notice.textContent = 'Loading available SSIDs\u2026';
       showFormError('wifiFormError', '');
+      showBusyOverlay('Loading Wi-Fi Networks', 'Reading SSIDs from your MikroTik\u2026');
       fetch('/api/setup/router/wifi/networks', { cache: 'no-store' })
         .then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); })
         .then(function (res) {
           var json = res.json || {};
 
-          if (res.status === 202 || json.status === 'busy' ||
-              json.code === 'ROUTER_WORKER_BUSY') {
+          if (res.status === 202 || res.status === 503 ||
+              json.status === 'busy' ||
+              json.code === 'ROUTER_WORKER_BUSY' ||
+              json.code === 'ETH_DMA_LOW') {
             wifiNetworksLoading = false;
             updateWifiNextButtonState();
             if (wifiNetworksRetryCount < WIFI_NETWORKS_MAX_RETRIES) {
               wifiNetworksRetryCount++;
-              notice.textContent = 'Checking MikroTik Wi-Fi networks\u2026';
+              notice.textContent =
+                json.code === 'ETH_DMA_LOW'
+                  ? 'Waiting for free memory, then loading SSIDs\u2026'
+                  : 'Checking MikroTik Wi-Fi networks\u2026';
+              updateBusyOverlay(notice.textContent);
               scheduleWifiDiscoveryRetry();
             } else {
               cancelWifiDiscoveryRetry();
+              hideBusyOverlay();
               wifiNetworksLoaded = true;
               notice.textContent = 'Still checking MikroTik. You can create a new SSID instead, or wait and reopen this step.';
               setWifiMode('new');
@@ -2349,6 +2418,7 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
           wifiNetworksLoading = false;
           wifiNetworksLoaded = true;
           updateWifiNextButtonState();
+          hideBusyOverlay();
           var networks = json.data || [];
           var code = json.code || '';
           availableWifiNetworks = networks;
@@ -2363,10 +2433,7 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
           }
 
           if (code === 'WIFI_NO_WIRELESS_PACKAGE' || code === 'WIFI_NO_INTERFACES') {
-            notice.textContent =
-              json.message || 'No wireless interfaces were found on this MikroTik. You can create a new SSID if Wi-Fi hardware is present.';
-            document.getElementById('wifiModeExisting').disabled = true;
-            setWifiMode('new');
+            setExternalApWizardMode(true);
             return;
           }
 
@@ -2401,6 +2468,7 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
           wifiNetworksLoading = false;
           wifiNetworksLoaded = true;
           updateWifiNextButtonState();
+          hideBusyOverlay();
           notice.textContent = 'Unable to load SSIDs. You can create a new SSID instead.';
           setWifiMode('new');
         });
@@ -2418,7 +2486,9 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
         return;
       }
       var payload = { wifiMode: wifiSelection.mode };
-      if (wifiSelection.mode === 'existing') {
+      if (wifiSelection.mode === 'external_ap') {
+        payload.externalApOnly = true;
+      } else if (wifiSelection.mode === 'existing') {
         payload.interfaceId = wifiSelection.interfaceId;
         payload.selectedSsid = wifiSelection.selectedSsid;
       } else {
@@ -2426,38 +2496,41 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
       }
       wifiSaveInFlight = true;
       updateWifiNextButtonState();
+      showBusyOverlay('Saving Wi-Fi Selection', 'Saving your Wi-Fi choice\u2026');
       fetch('/api/setup/router/wifi/selection', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      })
-        .then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); })
-        .then(function (res) {
-          if (!res.json || !res.json.success) {
-            wifiSaveInFlight = false;
-            updateWifiNextButtonState();
-            if (handleSetupLifecycleError(res, 'wifiFormError',
-                (res.json && res.json.error) || 'Unable to save Wi-Fi selection')) {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+          .then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); })
+          .then(function (res) {
+            if (!res.json || !res.json.success) {
+              wifiSaveInFlight = false;
+              updateWifiNextButtonState();
+              hideBusyOverlay();
+              if (handleSetupLifecycleError(res, 'wifiFormError',
+                  (res.json && res.json.error) || 'Unable to save Wi-Fi selection')) {
+                return;
+              }
+              showFormError('wifiFormError', (res.json && res.json.error) || 'Unable to save Wi-Fi selection');
               return;
             }
-            showFormError('wifiFormError', (res.json && res.json.error) || 'Unable to save Wi-Fi selection');
-            return;
-          }
-          if (res.json.data) setupStatus = res.json.data;
-          // 202 / pending: durable SD+SPIFFS commit is off async_tcp — wait
-          // before adoption so setup does not advance on a false durable claim.
-          return waitForWifiSelectionDurable(res).then(function () {
+            if (res.json.data) setupStatus = res.json.data;
+            updateBusyOverlay('Persisting Wi-Fi selection\u2026', 35);
+            return waitForWifiSelectionDurable(res).then(function () {
+              wifiSaveInFlight = false;
+              updateWifiNextButtonState();
+              updateBusyOverlay('Applying configuration on your router\u2026', 55);
+              finishWifiStepAndApply();
+            });
+          })
+          .catch(function (err) {
             wifiSaveInFlight = false;
             updateWifiNextButtonState();
-            finishWifiStepAndApply();
+            hideBusyOverlay();
+            showFormError('wifiFormError',
+              (err && err.message) || 'Unable to save Wi-Fi selection');
           });
-        })
-        .catch(function (err) {
-          wifiSaveInFlight = false;
-          updateWifiNextButtonState();
-          showFormError('wifiFormError',
-            (err && err.message) || 'Unable to save Wi-Fi selection');
-        });
     }
 
     function waitForWifiSelectionDurable(initialRes) {
@@ -2519,11 +2592,13 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     // silently starting a new scan.
     function finishWifiStepAndApply() {
       if (selectedExistingCandidate && scanConfirmEnabled(lastExistingScanData)) {
+        wifiAdoptionDmaRetries = 0;
         executeAdoption();
         return;
       }
       wifiSaveInFlight = false;
       updateWifiNextButtonState();
+      hideBusyOverlay();
       showFormError(
         'wifiFormError',
         'Router scan result is no longer available. Please go back and confirm the Router Scan step again.');
@@ -2541,9 +2616,22 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
       function handleAdoptionResult(res) {
         applyExistingNetworkInFlight = false;
         if (!res.json || !res.json.success) {
+          var dmaBusy = (res.status === 503) ||
+              (res.json && (res.json.code === 'ETH_DMA_LOW' ||
+                            res.json.code === 'ROUTER_WORKER_BUSY'));
+          if (dmaBusy && wifiAdoptionDmaRetries < 8) {
+            wifiAdoptionDmaRetries += 1;
+            showBusyOverlay('Applying Configuration',
+              res.json && res.json.code === 'ROUTER_WORKER_BUSY'
+                ? 'Router is still applying your configuration\u2026'
+                : 'Waiting for free memory, then applying\u2026');
+            // Re-POST is safe: worker joins the in-flight configure jobId.
+            setTimeout(function () { executeAdoption(); }, 2000);
+            return;
+          }
           var errMsg = formatRouterError(res.json);
           if (handleSetupLifecycleError(res, 'existingScanError', errMsg)) {
-            hideAdoptProgressModal();
+            hideBusyOverlay();
             updateAdoptButtonState();
             updateExistingScanButtonState();
             updateWifiNextButtonState();
@@ -2562,6 +2650,7 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
             networkModeState = res.json.data.networkProvisioning;
           }
         }
+        wifiAdoptionDmaRetries = 0;
         showSetupCompletePanel(res.json);
       }
 
@@ -2570,7 +2659,8 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           confirmation: 'ADOPT EXISTING RENZ-FI NETWORK',
-          wifiMode: wifiSelection.mode,
+          wifiMode: externalApWizardMode ? 'external_ap' : wifiSelection.mode,
+          externalApOnly: externalApWizardMode || wifiSelection.mode === 'external_ap',
           interfaceId: wifiSelection.mode === 'existing' ? wifiSelection.interfaceId : undefined,
           ssid: wifiSelection.mode === 'new' ? wifiSelection.ssid : undefined,
           selectedSsid: wifiSelection.mode === 'existing' ? wifiSelection.selectedSsid : undefined,
@@ -2596,9 +2686,13 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
         .then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); })
         .then(function (res) {
           if (res.json && res.json.success && res.json.data && res.json.data.jobId) {
-            showAdoptProgressModal('Applying Configuration...');
-            pollRouterJob(res.json.data.jobId, handleAdoptionResult, function () {
-              showAdoptProgressModal('Applying Configuration...');
+            updateBusyOverlay('Applying configuration on your router\u2026', 70);
+            pollRouterJob(res.json.data.jobId, handleAdoptionResult, function (job) {
+              var label = (job && job.stageLabel) ||
+                (job && job.state === 'queued'
+                  ? 'Queued on device\u2026'
+                  : 'Applying configuration on your router\u2026');
+              updateBusyOverlay(label, job && job.state === 'running' ? 82 : 70);
             });
             return;
           }
@@ -2743,6 +2837,35 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
               return;
             }
             var json = resp.json || {};
+            // Transient SoftAP/DMA pressure must not abort an in-flight job.
+            // Proven false failure: poll 503 ETH_DMA_LOW → UI re-POST configure
+            // → ROUTER_WORKER_BUSY shown as "Configuration failed" while the
+            // original job later logged ADOPTION COMPLETE.
+            if (resp.status === 503 ||
+                json.code === 'ETH_DMA_LOW' ||
+                json.code === 'ROUTER_WORKER_BUSY') {
+              if (onProgress) {
+                onProgress({
+                  state: 'running',
+                  stageLabel: json.code === 'ETH_DMA_LOW'
+                    ? 'Waiting for free memory\u2026'
+                    : 'Waiting for router worker\u2026'
+                });
+              }
+              if (attempts < 120) {
+                setTimeout(tick, 800);
+              } else {
+                onDone({
+                  status: 504,
+                  json: {
+                    success: false,
+                    error: 'Router job timed out while waiting for free memory',
+                    code: 'ROUTER_JOB_TIMEOUT'
+                  }
+                });
+              }
+              return;
+            }
             var d = json.data || {};
             if (d.state === 'queued' || d.state === 'running') {
               if (onProgress) onProgress(d);
@@ -2775,6 +2898,14 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
             onDone({ status: 500, json: json.success === false ? json : { success: false, error: 'Invalid job response' } });
           })
           .catch(function () {
+            // SoftAP blips are common; keep polling the same jobId.
+            if (attempts < 120) {
+              if (onProgress) {
+                onProgress({ state: 'running', stageLabel: 'Reconnecting to device\u2026' });
+              }
+              setTimeout(tick, 800);
+              return;
+            }
             onDone({ status: 0, json: { success: false, error: 'Network error', code: 'NETWORK_ERROR' } });
           });
       }
@@ -2784,6 +2915,10 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     function postRouter(path, onDone, onProgress, requestBody) {
       setRouterBusy(true);
       routerSubmitting = true;
+      var isTest = path.indexOf('/test') >= 0;
+      showBusyOverlay(
+        isTest ? 'Testing Router Connection' : 'Saving Router Connection',
+        isTest ? 'Contacting MikroTik\u2026' : 'Saving router credentials\u2026');
       fetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2793,20 +2928,31 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
         .then(function (res) {
           if (res.json && res.json.success && res.json.data && res.json.data.jobId) {
             if (onProgress) onProgress('queued');
+            updateBusyOverlay(
+              isTest ? 'Waiting for router test result\u2026' : 'Waiting for save to complete\u2026',
+              40);
             pollRouterJob(res.json.data.jobId, function (finalRes) {
               routerSubmitting = false;
               setRouterBusy(false);
+              hideBusyOverlay();
               onDone(finalRes);
-            }, onProgress);
+            }, function (job) {
+              if (onProgress) onProgress(job);
+              updateBusyOverlay(
+                isTest ? 'Testing connection\u2026' : 'Saving connection\u2026',
+                job && job.state === 'running' ? 75 : 45);
+            });
             return;
           }
           routerSubmitting = false;
           setRouterBusy(false);
+          hideBusyOverlay();
           onDone(res);
         })
         .catch(function () {
           routerSubmitting = false;
           setRouterBusy(false);
+          hideBusyOverlay();
           showRouterFormError('Network error \u2014 please try again.');
         });
     }
@@ -2843,7 +2989,15 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
     }
 
     document.getElementById('createBtn').addEventListener('click', function () {
-      if (submitting || (setupStatus && setupStatus.ownerCreated)) return;
+      if (submitting) return;
+      // Unlock may happen on another client (phone vs laptop). Owner already
+      // exists — Next must resume the shared wizard, not silently no-op.
+      if (setupStatus && setupStatus.ownerCreated) {
+        loadSetupStatus(function (json) {
+          resumeWizardFromStatus(json);
+        });
+        return;
+      }
       showFormError('ownerFormError', '');
       var payload = {
         displayName: document.getElementById('ownerDisplayName').value.trim(),
@@ -2867,14 +3021,17 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
       }
       submitting = true;
       document.getElementById('createBtn').disabled = true;
+      showBusyOverlay('Creating Owner Account', 'Saving owner account\u2026');
       postSetupStep('/api/setup/owner', payload, 'ownerFormError', function () {
         document.getElementById('password').value = '';
         document.getElementById('confirmPassword').value = '';
         document.getElementById('setupUnlockPassword').value = '';
         document.getElementById('confirmSetupUnlockPassword').value = '';
+        hideBusyOverlay();
       }, function () {
         submitting = false;
         document.getElementById('createBtn').disabled = false;
+        hideBusyOverlay();
       });
     });
 
@@ -3039,6 +3196,7 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
       }
       operatorSubmitting = true;
       setFinishButtonsDisabled(true);
+      showBusyOverlay('Creating Operator', 'Saving operator account\u2026');
       fetch('/api/setup/operator', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3052,6 +3210,7 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
             finishSetup(null, { portalDeploymentMode: selectedPortalDeploymentMode() });
             return;
           }
+          hideBusyOverlay();
           setFinishButtonsDisabled(false);
           if (handleSetupLifecycleError(res, 'operatorFormError',
               (res.json && res.json.error) || 'Unable to create operator account.')) {
@@ -3061,6 +3220,7 @@ const char kSetupWizardPageHtml[] PROGMEM = R"rawliteral(<!doctype html>
         })
         .catch(function () {
           operatorSubmitting = false;
+          hideBusyOverlay();
           setFinishButtonsDisabled(false);
           showFormError('operatorFormError', 'Network error — please try again.');
         });

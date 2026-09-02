@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <time.h>
 
+#include "InstallationState.h"
 #include "InstallationStateManager.h"
 
 namespace {
@@ -13,7 +14,13 @@ bool s_timeConfigured = false;
 bool s_loggedNtpDeferred = false;
 
 bool installationAllowsNtp() {
-  return s_installation && s_installation->isReady();
+  // Guest production often runs while install state is still owner_created
+  // (wizard incomplete). Gating NTP on Ready/Provisioned alone left the clock
+  // unset forever → voucher redeem CLOCK_NOT_READY while coin still worked.
+  if (!s_installation) return false;
+  if (s_installation->isReady()) return true;
+  return installationStateAtLeast(s_installation->current(),
+                                  InstallationState::OwnerCreated);
 }
 
 bool readNowYmd(int &year, int &month, int &day) {
@@ -100,6 +107,37 @@ bool salesParseRecordedAt(const char *recordedAt, int &year, int &month, int &da
 bool salesIsUptimeMarker(const char *recordedAt) {
   return recordedAt && recordedAt[0] != '\0' &&
          strncmp(recordedAt, "uptime-ms:", 10) == 0;
+}
+
+bool salesParseUptimeMarkerMs(const char *stamp, uint32_t &outMs) {
+  if (!salesIsUptimeMarker(stamp)) return false;
+  const unsigned long parsed = strtoul(stamp + 10, nullptr, 10);
+  outMs = static_cast<uint32_t>(parsed);
+  return true;
+}
+
+String salesIsoFromUptimeMarker(const char *stamp) {
+  uint32_t saleMs = 0;
+  if (!salesParseUptimeMarkerMs(stamp, saleMs)) return String();
+  if (!salesTimeReady()) return String();
+
+  struct tm nowInfo;
+  if (!getLocalTime(&nowInfo)) return String();
+  const time_t nowEpoch = mktime(&nowInfo);
+  if (nowEpoch < 1704067200) return String();
+
+  const uint32_t nowMs = millis();
+  if (saleMs > nowMs) return String();
+
+  const time_t saleEpoch =
+      nowEpoch - static_cast<time_t>((nowMs - saleMs) / 1000UL);
+  struct tm saleInfo;
+  localtime_r(&saleEpoch, &saleInfo);
+  char buf[20];
+  if (strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &saleInfo) == 0) {
+    return String();
+  }
+  return String(buf);
 }
 
 String salesEffectiveIsoStamp(const char *recordedAt, const char *reportingAt) {

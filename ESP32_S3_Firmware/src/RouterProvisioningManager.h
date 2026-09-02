@@ -18,7 +18,7 @@ class RouterProvisioningEngine;
 // Phase 3 — read-only router inspection, provisioning plan, and safe apply.
 class RouterProvisioningManager {
  public:
-  static constexpr uint16_t SCHEMA_VERSION = 3;
+  static constexpr uint16_t SCHEMA_VERSION = 4;
 
   struct OperationResult {
     bool   success = false;
@@ -59,8 +59,10 @@ class RouterProvisioningManager {
            _foundationApplied && _adoptedAt > 0;
   }
   bool wifiSelectionConfigured() const { return _wifiSelectionConfigured; }
+  bool externalApOnly() const { return _externalApOnly; }
   // Existing SSID: configured + wireless interface id.
   // Create New SSID: configured + target SSID (interface is created at apply).
+  // External AP / bridge-only: configured without MikroTik wireless.
   bool wifiSetupComplete() const;
   // RAM-only. Cancels a queued durable persist so factory reset cannot
   // rewrite router-provisioning.json after the file was deleted.
@@ -108,6 +110,7 @@ class RouterProvisioningManager {
   uint32_t _updatedAt = 0;
   uint16_t _schemaVersion = SCHEMA_VERSION;
   bool     _wifiSelectionConfigured = false;
+  bool     _externalApOnly = false;
   String   _wifiMode;
   String   _wifiInterfaceId;
   String   _wifiSsid;

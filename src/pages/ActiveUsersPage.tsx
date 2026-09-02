@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useOutletContext } from "react-router-dom";
 import { Pause, Play, WifiOff, Wifi, Ban } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -46,6 +47,9 @@ import { DataPagination } from "@/components/admin/DataPagination";
 import { EmptyState } from "@/components/admin/EmptyState";
 import { Skeleton } from "@/components/ui/skeleton";
 import { clampPage, PAGE_SIZE_DEFAULT, pageSlice } from "@/lib/pagination";
+import { resolveConfiguredRateLimitDisplay } from "@/lib/configuredRateLimit";
+import { routerApi } from "@/services/router";
+import type { AdminOutletContext } from "@/components/AdminLayout";
 
 type ConfirmAction = "pause" | "resume" | "disconnect" | "reconnect" | "terminate";
 
@@ -383,7 +387,7 @@ export default function ActiveUsersPage() {
           {!isLoading && count === 0 ? (
             <EmptyState
               title="No Active Users"
-              description="There are currently no connected WiFi sessions."
+              description="No customers with remaining session time on this appliance. User History below is sales records, not live HotSpot sessions."
             />
           ) : null}
         </AdminTableCard>
@@ -393,10 +397,11 @@ export default function ActiveUsersPage() {
         <div>
           <h3 className="text-sm font-semibold">User History</h3>
           <p className="text-[12px] text-muted-foreground">
-            Profile is the MikroTik HotSpot user profile applied when the customer paid. Speed is
-            the promo bandwidth availed (for example 10/10 Mbps). Coin sessions record speed from
-            the matched promo at Done Paying. Recent completed sessions from sales persistence (same
-            ledger as Sales Reports).
+            Profile is the MikroTik HotSpot user profile applied when the customer paid. Configured
+            rate limit is the HotSpot profile bandwidth (for example 50 / 50 Mbps), not live
+            throughput. Coin sessions record the limit from the matched promo at Done Paying when
+            available. Recent completed sessions from sales persistence (same ledger as Sales
+            Reports).
           </p>
         </div>
         <UserHistoryTable />
@@ -422,6 +427,7 @@ export default function ActiveUsersPage() {
 
 function UserHistoryTable() {
   type Period = "day" | "weekly" | "monthly" | "range";
+  const { isOwner } = useOutletContext<AdminOutletContext>();
   const [period, setPeriod] = useState<Period>("day");
   const [rangeFrom, setRangeFrom] = useState("");
   const [rangeTo, setRangeTo] = useState("");
@@ -432,6 +438,21 @@ function UserHistoryTable() {
     queryKey: ["sales", "records", "history-table"],
     queryFn: () => salesApi.records(200),
   });
+
+  const { data: profilesData } = useQuery({
+    queryKey: ["router", "profiles"],
+    queryFn: () => routerApi.profiles(),
+    enabled: isOwner,
+    staleTime: Number.POSITIVE_INFINITY,
+    refetchOnMount: false,
+  });
+
+  const profileDetails = useMemo(() => {
+    if (Array.isArray(profilesData?.profileDetails) && profilesData.profileDetails.length > 0) {
+      return profilesData.profileDetails;
+    }
+    return undefined;
+  }, [profilesData?.profileDetails]);
 
   const filtered = useMemo(() => {
     const now = new Date();
@@ -534,9 +555,9 @@ function UserHistoryTable() {
               </TableHead>
               <TableHead
                 className="h-10 bg-muted/40 text-[12px]"
-                title="Promo bandwidth availed (Mbps)"
+                title="Configured HotSpot rate limit (not live throughput)"
               >
-                Speed
+                Configured rate limit
               </TableHead>
               <TableHead className="h-10 bg-muted/40 text-[12px]">Status</TableHead>
               <TableHead className="h-10 bg-muted/40 text-[12px]">Source</TableHead>
@@ -568,7 +589,9 @@ function UserHistoryTable() {
                     </TableCell>
                     <TableCell className="tabular-nums text-[12px]">₱{r.amount ?? 0}</TableCell>
                     <TableCell className="text-[12px]">{r.profile || "—"}</TableCell>
-                    <TableCell className="text-[12px]">{r.speed || "—"}</TableCell>
+                    <TableCell className="text-[12px]">
+                      {resolveConfiguredRateLimitDisplay(r.profile, r.speed, profileDetails) || "—"}
+                    </TableCell>
                     <TableCell className="text-[12px]">{r.status || "—"}</TableCell>
                     <TableCell className="text-[12px]">{r.paymentType || "—"}</TableCell>
                   </TableRow>

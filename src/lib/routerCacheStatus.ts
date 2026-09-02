@@ -100,7 +100,11 @@ export function routerCacheProductionWifiLabel(
   } | null | undefined,
   healthyLabel: string,
   unhealthyReasonLabel: string,
+  externalApOnly?: boolean,
 ): string {
+  if (externalApOnly) {
+    return "External Access Point / Bridge-only";
+  }
   const pn = cache?.productionNetwork;
   if (pn) {
     return pn.verified ? healthyLabel : unhealthyReasonLabel;
