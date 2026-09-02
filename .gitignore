@@ -9,6 +9,7 @@ lerna-debug.log*
 
 node_modules
 dist
+dist-openwrt
 dist-server
 dist-ssr
 data/
@@ -44,6 +45,11 @@ deployment/mikrotik-hotspot/Default-Banner.png
 deployment/mikrotik-hotspot/bg_music.mp3
 deployment/mikrotik-hotspot/coin.mp3
 deployment/mikrotik-hotspot/success.mp3
+
+# Generated OpenWrt Admin/portal payload (run: npm run build:openwrt)
+openwrt/files/www/renzfi/**
+!openwrt/files/www/renzfi/.gitkeep
+!openwrt/files/www/renzfi/README.md
 
 # Editor directories and files
 .vscode/*
