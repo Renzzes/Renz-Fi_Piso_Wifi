@@ -1,0 +1,15 @@
+{
+  "name": "Renz-Fi Admin",
+  "install": "npm ci",
+  "terminals": [
+    {
+      "name": "simulator",
+      "command": "npm run dev:simulator"
+    },
+    {
+      "name": "client",
+      "command": "npm run dev:client"
+    }
+  ],
+  "ports": [3001, 5173]
+}
